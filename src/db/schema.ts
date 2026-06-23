@@ -243,6 +243,7 @@ export const users = pgTable("user", {
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
+export type Role = User["role"];
 
 export const userBrands = pgTable(
   "user_brand",

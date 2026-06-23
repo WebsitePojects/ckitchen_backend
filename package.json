@@ -9,6 +9,8 @@
     "test": "vitest run",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",
+    "seed:pilot": "tsx src/db/seed-pilot.ts",
+    "agent:mock": "tsx agent-mock/index.ts",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {

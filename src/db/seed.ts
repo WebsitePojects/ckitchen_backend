@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import type { DB } from "./client.js";
 import { runMigrations } from "./migrate.js";
 import { hashPassword } from "../modules/auth/service.js";
-import { kitchenStations, locations, users, type Role } from "./schema.js";
+import { kitchenStations, locations, users, warehouses, type Role } from "./schema.js";
 
 const LOCATION_NAME = "Main Cloud Kitchen";
 
@@ -68,6 +68,19 @@ export async function seed(db: DB): Promise<SeededUser[]> {
   for (const name of STATION_NAMES) {
     if (!existingStationNames.has(name)) {
       await db.insert(kitchenStations).values({ locationId: location.id, name });
+    }
+  }
+
+  // --- warehouses: MAIN and KITCHEN (idempotent per type+location) ------
+  const existingWarehouses = await db
+    .select()
+    .from(warehouses)
+    .where(eq(warehouses.locationId, location.id));
+  const existingWarehouseTypes = new Set(existingWarehouses.map((w) => w.type));
+
+  for (const type of ["MAIN", "KITCHEN"] as const) {
+    if (!existingWarehouseTypes.has(type)) {
+      await db.insert(warehouses).values({ locationId: location.id, type });
     }
   }
 

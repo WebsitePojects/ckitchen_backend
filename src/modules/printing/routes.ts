@@ -16,12 +16,19 @@
  *   Write (reprint)           — SUPER_ADMIN | KITCHEN_STAFF
  *
  * The agent endpoints use requireAgentToken exclusively — no user JWT accepted.
+ *
+ * Task 8 — realtime emissions:
+ *   print.status   → after agent ack (PRINTED | FAILED) and after reprint (new PENDING)
+ *   printer.status → after agent heartbeat (per printer in the update)
  */
 import { Router, type Response } from "express";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
+import { locations, kitchenStations, printJobs } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
+import type { RealtimeHub } from "../../realtime/hub.js";
 import { requireAgentToken } from "./agent-auth.js";
 import {
   PrintNotFoundError,
@@ -80,10 +87,40 @@ function handleServiceError(err: unknown, res: Response): void {
 }
 
 // ---------------------------------------------------------------------------
+// Location resolution helper
+// ---------------------------------------------------------------------------
+
+/** Fetch the single prototype location id (gracefully returns null if not seeded). */
+async function getDefaultLocationId(db: DB): Promise<string | null> {
+  const [loc] = await db.select({ id: locations.id }).from(locations);
+  return loc?.id ?? null;
+}
+
+/**
+ * Resolve the location for a print job via: print_job → station → location.
+ * Falls back to the default location if the chain is broken (e.g. no station).
+ */
+async function getLocationIdForPrintJob(db: DB, jobId: string): Promise<string | null> {
+  const [job] = await db
+    .select({ stationId: printJobs.stationId })
+    .from(printJobs)
+    .where(eq(printJobs.id, jobId));
+
+  if (!job) return getDefaultLocationId(db);
+
+  const [station] = await db
+    .select({ locationId: kitchenStations.locationId })
+    .from(kitchenStations)
+    .where(eq(kitchenStations.id, job.stationId));
+
+  return station?.locationId ?? getDefaultLocationId(db);
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
-export function createPrintingRouter(db: DB): Router {
+export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
   const router = Router();
 
   // ── POST /agent/register ───────────────────────────────────────────────
@@ -124,8 +161,20 @@ export function createPrintingRouter(db: DB): Router {
 
     try {
       const updated = await ackJob(db, id, parsed.data);
-      // Return the updated job so Task 8 can emit print.status without re-fetching
       res.json(updated);
+
+      // Task 8: emit print.status after agent ack
+      const locationId = await getLocationIdForPrintJob(db, id);
+      if (locationId) {
+        hub.emitToLocation(locationId, "print.status", {
+          print_job_id: updated.id,
+          order_id: updated.orderId,
+          station_id: updated.stationId,
+          status: updated.status,
+          error: updated.error ?? null,
+          printed_at: updated.printedAt?.toISOString() ?? null,
+        });
+      }
     } catch (err) {
       handleServiceError(err, res);
     }
@@ -141,8 +190,19 @@ export function createPrintingRouter(db: DB): Router {
 
     try {
       const result = await updatePrinterStatuses(db, parsed.data.printers);
-      // TODO (Task 8): emit `printer.status` for each updated printer
       res.json(result);
+
+      // Task 8: emit printer.status for each updated printer
+      const locationId = await getDefaultLocationId(db);
+      if (locationId) {
+        for (const p of parsed.data.printers) {
+          hub.emitToLocation(locationId, "printer.status", {
+            printer_id: p.printer_id,
+            status: p.status,
+            last_seen: p.last_seen,
+          });
+        }
+      }
     } catch (err) {
       handleServiceError(err, res);
     }
@@ -170,8 +230,20 @@ export function createPrintingRouter(db: DB): Router {
 
       try {
         const newJob = await reprintJob(db, id);
-        // TODO (Task 8): emit `print.status` for the new PENDING job
         res.status(201).json(newJob);
+
+        // Task 8: emit print.status for the new PENDING job
+        const locationId = await getLocationIdForPrintJob(db, newJob.id);
+        if (locationId) {
+          hub.emitToLocation(locationId, "print.status", {
+            print_job_id: newJob.id,
+            order_id: newJob.orderId,
+            station_id: newJob.stationId,
+            status: newJob.status,
+            error: null,
+            printed_at: null,
+          });
+        }
       } catch (err) {
         handleServiceError(err, res);
       }

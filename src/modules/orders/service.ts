@@ -77,6 +77,20 @@ export interface LowStockEvent {
   threshold: number;
 }
 
+/**
+ * Represents a single ingredient balance change in the KITCHEN warehouse after
+ * deduction.  Returned from advanceOrder so the route handler (Task 8) can emit
+ * `stock.updated` without an extra DB round-trip.
+ */
+export interface StockUpdateEvent {
+  ingredientId: string;
+  ingredientName: string;
+  /** Always "KITCHEN" for deduction-triggered events. */
+  warehouseType: "KITCHEN" | "MAIN";
+  /** New balance after the deduction (may be negative — prototype allows oversell). */
+  quantity: number;
+}
+
 export interface AdvanceResult {
   order_id: string;
   status: string;
@@ -86,6 +100,8 @@ export interface AdvanceResult {
   completedAt: string | null;
   /** Low-stock events emitted by this stage transition (emit via Task 8 realtime). */
   lowStockEvents: LowStockEvent[];
+  /** All stock changes from this transition (emit `stock.updated` for each). */
+  stockUpdates: StockUpdateEvent[];
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +447,8 @@ export async function advanceOrder(
   // Captured via closure from inside the transaction
   let updatedOrder!: typeof orders.$inferSelect;
   const lowStockEvents: LowStockEvent[] = [];
+  // Map: ingredientId → latest StockUpdateEvent (last write wins for same ingredient)
+  const stockUpdateMap = new Map<string, StockUpdateEvent>();
 
   await db.transaction(async (tx) => {
     // FIX A — Conditional update: only update if status hasn't changed since we read.
@@ -562,6 +580,17 @@ export async function advanceOrder(
 
             const newQty = Number(stockRow.quantity);
             const threshold = Number(ing?.lowStockThreshold ?? 0);
+            const ingName = ing?.name ?? line.ingredientId;
+
+            // Record stock update (Task 8: emit `stock.updated`).
+            // The map upsert means if multiple recipe lines share the same ingredient
+            // we report the final balance (last write wins).
+            stockUpdateMap.set(line.ingredientId, {
+              ingredientId: line.ingredientId,
+              ingredientName: ingName,
+              warehouseType: "KITCHEN",
+              quantity: newQty,
+            });
 
             // Emit low-stock event if qty is at/below threshold OR has gone negative.
             // FIX D — negative qty must never be silent (prototype oversell policy).
@@ -572,7 +601,7 @@ export async function advanceOrder(
               if (!alreadyAdded) {
                 lowStockEvents.push({
                   ingredientId: line.ingredientId,
-                  ingredientName: ing?.name ?? line.ingredientId,
+                  ingredientName: ingName,
                   quantity: newQty,
                   threshold,
                 });
@@ -592,6 +621,7 @@ export async function advanceOrder(
     readyAt: updatedOrder.readyAt?.toISOString() ?? null,
     completedAt: updatedOrder.completedAt?.toISOString() ?? null,
     lowStockEvents,
+    stockUpdates: [...stockUpdateMap.values()],
   };
 }
 

@@ -15,13 +15,21 @@
  *   ingest / read       — any authenticated user
  *   advance / cancel    — SUPER_ADMIN | KITCHEN_STAFF
  *   simulator start/stop— SUPER_ADMIN only
+ *
+ * Task 8 — realtime emissions:
+ *   order.created  → after successful ingest (not on DUPLICATE_ORDER)
+ *   order.updated  → after advance and after cancel
+ *   stock.updated  → for each ingredient deducted on NEW→PREPARING
+ *   lowstock.alert → for each low-stock ingredient triggered by deduction
  */
 import { Router, type Response } from "express";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { aggregatorEnum, orderStatusEnum } from "../../db/schema.js";
+import { aggregatorEnum, brands, locations, orderStatusEnum, orders } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
+import type { RealtimeHub } from "../../realtime/hub.js";
 import {
   ConflictError,
   NotFoundError,
@@ -85,10 +93,37 @@ function handleServiceError(err: unknown, res: Response): void {
 }
 
 // ---------------------------------------------------------------------------
+// Location resolution helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the ID of the single prototype location.
+ * Single DB round-trip; returns null if no location is seeded yet
+ * (graceful — the emit is simply skipped rather than crashing).
+ */
+async function getDefaultLocationId(db: DB): Promise<string | null> {
+  const [loc] = await db.select({ id: locations.id }).from(locations);
+  return loc?.id ?? null;
+}
+
+/**
+ * Resolves the location_id for a given order by joining order → brand → location.
+ * Used for advance / cancel events where we have an orderId but no brand_id in scope.
+ */
+async function getLocationIdForOrder(db: DB, orderId: string): Promise<string | null> {
+  const rows = await db
+    .select({ locationId: brands.locationId })
+    .from(orders)
+    .innerJoin(brands, eq(orders.brandId, brands.id))
+    .where(eq(orders.id, orderId));
+  return rows[0]?.locationId ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
-export function createOrdersRouter(db: DB): Router {
+export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   const router = Router();
 
   // ── POST /ingest/order ─────────────────────────────────────────────────
@@ -109,6 +144,21 @@ export function createOrdersRouter(db: DB): Router {
       }
 
       res.status(201).json(result);
+
+      // Task 8: emit order.created after successful HTTP response is sent
+      // Use brand_id from the validated input to resolve the location room.
+      const locationId = await getDefaultLocationId(db);
+      if (locationId) {
+        hub.emitToLocation(locationId, "order.created", {
+          order_id: result.order_id,
+          status: result.status,
+          brand_id: parsed.data.brand_id,
+          aggregator: parsed.data.aggregator,
+          external_ref: parsed.data.external_ref,
+          customer_name: parsed.data.customer_name ?? null,
+          print_jobs: result.print_jobs,
+        });
+      }
     } catch (err) {
       handleServiceError(err, res);
     }
@@ -180,9 +230,30 @@ export function createOrdersRouter(db: DB): Router {
       try {
         // FIX A — pass the authenticated user id so consumption_log.logged_by is set
         const result = await advanceOrder(db, id, req.user?.id);
-        // TODO (Task 8): emit order.updated + stock.updated + lowstock.alert
-        // via the realtime hub using result.lowStockEvents
         res.json(result);
+
+        // Task 8: emit order.updated, stock.updated (per ingredient), lowstock.alert
+        const locationId = await getLocationIdForOrder(db, id);
+        if (locationId) {
+          // order.updated — stage + timestamps
+          hub.emitToLocation(locationId, "order.updated", {
+            order_id: result.order_id,
+            status: result.status,
+            prepAt: result.prepAt,
+            readyAt: result.readyAt,
+            completedAt: result.completedAt,
+          });
+
+          // stock.updated — one event per ingredient whose balance changed
+          for (const update of result.stockUpdates) {
+            hub.emitToLocation(locationId, "stock.updated", update);
+          }
+
+          // lowstock.alert — one event per ingredient that crossed its threshold
+          for (const alert of result.lowStockEvents) {
+            hub.emitToLocation(locationId, "lowstock.alert", alert);
+          }
+        }
       } catch (err) {
         handleServiceError(err, res);
       }
@@ -200,6 +271,15 @@ export function createOrdersRouter(db: DB): Router {
       try {
         const result = await cancelOrder(db, id);
         res.json(result);
+
+        // Task 8: emit order.updated with CANCELLED status
+        const locationId = await getLocationIdForOrder(db, id);
+        if (locationId) {
+          hub.emitToLocation(locationId, "order.updated", {
+            order_id: id,
+            status: result.status,
+          });
+        }
       } catch (err) {
         handleServiceError(err, res);
       }

@@ -14,6 +14,9 @@
  *   inventory receive / ITO confirm → SUPER_ADMIN | WAREHOUSE
  *   ITO request / consumption log  → SUPER_ADMIN | KITCHEN_STAFF
  *   ingredient create              → SUPER_ADMIN only
+ *
+ * Task 8 — realtime emissions:
+ *   stock.updated → after /inventory/receive (MAIN) and /itos/:id/confirm (KITCHEN)
  */
 import { Router } from "express";
 import { and, eq, sql } from "drizzle-orm";
@@ -26,11 +29,13 @@ import {
   itoItems,
   itoStatusEnum,
   itos,
+  locations,
   warehouseTypeEnum,
   warehouses,
 } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
+import type { RealtimeHub } from "../../realtime/hub.js";
 
 // ---------------------------------------------------------------------------
 // RBAC role sets (§1 role matrix)
@@ -82,10 +87,20 @@ const createItoSchema = z.object({
 });
 
 // ---------------------------------------------------------------------------
+// Location resolution helper
+// ---------------------------------------------------------------------------
+
+/** Fetch the single prototype location id (gracefully returns null if not seeded). */
+async function getDefaultLocationId(db: DB): Promise<string | null> {
+  const [loc] = await db.select({ id: locations.id }).from(locations);
+  return loc?.id ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
-export function createInventoryRouter(db: DB): Router {
+export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   const router = Router();
 
   // Helper: look up a warehouse by its type (MAIN | KITCHEN) for this prototype's
@@ -240,6 +255,36 @@ export function createInventoryRouter(db: DB): Router {
       }
 
       res.status(201).json({ ok: true });
+
+      // Task 8: emit stock.updated for each received ingredient (MAIN warehouse)
+      const locationId = await getDefaultLocationId(db);
+      if (locationId) {
+        for (const item of parsed.data.items) {
+          // Read back the new MAIN balance
+          const [stockRow] = await db
+            .select({ quantity: inventoryStock.quantity })
+            .from(inventoryStock)
+            .where(
+              and(
+                eq(inventoryStock.warehouseId, mainWarehouse.id),
+                eq(inventoryStock.ingredientId, item.ingredient_id),
+              ),
+            );
+          const [ing] = await db
+            .select({ name: ingredients.name })
+            .from(ingredients)
+            .where(eq(ingredients.id, item.ingredient_id));
+
+          if (stockRow) {
+            hub.emitToLocation(locationId, "stock.updated", {
+              ingredientId: item.ingredient_id,
+              ingredientName: ing?.name ?? item.ingredient_id,
+              warehouseType: "MAIN",
+              quantity: Number(stockRow.quantity),
+            });
+          }
+        }
+      }
     },
   );
 
@@ -472,6 +517,36 @@ export function createInventoryRouter(db: DB): Router {
       });
 
       res.json(confirmedIto!);
+
+      // Task 8: emit stock.updated for each ingredient moved to KITCHEN
+      const locationId = await getDefaultLocationId(db);
+      if (locationId) {
+        for (const item of items) {
+          // Read back the new KITCHEN balance after the transaction
+          const [stockRow] = await db
+            .select({ quantity: inventoryStock.quantity })
+            .from(inventoryStock)
+            .where(
+              and(
+                eq(inventoryStock.warehouseId, ito.toWarehouseId),
+                eq(inventoryStock.ingredientId, item.ingredientId),
+              ),
+            );
+          const [ing] = await db
+            .select({ name: ingredients.name })
+            .from(ingredients)
+            .where(eq(ingredients.id, item.ingredientId));
+
+          if (stockRow) {
+            hub.emitToLocation(locationId, "stock.updated", {
+              ingredientId: item.ingredientId,
+              ingredientName: ing?.name ?? item.ingredientId,
+              warehouseType: "KITCHEN",
+              quantity: Number(stockRow.quantity),
+            });
+          }
+        }
+      }
     },
   );
 

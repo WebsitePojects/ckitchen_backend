@@ -1,0 +1,2 @@
+ALTER TABLE "consumption_log" ADD COLUMN "order_id" uuid;--> statement-breakpoint
+ALTER TABLE "consumption_log" ADD CONSTRAINT "consumption_log_order_id_order_id_fk" FOREIGN KEY ("order_id") REFERENCES "public"."order"("id") ON DELETE no action ON UPDATE no action;

@@ -23,6 +23,7 @@ import { aggregatorEnum, orderStatusEnum } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import {
+  ConflictError,
   NotFoundError,
   ValidationError,
   advanceOrder,
@@ -74,6 +75,9 @@ function handleServiceError(err: unknown, res: Response): void {
     sendError(res, 404, err.code, err.message);
   } else if (err instanceof ValidationError) {
     sendError(res, 400, err.code, err.message);
+  } else if (err instanceof ConflictError) {
+    // FIX A — concurrent double-advance returns 409 CONFLICT
+    sendError(res, 409, err.code, err.message);
   } else {
     const message = err instanceof Error ? err.message : "Internal server error.";
     sendError(res, 500, "INTERNAL_ERROR", message);
@@ -174,7 +178,8 @@ export function createOrdersRouter(db: DB): Router {
       const id = paramAsString(req.params.id);
 
       try {
-        const result = await advanceOrder(db, id);
+        // FIX A — pass the authenticated user id so consumption_log.logged_by is set
+        const result = await advanceOrder(db, id, req.user?.id);
         // TODO (Task 8): emit order.updated + stock.updated + lowstock.alert
         // via the realtime hub using result.lowStockEvents
         res.json(result);

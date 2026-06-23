@@ -11,12 +11,23 @@
  * Design note: low-stock events are RETURNED from advanceOrder so the caller
  * (route handler / Task 8 realtime layer) can emit `lowstock.alert` over Socket.IO.
  * The service itself does NOT emit — separation of concerns for Task 8.
+ *
+ * Correctness fixes (Opus review):
+ *   FIX A — conditional update (WHERE status=expected) prevents concurrent double-deduction
+ *   FIX B — consumption_log with order_id tracks what was actually deducted; cancel uses
+ *            the ledger (not current recipe) and deletes rows to prevent double-restock
+ *   FIX C — unique constraint violation on (aggregator,external_ref) is caught and
+ *            returned as DUPLICATE_ORDER instead of a 500
+ *   FIX D — missing KITCHEN inventory_stock row is created at qty=0 before deducting,
+ *            allowing the balance to go visibly negative (prototype allows oversell;
+ *            production should decide INSUFFICIENT_STOCK block vs allow+flag)
  */
-import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
   aggregatorAccounts,
   brands,
+  consumptionLogs,
   ingredients,
   inventoryStock,
   kitchenStations,
@@ -105,6 +116,14 @@ export class ValidationError extends ServiceError {
   }
 }
 
+/** FIX A — thrown when a concurrent advance wins the conditional update race. */
+export class ConflictError extends ServiceError {
+  constructor(message: string) {
+    super("CONFLICT", message);
+    this.name = "ConflictError";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stage progression
 // ---------------------------------------------------------------------------
@@ -120,6 +139,24 @@ function nextStage(current: OrderStatus): OrderStatus {
     );
   }
   return STAGE_ORDER[idx + 1] as OrderStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: detect PostgreSQL unique-violation from pglite/drizzle errors
+// ---------------------------------------------------------------------------
+
+function isUniqueViolation(err: unknown): boolean {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    // PGlite surfaces PG error code on the error object
+    if (e["code"] === "23505") return true;
+    // Some wrappers nest it under cause
+    if (e["cause"] && typeof e["cause"] === "object") {
+      const cause = e["cause"] as Record<string, unknown>;
+      if (cause["code"] === "23505") return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,37 +176,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     );
 
   if (existing) {
-    // Return the existing order; attach its print jobs
-    const existingJobs = await db
-      .select({
-        id: printJobs.id,
-        stationId: printJobs.stationId,
-        printerId: printJobs.printerId,
-      })
-      .from(printJobs)
-      .where(eq(printJobs.orderId, existing.id));
-
-    // Resolve station names for the existing jobs
-    const stationIds = [...new Set(existingJobs.map((j) => j.stationId))];
-    const stationRows =
-      stationIds.length > 0
-        ? await db
-            .select({ id: kitchenStations.id, name: kitchenStations.name })
-            .from(kitchenStations)
-            .where(inArray(kitchenStations.id, stationIds))
-        : [];
-    const stationNameById = new Map(stationRows.map((s) => [s.id, s.name]));
-
-    return {
-      order_id: existing.id,
-      status: existing.status,
-      print_jobs: existingJobs.map((j) => ({
-        id: j.id,
-        station: stationNameById.get(j.stationId) ?? j.stationId,
-        printer: j.printerId,
-      })),
-      code: "DUPLICATE_ORDER",
-    };
+    return buildDuplicateResponse(db, existing);
   }
 
   // ── VALIDATE BRAND ───────────────────────────────────────────────────────
@@ -262,78 +269,100 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
   let createdOrderStatus = "NEW";
   const createdPrintJobs: PrintJobSummary[] = [];
 
-  await db.transaction(async (tx) => {
-    // Create the order
-    const [createdOrder] = await tx
-      .insert(orders)
-      .values({
-        brandId: input.brand_id,
-        aggregatorAccountId: account.id,
-        aggregator: input.aggregator,
-        externalRef: input.external_ref,
-        customerName: input.customer_name,
-        status: "NEW",
-        total,
-        placedAt,
-      })
-      .returning();
-
-    createdOrderId = createdOrder.id;
-    createdOrderStatus = createdOrder.status;
-
-    // Create order items
-    await tx.insert(orderItems).values(
-      resolvedItems.map((item) => ({
-        orderId: createdOrder.id,
-        menuItemId: item.menuItemId,
-        qty: item.qty,
-        stationId: item.stationId,
-        notes: item.notes ?? null,
-      })),
-    );
-
-    // Create ONE print job per distinct station
-    for (const [stationId, group] of stationGroupMap.entries()) {
-      // Fetch station default printer
-      const [station] = await tx
-        .select()
-        .from(kitchenStations)
-        .where(eq(kitchenStations.id, stationId));
-
-      const kotPayload = {
-        type: "KOT",
-        brand: brand.name,
-        aggregator: input.aggregator,
-        order_ref: input.external_ref,
-        station: group.stationName,
-        placed_at: placedAt.toISOString(),
-        customer: input.customer_name ?? null,
-        items: group.items.map((i) => ({
-          qty: i.qty,
-          name: i.name,
-          notes: i.notes ?? null,
-        })),
-        footer: "CloudKitchen ONE",
-      };
-
-      const [printJob] = await tx
-        .insert(printJobs)
+  try {
+    await db.transaction(async (tx) => {
+      // Create the order
+      const [createdOrder] = await tx
+        .insert(orders)
         .values({
-          orderId: createdOrder.id,
-          stationId,
-          printerId: station?.defaultPrinterId ?? null,
-          payload: kotPayload,
-          status: "PENDING",
+          brandId: input.brand_id,
+          aggregatorAccountId: account.id,
+          aggregator: input.aggregator,
+          externalRef: input.external_ref,
+          customerName: input.customer_name,
+          status: "NEW",
+          total,
+          placedAt,
         })
         .returning();
 
-      createdPrintJobs.push({
-        id: printJob.id,
-        station: group.stationName,
-        printer: printJob.printerId,
-      });
+      createdOrderId = createdOrder.id;
+      createdOrderStatus = createdOrder.status;
+
+      // Create order items
+      await tx.insert(orderItems).values(
+        resolvedItems.map((item) => ({
+          orderId: createdOrder.id,
+          menuItemId: item.menuItemId,
+          qty: item.qty,
+          stationId: item.stationId,
+          notes: item.notes ?? null,
+        })),
+      );
+
+      // Create ONE print job per distinct station
+      for (const [stationId, group] of stationGroupMap.entries()) {
+        // Fetch station default printer
+        const [station] = await tx
+          .select()
+          .from(kitchenStations)
+          .where(eq(kitchenStations.id, stationId));
+
+        const kotPayload = {
+          type: "KOT",
+          brand: brand.name,
+          aggregator: input.aggregator,
+          order_ref: input.external_ref,
+          station: group.stationName,
+          placed_at: placedAt.toISOString(),
+          customer: input.customer_name ?? null,
+          items: group.items.map((i) => ({
+            qty: i.qty,
+            name: i.name,
+            notes: i.notes ?? null,
+          })),
+          footer: "CloudKitchen ONE",
+        };
+
+        const [printJob] = await tx
+          .insert(printJobs)
+          .values({
+            orderId: createdOrder.id,
+            stationId,
+            printerId: station?.defaultPrinterId ?? null,
+            payload: kotPayload,
+            status: "PENDING",
+          })
+          .returning();
+
+        createdPrintJobs.push({
+          id: printJob.id,
+          station: group.stationName,
+          printer: printJob.printerId,
+        });
+      }
+    });
+  } catch (err) {
+    // FIX C — graceful handling of concurrent duplicate ingests.
+    // If two requests with the same (aggregator, external_ref) race past the
+    // pre-check above, one INSERT wins and the other hits a UNIQUE violation
+    // (PG code 23505). Return the existing order instead of a 500.
+    if (isUniqueViolation(err)) {
+      const [raceExisting] = await db
+        .select()
+        .from(orders)
+        .where(
+          and(
+            eq(orders.aggregator, input.aggregator),
+            eq(orders.externalRef, input.external_ref),
+          ),
+        );
+      if (raceExisting) {
+        return buildDuplicateResponse(db, raceExisting);
+      }
     }
-  });
+    throw err;
+  }
 
   return {
     order_id: createdOrderId,
@@ -342,12 +371,52 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
   };
 }
 
+// Helper shared by idempotency check and race-condition catch
+async function buildDuplicateResponse(
+  db: DB,
+  existing: typeof orders.$inferSelect,
+): Promise<IngestResult> {
+  const existingJobs = await db
+    .select({
+      id: printJobs.id,
+      stationId: printJobs.stationId,
+      printerId: printJobs.printerId,
+    })
+    .from(printJobs)
+    .where(eq(printJobs.orderId, existing.id));
+
+  const stationIds = [...new Set(existingJobs.map((j) => j.stationId))];
+  const stationRows =
+    stationIds.length > 0
+      ? await db
+          .select({ id: kitchenStations.id, name: kitchenStations.name })
+          .from(kitchenStations)
+          .where(inArray(kitchenStations.id, stationIds))
+      : [];
+  const stationNameById = new Map(stationRows.map((s) => [s.id, s.name]));
+
+  return {
+    order_id: existing.id,
+    status: existing.status,
+    print_jobs: existingJobs.map((j) => ({
+      id: j.id,
+      station: stationNameById.get(j.stationId) ?? j.stationId,
+      printer: j.printerId,
+    })),
+    code: "DUPLICATE_ORDER",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // advanceOrder — POST /orders/:id/advance
 // On NEW→PREPARING: runs the deduction engine in the same transaction.
 // ---------------------------------------------------------------------------
 
-export async function advanceOrder(db: DB, orderId: string): Promise<AdvanceResult> {
+export async function advanceOrder(
+  db: DB,
+  orderId: string,
+  userId?: string,
+): Promise<AdvanceResult> {
   // Load the order
   const [order] = await db.select().from(orders).where(eq(orders.id, orderId));
   if (!order) throw new NotFoundError("Order not found.");
@@ -357,13 +426,17 @@ export async function advanceOrder(db: DB, orderId: string): Promise<AdvanceResu
   }
 
   const next = nextStage(order.status); // throws ValidationError if COMPLETED
+  const expectedCurrentStatus = order.status; // captured for the conditional update
 
   // Captured via closure from inside the transaction
   let updatedOrder!: typeof orders.$inferSelect;
   const lowStockEvents: LowStockEvent[] = [];
 
   await db.transaction(async (tx) => {
-    // Build the status update; set the appropriate stage timestamp
+    // FIX A — Conditional update: only update if status hasn't changed since we read.
+    // This is the double-deduction guard. If a concurrent advance already moved the
+    // order to the next status, this update finds 0 rows and we abort immediately,
+    // preventing duplicate stock deduction.
     const now = new Date();
     const updateSet: Partial<typeof orders.$inferInsert> = {
       status: next,
@@ -373,16 +446,26 @@ export async function advanceOrder(db: DB, orderId: string): Promise<AdvanceResu
     if (next === "READY") updateSet.readyAt = now;
     if (next === "COMPLETED") updateSet.completedAt = now;
 
-    const [updated] = await tx
+    const updatedRows = await tx
       .update(orders)
       .set(updateSet)
-      .where(eq(orders.id, orderId))
+      .where(and(eq(orders.id, orderId), eq(orders.status, expectedCurrentStatus)))
       .returning();
 
-    updatedOrder = updated;
+    if (updatedRows.length === 0) {
+      // Another concurrent request already advanced this order.
+      // Abort the transaction without deducting stock.
+      throw new ConflictError(
+        "Order was modified concurrently. Another advance is already in progress.",
+      );
+    }
+
+    updatedOrder = updatedRows[0];
 
     // ── DEDUCTION ENGINE (fires ONLY on NEW → PREPARING) ──────────────────
     // CK1-ARC-002 §5.1, Cardinal Rule #2
+    // Deduction runs here ONLY because the conditional update above succeeded —
+    // guaranteeing exactly-once deduction even under concurrent advance calls.
     if (next === "PREPARING") {
       // Locate the KITCHEN warehouse (single location prototype)
       const [kitchenWarehouse] = await tx
@@ -409,6 +492,31 @@ export async function advanceOrder(db: DB, orderId: string): Promise<AdvanceResu
           // qty = portion_qty * order_item.qty  (Rule #3: brand-specific portion)
           const qtyToDeduct = Number(line.portionQty) * item.qty;
 
+          // FIX D — Ensure the KITCHEN inventory_stock row exists before deducting.
+          // If the row is absent (ingredient never received into KITCHEN), create it
+          // at qty=0 and allow the balance to go negative. This makes "oversell"
+          // visible rather than silently skipping the deduction.
+          //
+          // prototype allows oversell; production should decide
+          // INSUFFICIENT_STOCK block vs allow+flag
+          const [existingStock] = await tx
+            .select()
+            .from(inventoryStock)
+            .where(
+              and(
+                eq(inventoryStock.warehouseId, kitchenWarehouse.id),
+                eq(inventoryStock.ingredientId, line.ingredientId),
+              ),
+            );
+
+          if (!existingStock) {
+            await tx.insert(inventoryStock).values({
+              warehouseId: kitchenWarehouse.id,
+              ingredientId: line.ingredientId,
+              quantity: "0",
+            });
+          }
+
           // Decrement the SHARED KITCHEN pool for this ingredient
           await tx
             .update(inventoryStock)
@@ -421,6 +529,17 @@ export async function advanceOrder(db: DB, orderId: string): Promise<AdvanceResu
                 eq(inventoryStock.ingredientId, line.ingredientId),
               ),
             );
+
+          // FIX B — Record what was actually deducted in the consumption ledger.
+          // Tagged with orderId so cancelOrder can look up the exact amounts and
+          // restock from this record (not from the current recipe, which may have
+          // changed since the order was placed).
+          await tx.insert(consumptionLogs).values({
+            ingredientId: line.ingredientId,
+            quantity: String(qtyToDeduct),
+            loggedBy: userId ?? null,
+            orderId,
+          });
 
           // Read back the new balance to check threshold
           const [stockRow] = await tx
@@ -444,9 +563,9 @@ export async function advanceOrder(db: DB, orderId: string): Promise<AdvanceResu
             const newQty = Number(stockRow.quantity);
             const threshold = Number(ing?.lowStockThreshold ?? 0);
 
-            // Emit low-stock event if qty has crossed the threshold
-            // (Rule #8: prompt repurchase / ITO)
-            if (newQty <= threshold) {
+            // Emit low-stock event if qty is at/below threshold OR has gone negative.
+            // FIX D — negative qty must never be silent (prototype oversell policy).
+            if (newQty <= threshold || newQty < 0) {
               const alreadyAdded = lowStockEvents.some(
                 (e) => e.ingredientId === line.ingredientId,
               );
@@ -500,28 +619,33 @@ export async function cancelOrder(db: DB, orderId: string): Promise<{ status: st
   await db.transaction(async (tx) => {
     if (needsRestock) {
       // ── COMPENSATING RESTOCK ───────────────────────────────────────────
-      // Recompute what was deducted and add it back to KITCHEN.
-      const [kitchenWarehouse] = await tx
+      // FIX B — Restock using the RECORDED consumption ledger for this order,
+      // NOT by re-deriving from the current recipe_lines. This is correct even
+      // if the recipe was changed after the order was placed.
+      //
+      // We also DELETE the log rows so a double-cancel cannot double-restock.
+      const logRows = await tx
         .select()
-        .from(warehouses)
-        .where(eq(warehouses.type, "KITCHEN"));
+        .from(consumptionLogs)
+        .where(eq(consumptionLogs.orderId, orderId));
 
-      if (!kitchenWarehouse) throw new Error("KITCHEN warehouse not configured.");
-
-      const items = await tx
-        .select()
-        .from(orderItems)
-        .where(eq(orderItems.orderId, orderId));
-
-      for (const item of items) {
-        const lines = await tx
+      if (logRows.length > 0) {
+        const [kitchenWarehouse] = await tx
           .select()
-          .from(recipeLines)
-          .where(eq(recipeLines.menuItemId, item.menuItemId));
+          .from(warehouses)
+          .where(eq(warehouses.type, "KITCHEN"));
 
-        for (const line of lines) {
-          const qtyToRestore = Number(line.portionQty) * item.qty;
+        if (!kitchenWarehouse) throw new Error("KITCHEN warehouse not configured.");
 
+        // Aggregate per ingredient (a single ingredient may appear in multiple log rows
+        // if the order had multiple line items using the same ingredient)
+        const restockByIngredient = new Map<string, number>();
+        for (const row of logRows) {
+          const prev = restockByIngredient.get(row.ingredientId) ?? 0;
+          restockByIngredient.set(row.ingredientId, prev + Number(row.quantity));
+        }
+
+        for (const [ingredientId, qtyToRestore] of restockByIngredient.entries()) {
           await tx
             .update(inventoryStock)
             .set({
@@ -530,10 +654,17 @@ export async function cancelOrder(db: DB, orderId: string): Promise<{ status: st
             .where(
               and(
                 eq(inventoryStock.warehouseId, kitchenWarehouse.id),
-                eq(inventoryStock.ingredientId, line.ingredientId),
+                eq(inventoryStock.ingredientId, ingredientId),
               ),
             );
         }
+
+        // Delete the consumption log rows for this order AFTER restocking.
+        // This is the double-cancel guard: if cancelOrder is called again,
+        // logRows will be empty and no restock will happen.
+        await tx
+          .delete(consumptionLogs)
+          .where(eq(consumptionLogs.orderId, orderId));
       }
     }
 

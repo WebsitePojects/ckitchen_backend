@@ -15,6 +15,13 @@
       "when": 1782234181938,
       "tag": "0001_add_cancelled_order_status",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782235409154,
+      "tag": "0002_outgoing_liz_osborn",
+      "breakpoints": true
     }
   ]
 }

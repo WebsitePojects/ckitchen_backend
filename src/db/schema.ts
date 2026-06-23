@@ -401,6 +401,7 @@ export const consumptionLogs = pgTable("consumption_log", {
   quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
   logDate: timestamp("log_date", { withTimezone: true }).notNull().defaultNow(),
   loggedBy: uuid("logged_by").references(() => users.id),
+  orderId: uuid("order_id").references(() => orders.id),
 });
 
 export type ConsumptionLog = typeof consumptionLogs.$inferSelect;

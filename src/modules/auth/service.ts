@@ -23,9 +23,23 @@ export function signToken(
   jwtSecret: string,
 ): string {
   const payload: AuthTokenPayload = { sub: user.id, role: user.role };
-  return jwt.sign(payload, jwtSecret, { expiresIn: "12h" });
+  return jwt.sign(payload, jwtSecret, { algorithm: "HS256", expiresIn: "12h" });
 }
 
+/**
+ * Verifies a JWT, pinning the algorithm to HS256 (prevents alg-confusion attacks) and rejecting
+ * a signed-but-malformed payload (missing `sub`/`role`) rather than yielding undefined authz
+ * fields to callers.
+ */
 export function verifyToken(token: string, jwtSecret: string): AuthTokenPayload {
-  return jwt.verify(token, jwtSecret) as AuthTokenPayload;
+  const payload = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] });
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    typeof (payload as Record<string, unknown>).sub !== "string" ||
+    typeof (payload as Record<string, unknown>).role !== "string"
+  ) {
+    throw new Error("Invalid token payload: missing sub/role.");
+  }
+  return payload as unknown as AuthTokenPayload;
 }

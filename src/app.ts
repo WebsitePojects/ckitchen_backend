@@ -6,6 +6,7 @@ import { createBrandsRouter } from "./modules/brands/routes.js";
 import { createStationsRouter } from "./modules/stations/routes.js";
 import { createMenuRouter } from "./modules/menu/routes.js";
 import { createInventoryRouter } from "./modules/inventory/routes.js";
+import { createOrdersRouter } from "./modules/orders/routes.js";
 
 /** Express app factory. Takes the db so tests can inject an isolated in-memory instance. */
 export function createApp(db: DB): Express {
@@ -19,6 +20,7 @@ export function createApp(db: DB): Express {
   app.use("/api/v1", createStationsRouter(db));
   app.use("/api/v1", createMenuRouter(db));
   app.use("/api/v1", createInventoryRouter(db));
+  app.use("/api/v1", createOrdersRouter(db));
 
   return app;
 }

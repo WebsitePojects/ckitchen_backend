@@ -17,3 +17,6 @@ agent/**/obj/
 # Prisma / Supabase local
 prisma/*.db
 .supabase/
+
+# PGlite file-backed local dev DB
+.data/

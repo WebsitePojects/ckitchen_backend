@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "./schema.js";
 
 export type DB = ReturnType<typeof createDb>["db"];
 
@@ -13,6 +14,6 @@ export function createDb(dataDir?: string) {
     mkdirSync(dirname(dataDir), { recursive: true });
   }
   const client = new PGlite(dataDir);
-  const db = drizzle(client);
+  const db = drizzle(client, { schema });
   return { client, db };
 }

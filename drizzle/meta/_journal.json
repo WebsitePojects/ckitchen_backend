@@ -8,6 +8,13 @@
       "when": 1782230323241,
       "tag": "0000_sticky_brood",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1782234181938,
+      "tag": "0001_add_cancelled_order_status",
+      "breakpoints": true
     }
   ]
 }

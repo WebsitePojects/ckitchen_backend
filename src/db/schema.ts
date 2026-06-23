@@ -28,6 +28,7 @@ export const orderStatusEnum = pgEnum("order_status", [
   "PREPARING",
   "READY",
   "COMPLETED",
+  "CANCELLED",
 ]);
 
 export const itoStatusEnum = pgEnum("ito_status", ["REQUESTED", "CONFIRMED", "CANCELLED"]);

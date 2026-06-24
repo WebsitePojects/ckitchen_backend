@@ -1,4 +1,5 @@
 import express, { type Express } from "express";
+import cors from "cors";
 import type { DB } from "./db/client.js";
 import { createNoopHub, type RealtimeHub } from "./realtime/hub.js";
 import { healthRouter } from "./routes/health.js";
@@ -20,6 +21,9 @@ import { createAnalyticsRouter } from "./modules/analytics/routes.js";
  */
 export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   const app = express();
+  // Allow the hosted frontend (different origin in production) to call the REST API.
+  // Bearer-token auth (no cookies), so a wildcard origin is safe; restrict via CORS_ORIGIN if desired.
+  app.use(cors({ origin: process.env.CORS_ORIGIN ?? "*" }));
   app.use(express.json());
   app.set("db", db);
 

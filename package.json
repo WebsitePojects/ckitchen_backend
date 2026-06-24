@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
+    "start": "tsx src/server.ts",
     "test": "vitest run",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",
@@ -16,14 +17,17 @@
   "dependencies": {
     "@electric-sql/pglite": "^0.5.3",
     "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "postgres": "^3.4.9",
     "socket.io": "^4.8.3",
+    "tsx": "^4.22.4",
     "zod": "^4.1.9"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.17",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.13.2",
@@ -31,7 +35,6 @@
     "drizzle-kit": "^0.31.10",
     "socket.io-client": "^4.8.3",
     "supertest": "^7.2.2",
-    "tsx": "^4.22.4",
     "typescript": "^5.9.3",
     "vitest": "^4.1.9"
   }

@@ -1,0 +1,238 @@
+/**
+ * Menu Items & Recipes — CK1-API-003 §5
+ *
+ * Key endpoints:
+ *   GET  /brands/:id/menu          – list a brand's menu items
+ *   POST /brands/:id/menu          – create a menu item (SUPER_ADMIN | BRAND_MANAGER)
+ *   PATCH /menu/:id                – update fields incl. availability
+ *   GET  /menu/:id/recipe          – list recipe lines
+ *   PUT  /menu/:id/recipe          – REPLACE recipe lines (transactional delete+insert)
+ *
+ * Cardinal Business Rule #3: one ingredient_id shared across brands; each RecipeLine
+ * carries its OWN brand-specific portion_qty.
+ */
+import { Router } from "express";
+import { eq } from "drizzle-orm";
+import { z } from "zod";
+import type { DB } from "../../db/client.js";
+import {
+  availabilityEnum,
+  brands,
+  ingredients,
+  menuItems,
+  recipeLines,
+} from "../../db/schema.js";
+import { requireAuth, requireRole } from "../auth/middleware.js";
+import { paramAsString, sendError } from "../http-errors.js";
+
+const WRITE_ROLES = ["SUPER_ADMIN", "BRAND_MANAGER"] as const;
+
+// ---------------------------------------------------------------------------
+// Validation schemas
+// ---------------------------------------------------------------------------
+
+const createMenuItemSchema = z.object({
+  name: z.string().min(1),
+  price: z.union([z.string().min(1), z.number()]),
+  prep_time_min: z.number().int().positive().optional(),
+  station_id: z.string().uuid().optional(),
+  availability: z.enum(availabilityEnum.enumValues).optional(),
+});
+
+const updateMenuItemSchema = z
+  .object({
+    name: z.string().min(1).optional(),
+    price: z.union([z.string().min(1), z.number()]).optional(),
+    prep_time_min: z.number().int().positive().optional(),
+    station_id: z.string().uuid().optional(),
+    availability: z.enum(availabilityEnum.enumValues).optional(),
+  })
+  .refine((body) => Object.keys(body).some((k) => body[k as keyof typeof body] !== undefined), {
+    message: "At least one field is required.",
+  });
+
+const recipeLineSchema = z.object({
+  ingredient_id: z.string().uuid(),
+  portion_qty: z.union([z.string().min(1), z.number()]),
+  unit: z.string().min(1),
+});
+
+const putRecipeSchema = z.object({
+  lines: z.array(recipeLineSchema),
+});
+
+// ---------------------------------------------------------------------------
+// Router factory
+// ---------------------------------------------------------------------------
+
+export function createMenuRouter(db: DB): Router {
+  const router = Router();
+
+  // -------------------------------------------------------------------------
+  // GET /brands/:id/menu — list a brand's menu items
+  // -------------------------------------------------------------------------
+  router.get("/brands/:id/menu", requireAuth, async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+    if (!brand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const rows = await db.select().from(menuItems).where(eq(menuItems.brandId, id));
+    res.json(rows);
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /brands/:id/menu — create a menu item
+  // -------------------------------------------------------------------------
+  router.post("/brands/:id/menu", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+    if (!brand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const parsed = createMenuItemSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid menu item payload.", parsed.error.issues);
+      return;
+    }
+
+    const [item] = await db
+      .insert(menuItems)
+      .values({
+        brandId: id,
+        name: parsed.data.name,
+        price: String(parsed.data.price),
+        prepTimeMin: parsed.data.prep_time_min,
+        stationId: parsed.data.station_id,
+        availability: parsed.data.availability ?? "AVAILABLE",
+      })
+      .returning();
+
+    res.status(201).json(item);
+  });
+
+  // -------------------------------------------------------------------------
+  // PATCH /menu/:id — update menu item fields (incl. availability toggle)
+  // -------------------------------------------------------------------------
+  router.patch("/menu/:id", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [existing] = await db.select().from(menuItems).where(eq(menuItems.id, id));
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+      return;
+    }
+
+    const parsed = updateMenuItemSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid menu item payload.", parsed.error.issues);
+      return;
+    }
+
+    const updates: Partial<typeof menuItems.$inferInsert> = {};
+    if (parsed.data.name !== undefined) updates.name = parsed.data.name;
+    if (parsed.data.price !== undefined) updates.price = String(parsed.data.price);
+    if (parsed.data.prep_time_min !== undefined) updates.prepTimeMin = parsed.data.prep_time_min;
+    if (parsed.data.station_id !== undefined) updates.stationId = parsed.data.station_id;
+    if (parsed.data.availability !== undefined) updates.availability = parsed.data.availability;
+
+    const [updated] = await db
+      .update(menuItems)
+      .set(updates)
+      .where(eq(menuItems.id, id))
+      .returning();
+
+    res.json(updated);
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /menu/:id/recipe — list recipe lines for a menu item
+  // -------------------------------------------------------------------------
+  router.get("/menu/:id/recipe", requireAuth, async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [item] = await db.select().from(menuItems).where(eq(menuItems.id, id));
+    if (!item) {
+      sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+      return;
+    }
+
+    const lines = await db
+      .select()
+      .from(recipeLines)
+      .where(eq(recipeLines.menuItemId, id));
+
+    res.json(lines);
+  });
+
+  // -------------------------------------------------------------------------
+  // PUT /menu/:id/recipe — REPLACE all recipe lines (transactional)
+  //
+  // Cardinal Rule #3: a single ingredient_id is shared across brands; the
+  // portion_qty on each RecipeLine is brand-specific. Teriyaki Chicken may
+  // deduct 200 g while Korean Fried Chicken deducts 150 g from ONE pool.
+  // -------------------------------------------------------------------------
+  router.put("/menu/:id/recipe", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [item] = await db.select().from(menuItems).where(eq(menuItems.id, id));
+    if (!item) {
+      sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+      return;
+    }
+
+    const parsed = putRecipeSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid recipe payload.", parsed.error.issues);
+      return;
+    }
+
+    // Validate every ingredient_id exists before touching the DB
+    for (const line of parsed.data.lines) {
+      const [ing] = await db
+        .select()
+        .from(ingredients)
+        .where(eq(ingredients.id, line.ingredient_id));
+      if (!ing) {
+        sendError(
+          res,
+          404,
+          "NOT_FOUND",
+          `Ingredient ${line.ingredient_id} not found.`,
+        );
+        return;
+      }
+    }
+
+    // Transactional REPLACE: delete existing lines, insert the new set atomically
+    let newLines: (typeof recipeLines.$inferSelect)[] = [];
+
+    await db.transaction(async (tx) => {
+      await tx.delete(recipeLines).where(eq(recipeLines.menuItemId, id));
+
+      if (parsed.data.lines.length > 0) {
+        newLines = await tx
+          .insert(recipeLines)
+          .values(
+            parsed.data.lines.map((line) => ({
+              menuItemId: id,
+              ingredientId: line.ingredient_id,
+              portionQty: String(line.portion_qty),
+              unit: line.unit,
+            })),
+          )
+          .returning();
+      }
+    });
+
+    res.json(newLines);
+  });
+
+  return router;
+}

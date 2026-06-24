@@ -1,0 +1,408 @@
+import {
+  boolean,
+  integer,
+  jsonb,
+  numeric,
+  pgEnum,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
+
+// ---------------------------------------------------------------------------
+// Enums (CK1-ARC-002 §4.2)
+// ---------------------------------------------------------------------------
+
+export const aggregatorEnum = pgEnum("aggregator", ["FOODPANDA", "GRABFOOD", "OTHER"]);
+
+export const availabilityEnum = pgEnum("availability", [
+  "AVAILABLE",
+  "PAUSED",
+  "SOLD_OUT",
+]);
+
+export const orderStatusEnum = pgEnum("order_status", [
+  "NEW",
+  "PREPARING",
+  "READY",
+  "COMPLETED",
+  "CANCELLED",
+]);
+
+export const itoStatusEnum = pgEnum("ito_status", ["REQUESTED", "CONFIRMED", "CANCELLED"]);
+
+export const printerConnectionEnum = pgEnum("printer_connection", [
+  "USB",
+  "NETWORK",
+  "SERIAL",
+]);
+
+export const printerStatusEnum = pgEnum("printer_status", ["ONLINE", "OFFLINE", "ERROR"]);
+
+export const printJobStatusEnum = pgEnum("print_job_status", ["PENDING", "PRINTED", "FAILED"]);
+
+export const warehouseTypeEnum = pgEnum("warehouse_type", ["MAIN", "KITCHEN"]);
+
+export const roleEnum = pgEnum("role", [
+  "SUPER_ADMIN",
+  "BRAND_MANAGER",
+  "KITCHEN_STAFF",
+  "WAREHOUSE",
+  "SUPPLIER_COORDINATOR",
+  "ACCOUNTANT",
+  "RIDER",
+]);
+
+// ---------------------------------------------------------------------------
+// location
+// ---------------------------------------------------------------------------
+
+export const locations = pgTable("location", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  address: text("address"),
+});
+
+export type Location = typeof locations.$inferSelect;
+export type NewLocation = typeof locations.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// brand
+// ---------------------------------------------------------------------------
+
+export const brands = pgTable("brand", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  locationId: uuid("location_id")
+    .notNull()
+    .references(() => locations.id),
+  name: text("name").notNull(),
+  logoUrl: text("logo_url"),
+  color: text("color").notNull(),
+  salesPerfId: text("sales_perf_id").notNull(),
+  isActive: boolean("is_active").notNull().default(true),
+});
+
+export type Brand = typeof brands.$inferSelect;
+export type NewBrand = typeof brands.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// aggregator_account
+// ---------------------------------------------------------------------------
+
+export const aggregatorAccounts = pgTable("aggregator_account", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  brandId: uuid("brand_id")
+    .notNull()
+    .references(() => brands.id),
+  aggregator: aggregatorEnum("aggregator").notNull(),
+  externalMerchantId: text("external_merchant_id").notNull(),
+  credentialRef: text("credential_ref"),
+  isActive: boolean("is_active").notNull().default(true),
+});
+
+export type AggregatorAccount = typeof aggregatorAccounts.$inferSelect;
+export type NewAggregatorAccount = typeof aggregatorAccounts.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// printer
+// ---------------------------------------------------------------------------
+
+export const printers = pgTable("printer", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  connection: printerConnectionEnum("connection").notNull(),
+  address: text("address").notNull(),
+  status: printerStatusEnum("status").notNull().default("OFFLINE"),
+  lastSeen: timestamp("last_seen", { withTimezone: true }),
+});
+
+export type Printer = typeof printers.$inferSelect;
+export type NewPrinter = typeof printers.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// kitchen_station
+// ---------------------------------------------------------------------------
+
+export const kitchenStations = pgTable("kitchen_station", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  locationId: uuid("location_id")
+    .notNull()
+    .references(() => locations.id),
+  name: text("name").notNull(),
+  defaultPrinterId: uuid("default_printer_id").references(() => printers.id),
+});
+
+export type KitchenStation = typeof kitchenStations.$inferSelect;
+export type NewKitchenStation = typeof kitchenStations.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// ingredient
+// ---------------------------------------------------------------------------
+
+export const ingredients = pgTable("ingredient", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  unit: text("unit").notNull(),
+  unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull(),
+  lowStockThreshold: numeric("low_stock_threshold", { precision: 14, scale: 4 }).notNull(),
+});
+
+export type Ingredient = typeof ingredients.$inferSelect;
+export type NewIngredient = typeof ingredients.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// menu_item
+// ---------------------------------------------------------------------------
+
+export const menuItems = pgTable("menu_item", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  brandId: uuid("brand_id")
+    .notNull()
+    .references(() => brands.id),
+  name: text("name").notNull(),
+  price: numeric("price", { precision: 14, scale: 2 }).notNull(),
+  prepTimeMin: integer("prep_time_min"),
+  stationId: uuid("station_id").references(() => kitchenStations.id),
+  availability: availabilityEnum("availability").notNull().default("AVAILABLE"),
+});
+
+export type MenuItem = typeof menuItems.$inferSelect;
+export type NewMenuItem = typeof menuItems.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// recipe_line
+// ---------------------------------------------------------------------------
+
+export const recipeLines = pgTable("recipe_line", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  menuItemId: uuid("menu_item_id")
+    .notNull()
+    .references(() => menuItems.id),
+  ingredientId: uuid("ingredient_id")
+    .notNull()
+    .references(() => ingredients.id),
+  portionQty: numeric("portion_qty", { precision: 14, scale: 4 }).notNull(),
+  unit: text("unit").notNull(),
+});
+
+export type RecipeLine = typeof recipeLines.$inferSelect;
+export type NewRecipeLine = typeof recipeLines.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// warehouse / inventory_stock
+// ---------------------------------------------------------------------------
+
+export const warehouses = pgTable("warehouse", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  locationId: uuid("location_id")
+    .notNull()
+    .references(() => locations.id),
+  type: warehouseTypeEnum("type").notNull(),
+});
+
+export type Warehouse = typeof warehouses.$inferSelect;
+export type NewWarehouse = typeof warehouses.$inferInsert;
+
+export const inventoryStock = pgTable(
+  "inventory_stock",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    warehouseId: uuid("warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull().default("0"),
+  },
+  (table) => [
+    uniqueIndex("inventory_stock_warehouse_ingredient_unique").on(
+      table.warehouseId,
+      table.ingredientId,
+    ),
+  ],
+);
+
+export type InventoryStock = typeof inventoryStock.$inferSelect;
+export type NewInventoryStock = typeof inventoryStock.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// user / user_brand
+// ---------------------------------------------------------------------------
+
+export const users = pgTable("user", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  email: text("email").notNull().unique(),
+  passwordHash: text("password_hash").notNull(),
+  role: roleEnum("role").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
+export type Role = User["role"];
+
+export const userBrands = pgTable(
+  "user_brand",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    brandId: uuid("brand_id")
+      .notNull()
+      .references(() => brands.id),
+  },
+  (table) => [
+    uniqueIndex("user_brand_user_brand_unique").on(table.userId, table.brandId),
+  ],
+);
+
+export type UserBrand = typeof userBrands.$inferSelect;
+export type NewUserBrand = typeof userBrands.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// order / order_item   (table name is the reserved word "order"; exported as `orders`)
+// ---------------------------------------------------------------------------
+
+export const orders = pgTable(
+  "order",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    brandId: uuid("brand_id")
+      .notNull()
+      .references(() => brands.id),
+    aggregatorAccountId: uuid("aggregator_account_id")
+      .notNull()
+      .references(() => aggregatorAccounts.id),
+    aggregator: aggregatorEnum("aggregator").notNull(),
+    externalRef: text("external_ref").notNull(),
+    customerName: text("customer_name"),
+    status: orderStatusEnum("status").notNull().default("NEW"),
+    total: numeric("total", { precision: 14, scale: 2 }).notNull(),
+    placedAt: timestamp("placed_at", { withTimezone: true }).notNull().defaultNow(),
+    prepAt: timestamp("prep_at", { withTimezone: true }),
+    readyAt: timestamp("ready_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("order_aggregator_external_ref_unique").on(
+      table.aggregator,
+      table.externalRef,
+    ),
+  ],
+);
+
+export type Order = typeof orders.$inferSelect;
+export type NewOrder = typeof orders.$inferInsert;
+
+export const orderItems = pgTable("order_item", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  orderId: uuid("order_id")
+    .notNull()
+    .references(() => orders.id),
+  menuItemId: uuid("menu_item_id")
+    .notNull()
+    .references(() => menuItems.id),
+  qty: integer("qty").notNull(),
+  stationId: uuid("station_id")
+    .notNull()
+    .references(() => kitchenStations.id),
+  notes: text("notes"),
+});
+
+export type OrderItem = typeof orderItems.$inferSelect;
+export type NewOrderItem = typeof orderItems.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// ito / ito_item   (Internal Transfer Order)
+// ---------------------------------------------------------------------------
+
+export const itos = pgTable("ito", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  fromWarehouseId: uuid("from_warehouse_id")
+    .notNull()
+    .references(() => warehouses.id),
+  toWarehouseId: uuid("to_warehouse_id")
+    .notNull()
+    .references(() => warehouses.id),
+  status: itoStatusEnum("status").notNull().default("REQUESTED"),
+  requestedBy: uuid("requested_by").references(() => users.id),
+  confirmedBy: uuid("confirmed_by").references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+});
+
+export type Ito = typeof itos.$inferSelect;
+export type NewIto = typeof itos.$inferInsert;
+
+export const itoItems = pgTable("ito_item", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  itoId: uuid("ito_id")
+    .notNull()
+    .references(() => itos.id),
+  ingredientId: uuid("ingredient_id")
+    .notNull()
+    .references(() => ingredients.id),
+  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+});
+
+export type ItoItem = typeof itoItems.$inferSelect;
+export type NewItoItem = typeof itoItems.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// print_job / print_agent / consumption_log
+// ---------------------------------------------------------------------------
+
+export const printJobs = pgTable("print_job", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  orderId: uuid("order_id")
+    .notNull()
+    .references(() => orders.id),
+  stationId: uuid("station_id")
+    .notNull()
+    .references(() => kitchenStations.id),
+  printerId: uuid("printer_id").references(() => printers.id),
+  payload: jsonb("payload").notNull(),
+  status: printJobStatusEnum("status").notNull().default("PENDING"),
+  error: text("error"),
+  retries: integer("retries").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  printedAt: timestamp("printed_at", { withTimezone: true }),
+});
+
+export type PrintJob = typeof printJobs.$inferSelect;
+export type NewPrintJob = typeof printJobs.$inferInsert;
+
+export const printAgents = pgTable("print_agent", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  locationId: uuid("location_id")
+    .notNull()
+    .references(() => locations.id),
+  apiToken: text("api_token").notNull(),
+  name: text("name"),
+  lastSeen: timestamp("last_seen", { withTimezone: true }),
+});
+
+export type PrintAgent = typeof printAgents.$inferSelect;
+export type NewPrintAgent = typeof printAgents.$inferInsert;
+
+export const consumptionLogs = pgTable("consumption_log", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ingredientId: uuid("ingredient_id")
+    .notNull()
+    .references(() => ingredients.id),
+  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+  logDate: timestamp("log_date", { withTimezone: true }).notNull().defaultNow(),
+  loggedBy: uuid("logged_by").references(() => users.id),
+  orderId: uuid("order_id").references(() => orders.id),
+});
+
+export type ConsumptionLog = typeof consumptionLogs.$inferSelect;
+export type NewConsumptionLog = typeof consumptionLogs.$inferInsert;

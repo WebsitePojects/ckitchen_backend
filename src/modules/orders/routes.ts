@@ -166,10 +166,30 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
 
   // ── GET /orders ────────────────────────────────────────────────────────
   router.get("/orders", requireAuth, async (req, res) => {
-    const { brand_id, aggregator, station_id, status, from, to } = req.query as Record<
+    const { brand_id, aggregator, station_id, from, to } = req.query as Record<
       string,
       string | undefined
     >;
+
+    // status accepts a single value, a comma-separated list, or repeated params
+    // (?status=NEW&status=PREPARING) — the KDS needs several active stages at once.
+    const statusRaw = req.query.status;
+    let statuses: string[] | undefined;
+    if (statusRaw !== undefined) {
+      statuses = (Array.isArray(statusRaw) ? statusRaw.map(String) : String(statusRaw).split(","))
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const valid = orderStatusEnum.enumValues as readonly string[];
+      if (statuses.some((s) => !valid.includes(s))) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          `Invalid status. Valid values: ${orderStatusEnum.enumValues.join(", ")}.`,
+        );
+        return;
+      }
+    }
 
     if (aggregator && !(aggregatorEnum.enumValues as readonly string[]).includes(aggregator)) {
       sendError(
@@ -181,18 +201,15 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    if (status && !(orderStatusEnum.enumValues as readonly string[]).includes(status)) {
-      sendError(
-        res,
-        400,
-        "VALIDATION_ERROR",
-        `Invalid status. Valid values: ${orderStatusEnum.enumValues.join(", ")}.`,
-      );
-      return;
-    }
-
     try {
-      const rows = await listOrders(db, { brand_id, aggregator, station_id, status, from, to });
+      const rows = await listOrders(db, {
+        brand_id,
+        aggregator,
+        station_id,
+        status: statuses,
+        from,
+        to,
+      });
       res.json(rows);
     } catch (err) {
       handleServiceError(err, res);

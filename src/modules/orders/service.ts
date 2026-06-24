@@ -719,7 +719,7 @@ export async function listOrders(
     brand_id?: string;
     aggregator?: string;
     station_id?: string;
-    status?: string;
+    status?: string | string[];
     from?: string;
     to?: string;
   },
@@ -734,9 +734,14 @@ export async function listOrders(
     );
   }
   if (filters.status) {
-    conditions.push(
-      eq(orders.status, filters.status as typeof orders.$inferSelect["status"]),
-    );
+    const statuses = (Array.isArray(filters.status)
+      ? filters.status
+      : [filters.status]) as (typeof orders.$inferSelect)["status"][];
+    if (statuses.length === 1) {
+      conditions.push(eq(orders.status, statuses[0]));
+    } else if (statuses.length > 1) {
+      conditions.push(inArray(orders.status, statuses));
+    }
   }
   if (filters.from) conditions.push(gte(orders.placedAt, new Date(filters.from)));
   if (filters.to) conditions.push(lte(orders.placedAt, new Date(filters.to)));

@@ -460,10 +460,10 @@ const isMain =
   process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 
 if (isMain) {
-  const { createDb } = await import("./client.js");
+  const { createDb, closeDb } = await import("./client.js");
   const { loadConfig } = await import("../config.js");
-  const { dbPath } = loadConfig();
-  const { db, client } = createDb(dbPath);
+  const { dbPath, databaseUrl } = loadConfig();
+  const { db, client } = createDb({ dataDir: dbPath, databaseUrl });
 
   console.log("Running pilot seed...");
   const ids = await seedPilot(db);
@@ -485,5 +485,5 @@ if (isMain) {
   console.log(`  MAIN    ${ids.warehouses.main}`);
   console.log(`  KITCHEN ${ids.warehouses.kitchen}`);
 
-  await client.close();
+  await closeDb(client); // GOTCHA: file-backed PGlite / postgres-js pool keep the loop alive — close or it hangs.
 }

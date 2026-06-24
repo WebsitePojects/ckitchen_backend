@@ -20,7 +20,7 @@ import { createDb } from "./db/client.js";
 import { createSocketHub } from "./realtime/hub.js";
 
 const config = loadConfig();
-const { db } = createDb(config.dbPath);
+const { db } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUrl });
 
 // 1. Bare HTTP server (no request handler — Express is added below)
 const httpServer = createServer();

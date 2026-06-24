@@ -110,10 +110,10 @@ const isMain =
   process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 
 if (isMain) {
-  const { createDb } = await import("./client.js");
+  const { createDb, closeDb } = await import("./client.js");
   const { loadConfig } = await import("../config.js");
-  const { dbPath } = loadConfig();
-  const { db, client } = createDb(dbPath);
+  const { dbPath, databaseUrl } = loadConfig();
+  const { db, client } = createDb({ dataDir: dbPath, databaseUrl });
 
   const seededCreds = await seed(db);
 
@@ -126,5 +126,5 @@ if (isMain) {
     console.log(`  ${cred.role.padEnd(22)} ${cred.email.padEnd(36)} ${cred.password}`);
   }
 
-  await client.close(); // GOTCHA: file-backed PGlite keeps the loop alive — close or it hangs.
+  await closeDb(client); // GOTCHA: file-backed PGlite / postgres-js pool keep the loop alive — close or it hangs.
 }

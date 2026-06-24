@@ -19,6 +19,7 @@
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
+    "postgres": "^3.4.9",
     "socket.io": "^4.8.3",
     "zod": "^4.1.9"
   },

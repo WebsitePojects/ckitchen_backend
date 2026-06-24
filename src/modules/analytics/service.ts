@@ -62,6 +62,8 @@ export interface BrandMargin {
  * drizzle-orm wraps this but the rows property always contains plain objects.
  */
 function toRows<T>(raw: unknown): T[] {
+  // postgres-js (Supabase) returns the row array directly; PGlite returns { rows: [...] }.
+  if (Array.isArray(raw)) return raw as T[];
   const r = raw as { rows?: T[] };
   return r.rows ?? [];
 }
@@ -104,8 +106,8 @@ export async function getBrandsAnalytics(
     FROM brand b
     LEFT JOIN "order" o
            ON o.brand_id   = b.id
-          AND o.placed_at >= ${fromDate}
-          AND o.placed_at <= ${toDate}
+          AND o.placed_at >= ${fromDate.toISOString()}
+          AND o.placed_at <= ${toDate.toISOString()}
     GROUP BY b.id, b.name
     ORDER BY COALESCE(SUM(o.total::numeric), 0) DESC NULLS LAST
   `);
@@ -152,8 +154,8 @@ export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrder
       EXTRACT(HOUR FROM placed_at AT TIME ZONE 'UTC')::integer AS hour,
       COUNT(id)::integer                                        AS order_count
     FROM "order"
-    WHERE placed_at >= ${startOfDay}
-      AND placed_at <= ${endOfDay}
+    WHERE placed_at >= ${startOfDay.toISOString()}
+      AND placed_at <= ${endOfDay.toISOString()}
     GROUP BY EXTRACT(HOUR FROM placed_at AT TIME ZONE 'UTC')
     ORDER BY hour
   `);
@@ -188,8 +190,8 @@ export async function getAggregatorsAnalytics(
       COUNT(id)::integer                 AS order_count,
       COALESCE(SUM(total::numeric), 0)   AS revenue
     FROM "order"
-    WHERE placed_at >= ${fromDate}
-      AND placed_at <= ${toDate}
+    WHERE placed_at >= ${fromDate.toISOString()}
+      AND placed_at <= ${toDate.toISOString()}
     GROUP BY aggregator
     ORDER BY revenue DESC
   `);
@@ -243,8 +245,8 @@ export async function getMarginsAnalytics(
       SELECT oi.menu_item_id, oi.qty
       FROM order_item oi
       JOIN "order" o ON o.id = oi.order_id
-      WHERE o.placed_at >= ${fromDate}
-        AND o.placed_at <= ${toDate}
+      WHERE o.placed_at >= ${fromDate.toISOString()}
+        AND o.placed_at <= ${toDate.toISOString()}
     )
     SELECT
       b.id AS brand_id,

@@ -36,6 +36,7 @@ import {
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
+import { audit } from "../ems/audit.js";
 
 // ---------------------------------------------------------------------------
 // RBAC role sets (§1 role matrix)
@@ -313,6 +314,16 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       }
 
       res.status(201).json({ ok: true });
+
+      // EMS: audit inventory.receive (non-blocking)
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "inventory.receive",
+        description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse`,
+        entityType: "warehouse",
+        metadata: { items: parsed.data.items },
+      });
 
       // Task 8: emit stock.updated for each received ingredient (MAIN warehouse)
       const emitLocationId = mainWarehouse.locationId;
@@ -594,6 +605,17 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       });
 
       res.json(confirmedIto!);
+
+      // EMS: audit ito.confirm (non-blocking)
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "ito.confirm",
+        description: `confirmed ITO ${id}`,
+        entityType: "ito",
+        entityId: id,
+        metadata: { itemCount: items.length },
+      });
 
       // Task 8: emit stock.updated for each ingredient moved to KITCHEN
       const [destinationWarehouse] = await db

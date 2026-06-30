@@ -421,3 +421,66 @@ export const consumptionLogs = pgTable("consumption_log", {
 
 export type ConsumptionLog = typeof consumptionLogs.$inferSelect;
 export type NewConsumptionLog = typeof consumptionLogs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// EMS: departmentEnum / employee / userSession / auditLog  (CK1-EMS-005)
+// ---------------------------------------------------------------------------
+
+export const departmentEnum = pgEnum("department", [
+  "KITCHEN",
+  "WAREHOUSE",
+  "PURCHASING",
+  "SALES",
+  "PRODUCTION",
+  "QA",
+  "ACCOUNTING",
+  "ADMIN",
+]);
+
+export const employeeStatusEnum = pgEnum("employee_status", ["ACTIVE", "INACTIVE"]);
+
+export const employees = pgTable("employee", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").references(() => users.id),
+  employeeNo: text("employee_no").notNull().unique(),
+  fullName: text("full_name").notNull(),
+  department: departmentEnum("department").notNull(),
+  position: text("position"),
+  photoUrl: text("photo_url"),
+  status: employeeStatusEnum("status").notNull().default("ACTIVE"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type Employee = typeof employees.$inferSelect;
+export type NewEmployee = typeof employees.$inferInsert;
+
+export const userSessions = pgTable("user_session", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id")
+    .notNull()
+    .references(() => users.id),
+  loginAt: timestamp("login_at", { withTimezone: true }).notNull().defaultNow(),
+  logoutAt: timestamp("logout_at", { withTimezone: true }),
+  ip: text("ip"),
+  userAgent: text("user_agent"),
+});
+
+export type UserSession = typeof userSessions.$inferSelect;
+export type NewUserSession = typeof userSessions.$inferInsert;
+
+export const auditLogs = pgTable("audit_log", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  actorUserId: uuid("actor_user_id").references(() => users.id),
+  actorName: text("actor_name"),
+  sessionId: uuid("session_id").references(() => userSessions.id),
+  action: text("action").notNull(),
+  description: text("description"),
+  entityType: text("entity_type"),
+  entityId: text("entity_id"),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type AuditLog = typeof auditLogs.$inferSelect;
+export type NewAuditLog = typeof auditLogs.$inferInsert;

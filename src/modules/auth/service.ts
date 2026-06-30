@@ -7,6 +7,8 @@ const BCRYPT_ROUNDS = 10;
 export interface AuthTokenPayload {
   sub: string;
   role: User["role"];
+  /** Session id — links this token to a user_session row. */
+  sid?: string;
 }
 
 export async function hashPassword(plain: string): Promise<string> {
@@ -17,12 +19,14 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   return bcrypt.compare(plain, hash);
 }
 
-/** Signs a JWT carrying the user id (`sub`) and role, per CK1-API-003 §2 / security.md. */
+/** Signs a JWT carrying the user id (`sub`), role, and optional session id (`sid`). */
 export function signToken(
   user: Pick<User, "id" | "role">,
   jwtSecret: string,
+  sessionId?: string,
 ): string {
   const payload: AuthTokenPayload = { sub: user.id, role: user.role };
+  if (sessionId) payload.sid = sessionId;
   return jwt.sign(payload, jwtSecret, { algorithm: "HS256", expiresIn: "12h" });
 }
 

@@ -4,10 +4,32 @@ import { eq } from "drizzle-orm";
 import type { DB } from "./client.js";
 import { runMigrations } from "./migrate.js";
 import { hashPassword } from "../modules/auth/service.js";
-import { kitchenStations, locations, users, warehouses, type Role } from "./schema.js";
+import {
+  departmentEnum,
+  employees,
+  kitchenStations,
+  locations,
+  users,
+  warehouses,
+  type Role,
+} from "./schema.js";
 
 const LOCATION_CODE = "CK1";
 const LOCATION_NAME = "CloudKitchen ONE";
+
+/** Maps a system role to a department for the initial employee seed. */
+function roleToDepartment(role: Role): typeof departmentEnum.enumValues[number] {
+  const map: Record<Role, typeof departmentEnum.enumValues[number]> = {
+    SUPER_ADMIN: "ADMIN",
+    BRAND_MANAGER: "SALES",
+    KITCHEN_STAFF: "KITCHEN",
+    WAREHOUSE: "WAREHOUSE",
+    SUPPLIER_COORDINATOR: "PURCHASING",
+    ACCOUNTANT: "ACCOUNTING",
+    RIDER: "SALES",
+  };
+  return map[role] ?? "ADMIN";
+}
 
 const STATION_NAMES = ["Grill", "Fry", "Prep", "Beverage", "Packing"] as const;
 
@@ -106,6 +128,36 @@ export async function seed(db: DB): Promise<SeededUser[]> {
         passwordHash: await hashPassword(candidate.password),
         role: candidate.role,
       });
+    }
+  }
+
+  // --- employees: one per seeded user (idempotent on employee_no) ----------
+  const allUsers = await db.select().from(users);
+  let empSeq = 0;
+  for (const usr of allUsers) {
+    empSeq += 1;
+    const employeeNo = `EMP-${String(empSeq).padStart(4, "0")}`;
+    // Check whether this user already has an employee record
+    const [existingEmp] = await db
+      .select({ id: employees.id })
+      .from(employees)
+      .where(eq(employees.userId, usr.id));
+    if (!existingEmp) {
+      // Also guard against employee_no collision (re-run safety)
+      const [noConflict] = await db
+        .select({ id: employees.id })
+        .from(employees)
+        .where(eq(employees.employeeNo, employeeNo));
+      if (!noConflict) {
+        await db.insert(employees).values({
+          userId: usr.id,
+          employeeNo,
+          fullName: usr.name,
+          department: roleToDepartment(usr.role),
+          position: usr.role.replace(/_/g, " "),
+          status: "ACTIVE",
+        });
+      }
     }
   }
 

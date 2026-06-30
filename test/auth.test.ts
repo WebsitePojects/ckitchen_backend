@@ -113,8 +113,18 @@ describe("GET /api/v1/auth/me", () => {
 });
 
 describe("POST /api/v1/auth/logout", () => {
-  it("returns 200 (stateless)", async () => {
+  it("requires auth — 401 without a token", async () => {
     const res = await request(app).post("/api/v1/auth/logout");
+    expect(res.status).toBe(401);
+  });
+
+  it("returns 200 and closes the session for an authed user", async () => {
+    const loginRes = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD });
+    const res = await request(app)
+      .post("/api/v1/auth/logout")
+      .set("Authorization", `Bearer ${loginRes.body.token}`);
     expect(res.status).toBe(200);
   });
 });

@@ -29,6 +29,13 @@
       "when": 1782823300000,
       "tag": "0003_physical_outlets",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1782802936169,
+      "tag": "0004_black_blue_blade",
+      "breakpoints": true
     }
   ]
 }

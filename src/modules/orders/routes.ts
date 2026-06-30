@@ -30,6 +30,7 @@ import { aggregatorEnum, brands, locations, orderStatusEnum, orders } from "../.
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
+import { audit } from "../ems/audit.js";
 import {
   ConflictError,
   NotFoundError,
@@ -249,6 +250,17 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         const result = await advanceOrder(db, id, req.user?.id);
         res.json(result);
 
+        // EMS: audit order.advance (non-blocking — swallows errors internally)
+        void audit(db, {
+          actorUserId: req.user?.id ?? null,
+          sessionId: req.user?.sessionId ?? null,
+          action: "order.advance",
+          description: `marked order ${id} as ${result.status}`,
+          entityType: "order",
+          entityId: id,
+          metadata: { status: result.status },
+        });
+
         // Task 8: emit order.updated, stock.updated (per ingredient), lowstock.alert
         const locationId = await getLocationIdForOrder(db, id);
         if (locationId) {
@@ -288,6 +300,17 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       try {
         const result = await cancelOrder(db, id);
         res.json(result);
+
+        // EMS: audit order.cancel (non-blocking)
+        void audit(db, {
+          actorUserId: req.user?.id ?? null,
+          sessionId: req.user?.sessionId ?? null,
+          action: "order.cancel",
+          description: `cancelled order ${id}`,
+          entityType: "order",
+          entityId: id,
+          metadata: { status: result.status },
+        });
 
         // Task 8: emit order.updated with CANCELLED status
         const locationId = await getLocationIdForOrder(db, id);

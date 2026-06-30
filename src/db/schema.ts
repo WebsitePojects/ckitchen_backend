@@ -558,3 +558,79 @@ export const attendanceRecords = pgTable("attendance_record", {
 
 export type AttendanceRecord = typeof attendanceRecords.$inferSelect;
 export type NewAttendanceRecord = typeof attendanceRecords.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// ERP R2: master data — suppliers / supplier_items / customers /
+// department_inventory_access  (CK1-ERP-006 §1-2). Additive. `ingredients`
+// stays the item catalog; supplier_items link a supplier to an ingredient.
+// ---------------------------------------------------------------------------
+
+export const suppliers = pgTable("supplier", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  code: text("code").notNull().unique(),
+  name: text("name").notNull(),
+  contactName: text("contact_name"),
+  contactPhone: text("contact_phone"),
+  email: text("email"),
+  address: text("address"),
+  paymentTermDays: integer("payment_term_days").notNull().default(0),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type Supplier = typeof suppliers.$inferSelect;
+export type NewSupplier = typeof suppliers.$inferInsert;
+
+export const supplierItems = pgTable(
+  "supplier_item",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    supplierId: uuid("supplier_id")
+      .notNull()
+      .references(() => suppliers.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    supplierSku: text("supplier_sku"),
+    lastUnitCost: numeric("last_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+  },
+  (table) => [uniqueIndex("supplier_item_unique").on(table.supplierId, table.ingredientId)],
+);
+export type SupplierItem = typeof supplierItems.$inferSelect;
+
+export const customers = pgTable("customer", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  code: text("code").notNull().unique(),
+  name: text("name").notNull(),
+  contactName: text("contact_name"),
+  contactPhone: text("contact_phone"),
+  email: text("email"),
+  address: text("address"),
+  paymentTermDays: integer("payment_term_days").notNull().default(0),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type Customer = typeof customers.$inferSelect;
+export type NewCustomer = typeof customers.$inferInsert;
+
+/** gprci-style per-department warehouse permissions (CK1-ERP-006 §2). */
+export const departmentInventoryAccess = pgTable(
+  "department_inventory_access",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    department: departmentEnum("department").notNull(),
+    warehouseType: warehouseTypeEnum("warehouse_type").notNull(),
+    canView: boolean("can_view").notNull().default(true),
+    canViewCost: boolean("can_view_cost").notNull().default(false),
+    canReceive: boolean("can_receive").notNull().default(false),
+    canIssue: boolean("can_issue").notNull().default(false),
+    canAdjust: boolean("can_adjust").notNull().default(false),
+    canApprove: boolean("can_approve").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("department_inventory_access_unique").on(table.department, table.warehouseType),
+  ],
+);
+export type DepartmentInventoryAccess = typeof departmentInventoryAccess.$inferSelect;

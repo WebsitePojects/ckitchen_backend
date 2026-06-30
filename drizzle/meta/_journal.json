@@ -43,6 +43,13 @@
       "when": 1782811347001,
       "tag": "0005_daily_jazinda",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1782813597883,
+      "tag": "0006_sturdy_vapor",
+      "breakpoints": true
     }
   ]
 }

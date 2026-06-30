@@ -1,17 +1,24 @@
 /**
- * EMS Routes — CK1-EMS-005 (E1 + E2-core)
+ * EMS Routes — CK1-EMS-005 (E1 + E2-core + E3 attendance/DTR)
  *
  * Endpoints:
  *   GET  /employees                          — list (filter status/department)
  *   POST /employees                          — create (SUPER_ADMIN)
  *   GET  /audit                              — audit trail (SUPER_ADMIN/BRAND_MANAGER)
  *   GET  /ems/analytics/employee/:userId     — per-staff analytics (self or admin)
+ *
+ * E3 attendance (CK1-EMS-005 §3):
+ *   POST /ems/attendance                     — record TIME_IN or TIME_OUT with Cloudinary photo
+ *   GET  /ems/attendance                     — list (SUPER_ADMIN: all; others: need employee_id)
+ *   GET  /ems/attendance/dtr                 — paired DTR view with worked_minutes
  */
 import { Router } from "express";
-import { and, count, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
+  attendanceRecords,
+  attendanceTypeEnum,
   auditLogs,
   departmentEnum,
   employeeStatusEnum,
@@ -21,6 +28,8 @@ import {
 } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { sendError } from "../http-errors.js";
+import { uploadAttendancePhoto } from "./cloudinary.js";
+import { audit } from "./audit.js";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -35,6 +44,16 @@ const createEmployeeSchema = z.object({
   photo_url: z.string().url().optional(),
   status: z.enum(employeeStatusEnum.enumValues).optional(),
 });
+
+const createAttendanceSchema = z.object({
+  employee_id: z.string().uuid(),
+  type: z.enum(attendanceTypeEnum.enumValues),
+  photo: z.string().min(1),
+  note: z.string().optional(),
+});
+
+/** Reject attendance photos larger than 8 MB (base64 string length ≈ byte budget). */
+const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Router factory
@@ -198,6 +217,154 @@ export function createEmsRouter(db: DB): Router {
       actionBreakdown,
       sessions: Number(sessionCount[0]?.total ?? 0),
     });
+  });
+
+  // ── POST /ems/attendance ──────────────────────────────────────────────────
+  // Record a TIME_IN / TIME_OUT punch with a Cloudinary photo proof.
+  // Actor + session come from the verified token (req.user), NEVER the body
+  // (anti-spoof, CK1-EMS-005 §3 + security rules).
+  router.post("/ems/attendance", requireAuth, async (req, res) => {
+    const parsed = createAttendanceSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid attendance payload.", parsed.error.issues);
+      return;
+    }
+    const { employee_id, type, photo, note } = parsed.data;
+
+    if (photo.length > MAX_PHOTO_BYTES) {
+      sendError(res, 400, "PAYLOAD_TOO_LARGE", "Attendance photo exceeds the 8 MB limit.");
+      return;
+    }
+
+    const [emp] = await db.select().from(employees).where(eq(employees.id, employee_id));
+    if (!emp) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${employee_id} not found.`);
+      return;
+    }
+    if (emp.status !== "ACTIVE") {
+      sendError(res, 400, "VALIDATION_ERROR", `Employee ${emp.fullName} is not ACTIVE.`);
+      return;
+    }
+
+    let uploaded: { url: string; publicId: string };
+    try {
+      uploaded = await uploadAttendancePhoto(photo);
+    } catch {
+      // Never leak Cloudinary config/secret detail to the caller.
+      sendError(res, 502, "UPLOAD_FAILED", "Failed to upload attendance photo.");
+      return;
+    }
+
+    const [record] = await db
+      .insert(attendanceRecords)
+      .values({
+        employeeId: employee_id,
+        type,
+        photoUrl: uploaded.url,
+        photoPublicId: uploaded.publicId,
+        recordedByUserId: req.user!.id, // anti-spoof: from token, not body
+        sessionId: req.user!.sessionId ?? null,
+        note: note ?? null,
+      })
+      .returning();
+
+    void audit(db, {
+      actorUserId: req.user!.id,
+      sessionId: req.user!.sessionId ?? null,
+      action: type === "TIME_IN" ? "attendance.time_in" : "attendance.time_out",
+      description: `${type} for ${emp.fullName} (${emp.employeeNo})`,
+      entityType: "attendance_record",
+      entityId: record!.id,
+    });
+
+    res.status(201).json(record);
+  });
+
+  // ── GET /ems/attendance ───────────────────────────────────────────────────
+  // List punches newest-first. Listing ALL employees is SUPER_ADMIN-only;
+  // anyone authed may filter to a specific employee_id.
+  router.get("/ems/attendance", requireAuth, async (req, res) => {
+    const { employee_id, type, from, to } = req.query as Record<string, string | undefined>;
+    const limitParam = req.query.limit as string | undefined;
+
+    if (!employee_id && req.user!.role !== "SUPER_ADMIN") {
+      sendError(res, 403, "FORBIDDEN", "Only SUPER_ADMIN may list all attendance. Filter by employee_id.");
+      return;
+    }
+    if (type && !(attendanceTypeEnum.enumValues as readonly string[]).includes(type)) {
+      sendError(res, 400, "VALIDATION_ERROR", `Invalid type. Valid: ${attendanceTypeEnum.enumValues.join(", ")}.`);
+      return;
+    }
+
+    const conditions: ReturnType<typeof eq>[] = [];
+    if (employee_id) conditions.push(eq(attendanceRecords.employeeId, employee_id));
+    if (type) conditions.push(eq(attendanceRecords.type, type as typeof attendanceTypeEnum.enumValues[number]));
+    if (from) conditions.push(gte(attendanceRecords.capturedAt, new Date(from)));
+    if (to) conditions.push(lte(attendanceRecords.capturedAt, new Date(to)));
+
+    const limit = Math.min(Math.max(Number(limitParam) || 100, 1), 500);
+
+    const rows = conditions.length
+      ? await db.select().from(attendanceRecords).where(and(...conditions)).orderBy(desc(attendanceRecords.capturedAt)).limit(limit)
+      : await db.select().from(attendanceRecords).orderBy(desc(attendanceRecords.capturedAt)).limit(limit);
+
+    res.json(rows);
+  });
+
+  // ── GET /ems/attendance/dtr ───────────────────────────────────────────────
+  // Daily Time Record: one entry per (employee, UTC date) — earliest TIME_IN
+  // paired with the latest TIME_OUT that day; worked minutes between them.
+  // An unpaired TIME_IN yields time_out=null and minutes=null.
+  router.get("/ems/attendance/dtr", requireAuth, async (req, res) => {
+    const { employee_id, from, to } = req.query as Record<string, string | undefined>;
+
+    const conditions: ReturnType<typeof eq>[] = [];
+    if (employee_id) conditions.push(eq(attendanceRecords.employeeId, employee_id));
+    if (from) conditions.push(gte(attendanceRecords.capturedAt, new Date(`${from}T00:00:00.000Z`)));
+    if (to) conditions.push(lte(attendanceRecords.capturedAt, new Date(`${to}T23:59:59.999Z`)));
+
+    const rows = conditions.length
+      ? await db.select().from(attendanceRecords).where(and(...conditions)).orderBy(asc(attendanceRecords.capturedAt))
+      : await db.select().from(attendanceRecords).orderBy(asc(attendanceRecords.capturedAt));
+
+    interface DtrEntry {
+      date: string;
+      employee_id: string;
+      time_in: string | null;
+      time_out: string | null;
+      photo_in: string | null;
+      photo_out: string | null;
+      minutes: number | null;
+    }
+    const byKey = new Map<string, DtrEntry>();
+    for (const r of rows) {
+      const iso = new Date(r.capturedAt).toISOString();
+      const date = iso.slice(0, 10);
+      const key = `${r.employeeId}|${date}`;
+      let entry = byKey.get(key);
+      if (!entry) {
+        entry = { date, employee_id: r.employeeId, time_in: null, time_out: null, photo_in: null, photo_out: null, minutes: null };
+        byKey.set(key, entry);
+      }
+      if (r.type === "TIME_IN") {
+        if (!entry.time_in) {
+          entry.time_in = iso;
+          entry.photo_in = r.photoUrl;
+        }
+      } else {
+        entry.time_out = iso; // latest TIME_OUT wins (rows asc by time)
+        entry.photo_out = r.photoUrl;
+      }
+    }
+    for (const entry of byKey.values()) {
+      if (entry.time_in && entry.time_out) {
+        entry.minutes = Math.round(
+          (new Date(entry.time_out).getTime() - new Date(entry.time_in).getTime()) / 60000,
+        );
+      }
+    }
+
+    res.json(Array.from(byKey.values()));
   });
 
   return router;

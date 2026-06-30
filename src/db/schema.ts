@@ -530,3 +530,31 @@ export const auditLogs = pgTable("audit_log", {
 
 export type AuditLog = typeof auditLogs.$inferSelect;
 export type NewAuditLog = typeof auditLogs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// EMS E3: attendance_record  (photo-based DTR — CK1-EMS-005 §3)
+// ---------------------------------------------------------------------------
+
+export const attendanceTypeEnum = pgEnum("attendance_type", ["TIME_IN", "TIME_OUT"]);
+
+export const attendanceRecords = pgTable("attendance_record", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  employeeId: uuid("employee_id")
+    .notNull()
+    .references(() => employees.id),
+  type: attendanceTypeEnum("type").notNull(),
+  photoUrl: text("photo_url").notNull(),
+  photoPublicId: text("photo_public_id").notNull(),
+  capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
+  /** The authed user who recorded this punch — derived from req.user (anti-spoof). */
+  recordedByUserId: uuid("recorded_by_user_id")
+    .notNull()
+    .references(() => users.id),
+  /** Session from req.user.sessionId — links to the actor's login session. */
+  sessionId: uuid("session_id").references(() => userSessions.id),
+  note: text("note"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type AttendanceRecord = typeof attendanceRecords.$inferSelect;
+export type NewAttendanceRecord = typeof attendanceRecords.$inferInsert;

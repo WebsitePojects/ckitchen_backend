@@ -11,6 +11,7 @@ import { createInventoryRouter } from "./modules/inventory/routes.js";
 import { createOrdersRouter } from "./modules/orders/routes.js";
 import { createPrintingRouter } from "./modules/printing/routes.js";
 import { createAnalyticsRouter } from "./modules/analytics/routes.js";
+import { createOutletsRouter } from "./modules/outlets/routes.js";
 
 /**
  * Express app factory.
@@ -29,6 +30,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
 
   app.use("/api/v1", healthRouter);
   app.use("/api/v1", createAuthRouter(db));
+  app.use("/api/v1", createOutletsRouter(db));
   app.use("/api/v1", createBrandsRouter(db));
   app.use("/api/v1", createStationsRouter(db));
   app.use("/api/v1", createMenuRouter(db));

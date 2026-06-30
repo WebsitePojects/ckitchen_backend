@@ -23,7 +23,7 @@ describe("schema: core tables + FK", () => {
   it("persists Location -> Brand -> AggregatorAccount with FKs intact", async () => {
     const [location] = await db
       .insert(locations)
-      .values({ name: "Main Cloud Kitchen", address: "123 Test St" })
+      .values({ code: "TST1", name: "Main Cloud Kitchen", address: "123 Test St" })
       .returning();
     expect(location.id).toBeTruthy();
 
@@ -68,7 +68,7 @@ describe("schema: core tables + FK", () => {
   it("enforces UNIQUE (aggregator, external_ref) on order — idempotent ingestion", async () => {
     const [location] = await db
       .insert(locations)
-      .values({ name: "Loc for order test" })
+      .values({ code: "ORD1", name: "Loc for order test" })
       .returning();
     const [brand] = await db
       .insert(brands)
@@ -108,7 +108,7 @@ describe("schema: core tables + FK", () => {
   it("enforces UNIQUE (warehouse_id, ingredient_id) on inventory_stock", async () => {
     const [location] = await db
       .insert(locations)
-      .values({ name: "Loc for inventory test" })
+      .values({ code: "INV1", name: "Loc for inventory test" })
       .returning();
     const [warehouse] = await db
       .insert(warehouses)

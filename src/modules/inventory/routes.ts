@@ -18,8 +18,8 @@
  * Task 8 — realtime emissions:
  *   stock.updated → after /inventory/receive (MAIN) and /itos/:id/confirm (KITCHEN)
  */
-import { Router } from "express";
-import { and, eq, sql } from "drizzle-orm";
+import { Router, type Response } from "express";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -62,6 +62,7 @@ const receiveItemSchema = z.object({
 });
 
 const receiveSchema = z.object({
+  outlet_id: z.string().uuid().optional(),
   items: z.array(receiveItemSchema).min(1),
 });
 
@@ -81,10 +82,13 @@ const itoItemSchema = z.object({
 });
 
 const createItoSchema = z.object({
+  outlet_id: z.string().uuid().optional(),
   from: z.literal("MAIN"),
   to: z.literal("KITCHEN"),
   items: z.array(itoItemSchema).min(1),
 });
+
+const outletIdParamSchema = z.string().uuid();
 
 // ---------------------------------------------------------------------------
 // Location resolution helper
@@ -96,6 +100,45 @@ async function getDefaultLocationId(db: DB): Promise<string | null> {
   return loc?.id ?? null;
 }
 
+function parseOutletIdParam(raw: unknown): string | undefined | null {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") return null;
+  const parsed = outletIdParamSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+async function resolveLocationId(
+  db: DB,
+  res: Response,
+  rawOutletId: unknown,
+): Promise<string | null> {
+  const parsedOutletId = parseOutletIdParam(rawOutletId);
+  if (parsedOutletId === null) {
+    sendError(res, 400, "VALIDATION_ERROR", "Query param 'outlet_id' must be a UUID.");
+    return null;
+  }
+
+  if (parsedOutletId) {
+    const [location] = await db
+      .select({ id: locations.id })
+      .from(locations)
+      .where(eq(locations.id, parsedOutletId));
+    if (!location) {
+      sendError(res, 404, "NOT_FOUND", "Outlet not found.");
+      return null;
+    }
+    return location.id;
+  }
+
+  const defaultLocationId = await getDefaultLocationId(db);
+  if (!defaultLocationId) {
+    sendError(res, 500, "NOT_FOUND", "No outlet is configured for this deployment.");
+    return null;
+  }
+
+  return defaultLocationId;
+}
+
 // ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
@@ -105,11 +148,14 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
 
   // Helper: look up a warehouse by its type (MAIN | KITCHEN) for this prototype's
   // single-location deployment.
-  async function getWarehouseByType(type: typeof warehouseTypeEnum.enumValues[number]) {
+  async function getWarehouseByType(
+    type: typeof warehouseTypeEnum.enumValues[number],
+    locationId: string,
+  ) {
     const [warehouse] = await db
       .select()
       .from(warehouses)
-      .where(eq(warehouses.type, type));
+      .where(and(eq(warehouses.type, type), eq(warehouses.locationId, locationId)));
     return warehouse ?? null;
   }
 
@@ -148,7 +194,13 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // GET /warehouses — list the two tiers
   // -------------------------------------------------------------------------
   router.get("/warehouses", requireAuth, async (req, res) => {
-    const rows = await db.select().from(warehouses);
+    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    if (!locationId) return;
+
+    const rows = await db
+      .select()
+      .from(warehouses)
+      .where(eq(warehouses.locationId, locationId));
     res.json(rows);
   });
 
@@ -170,7 +222,10 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const warehouse = await getWarehouseByType(warehouseParam as "MAIN" | "KITCHEN");
+    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    if (!locationId) return;
+
+    const warehouse = await getWarehouseByType(warehouseParam as "MAIN" | "KITCHEN", locationId);
     if (!warehouse) {
       sendError(res, 404, "NOT_FOUND", `Warehouse of type ${warehouseParam} not found.`);
       return;
@@ -218,7 +273,10 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         return;
       }
 
-      const mainWarehouse = await getWarehouseByType("MAIN");
+      const locationId = await resolveLocationId(db, res, parsed.data.outlet_id);
+      if (!locationId) return;
+
+      const mainWarehouse = await getWarehouseByType("MAIN", locationId);
       if (!mainWarehouse) {
         sendError(res, 500, "NOT_FOUND", "MAIN warehouse not configured.");
         return;
@@ -257,8 +315,8 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       res.status(201).json({ ok: true });
 
       // Task 8: emit stock.updated for each received ingredient (MAIN warehouse)
-      const locationId = await getDefaultLocationId(db);
-      if (locationId) {
+      const emitLocationId = mainWarehouse.locationId;
+      if (emitLocationId) {
         for (const item of parsed.data.items) {
           // Read back the new MAIN balance
           const [stockRow] = await db
@@ -276,7 +334,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
             .where(eq(ingredients.id, item.ingredient_id));
 
           if (stockRow) {
-            hub.emitToLocation(locationId, "stock.updated", {
+            hub.emitToLocation(emitLocationId, "stock.updated", {
               ingredientId: item.ingredient_id,
               ingredientName: ing?.name ?? item.ingredient_id,
               warehouseType: "MAIN",
@@ -346,6 +404,8 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // -------------------------------------------------------------------------
   router.get("/itos", requireAuth, async (req, res) => {
     const statusParam = req.query.status as string | undefined;
+    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    if (!locationId) return;
 
     if (
       statusParam &&
@@ -360,12 +420,26 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const rows = statusParam
-      ? await db
-          .select()
-          .from(itos)
-          .where(eq(itos.status, statusParam as typeof itoStatusEnum.enumValues[number]))
-      : await db.select().from(itos);
+    const scopedWarehouses = await db
+      .select({ id: warehouses.id })
+      .from(warehouses)
+      .where(eq(warehouses.locationId, locationId));
+    const scopedWarehouseIds = scopedWarehouses.map((warehouse) => warehouse.id);
+
+    if (scopedWarehouseIds.length === 0) {
+      res.json([]);
+      return;
+    }
+
+    const conditions = [inArray(itos.fromWarehouseId, scopedWarehouseIds)];
+    if (statusParam) {
+      conditions.push(eq(itos.status, statusParam as typeof itoStatusEnum.enumValues[number]));
+    }
+
+    const rows = await db
+      .select()
+      .from(itos)
+      .where(and(...conditions));
 
     res.json(rows);
   });
@@ -380,8 +454,11 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const fromWarehouse = await getWarehouseByType(parsed.data.from);
-    const toWarehouse = await getWarehouseByType(parsed.data.to);
+    const locationId = await resolveLocationId(db, res, parsed.data.outlet_id);
+    if (!locationId) return;
+
+    const fromWarehouse = await getWarehouseByType(parsed.data.from, locationId);
+    const toWarehouse = await getWarehouseByType(parsed.data.to, locationId);
 
     if (!fromWarehouse) {
       sendError(res, 404, "NOT_FOUND", "Source warehouse (MAIN) not found.");
@@ -519,7 +596,11 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       res.json(confirmedIto!);
 
       // Task 8: emit stock.updated for each ingredient moved to KITCHEN
-      const locationId = await getDefaultLocationId(db);
+      const [destinationWarehouse] = await db
+        .select({ locationId: warehouses.locationId })
+        .from(warehouses)
+        .where(eq(warehouses.id, ito.toWarehouseId));
+      const locationId = destinationWarehouse?.locationId;
       if (locationId) {
         for (const item of items) {
           // Read back the new KITCHEN balance after the transaction

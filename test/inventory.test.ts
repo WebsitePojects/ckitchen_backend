@@ -41,6 +41,121 @@ beforeAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Multi-outlet isolation: each outlet owns its MAIN + KITCHEN warehouse pair
+// ---------------------------------------------------------------------------
+
+describe("Multi-outlet inventory isolation", () => {
+  let ingredientId: string;
+  let outletAId: string;
+  let outletBId: string;
+  let outletBItoId: string;
+
+  beforeAll(async () => {
+    const ingredientRes = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        name: "Outlet Isolated Rice",
+        unit: "kg",
+        unit_cost: "42.00",
+        low_stock_threshold: "5",
+      });
+    ingredientId = ingredientRes.body.id as string;
+
+    const outletsRes = await request(app)
+      .get("/api/v1/outlets")
+      .set("Authorization", `Bearer ${adminToken}`);
+    outletAId = outletsRes.body[0].id as string;
+
+    const outletBRes = await request(app)
+      .post("/api/v1/outlets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: "ISO2", name: "Isolation Outlet" });
+    outletBId = outletBRes.body.id as string;
+  });
+
+  it("receives stock into a specific outlet MAIN without changing another outlet", async () => {
+    await request(app)
+      .post("/api/v1/inventory/receive")
+      .set("Authorization", `Bearer ${warehouseToken}`)
+      .send({
+        outlet_id: outletAId,
+        items: [{ ingredient_id: ingredientId, quantity: 10 }],
+      });
+
+    await request(app)
+      .post("/api/v1/inventory/receive")
+      .set("Authorization", `Bearer ${warehouseToken}`)
+      .send({
+        outlet_id: outletBId,
+        items: [{ ingredient_id: ingredientId, quantity: 30 }],
+      });
+
+    const outletAStock = await request(app)
+      .get(`/api/v1/inventory?warehouse=MAIN&outlet_id=${outletAId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    const outletBStock = await request(app)
+      .get(`/api/v1/inventory?warehouse=MAIN&outlet_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    const outletARow = outletAStock.body.find((row: { ingredientId: string }) => row.ingredientId === ingredientId);
+    const outletBRow = outletBStock.body.find((row: { ingredientId: string }) => row.ingredientId === ingredientId);
+
+    expect(Number(outletARow.quantity)).toBe(10);
+    expect(Number(outletBRow.quantity)).toBe(30);
+  });
+
+  it("creates and confirms an ITO inside one outlet without touching the other outlet", async () => {
+    const itoRes = await request(app)
+      .post("/api/v1/itos")
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .send({
+        outlet_id: outletBId,
+        from: "MAIN",
+        to: "KITCHEN",
+        items: [{ ingredient_id: ingredientId, quantity: 12 }],
+      });
+    expect(itoRes.status).toBe(201);
+    outletBItoId = itoRes.body.id as string;
+
+    const confirmRes = await request(app)
+      .post(`/api/v1/itos/${outletBItoId}/confirm`)
+      .set("Authorization", `Bearer ${warehouseToken}`);
+    expect(confirmRes.status).toBe(200);
+
+    const outletAMain = await request(app)
+      .get(`/api/v1/inventory?warehouse=MAIN&outlet_id=${outletAId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    const outletBMain = await request(app)
+      .get(`/api/v1/inventory?warehouse=MAIN&outlet_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    const outletBKitchen = await request(app)
+      .get(`/api/v1/inventory?warehouse=KITCHEN&outlet_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    const outletAMainRow = outletAMain.body.find((row: { ingredientId: string }) => row.ingredientId === ingredientId);
+    const outletBMainRow = outletBMain.body.find((row: { ingredientId: string }) => row.ingredientId === ingredientId);
+    const outletBKitchenRow = outletBKitchen.body.find((row: { ingredientId: string }) => row.ingredientId === ingredientId);
+
+    expect(Number(outletAMainRow.quantity)).toBe(10);
+    expect(Number(outletBMainRow.quantity)).toBe(18);
+    expect(Number(outletBKitchenRow.quantity)).toBe(12);
+  });
+
+  it("filters ITO list by outlet_id", async () => {
+    const outletAItos = await request(app)
+      .get(`/api/v1/itos?outlet_id=${outletAId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    const outletBItos = await request(app)
+      .get(`/api/v1/itos?outlet_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    expect(outletAItos.body.some((ito: { id: string }) => ito.id === outletBItoId)).toBe(false);
+    expect(outletBItos.body.some((ito: { id: string }) => ito.id === outletBItoId)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GET /warehouses — verify two-tier warehouse setup
 // ---------------------------------------------------------------------------
 

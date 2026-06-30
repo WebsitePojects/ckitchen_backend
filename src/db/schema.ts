@@ -43,6 +43,8 @@ export const printerStatusEnum = pgEnum("printer_status", ["ONLINE", "OFFLINE", 
 
 export const printJobStatusEnum = pgEnum("print_job_status", ["PENDING", "PRINTED", "FAILED"]);
 
+export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE"]);
+
 export const warehouseTypeEnum = pgEnum("warehouse_type", ["MAIN", "KITCHEN"]);
 
 export const roleEnum = pgEnum("role", [
@@ -59,11 +61,20 @@ export const roleEnum = pgEnum("role", [
 // location
 // ---------------------------------------------------------------------------
 
-export const locations = pgTable("location", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  name: text("name").notNull(),
-  address: text("address"),
-});
+export const locations = pgTable(
+  "location",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    code: text("code").notNull(),
+    name: text("name").notNull(),
+    address: text("address"),
+    status: locationStatusEnum("status").notNull().default("ACTIVE"),
+    timezone: text("timezone").notNull().default("Asia/Manila"),
+    contactName: text("contact_name"),
+    contactPhone: text("contact_phone"),
+  },
+  (table) => [uniqueIndex("location_code_unique").on(table.code)],
+);
 
 export type Location = typeof locations.$inferSelect;
 export type NewLocation = typeof locations.$inferInsert;
@@ -194,13 +205,17 @@ export type NewRecipeLine = typeof recipeLines.$inferInsert;
 // warehouse / inventory_stock
 // ---------------------------------------------------------------------------
 
-export const warehouses = pgTable("warehouse", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  locationId: uuid("location_id")
-    .notNull()
-    .references(() => locations.id),
-  type: warehouseTypeEnum("type").notNull(),
-});
+export const warehouses = pgTable(
+  "warehouse",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id),
+    type: warehouseTypeEnum("type").notNull(),
+  },
+  (table) => [uniqueIndex("warehouse_location_type_unique").on(table.locationId, table.type)],
+);
 
 export type Warehouse = typeof warehouses.$inferSelect;
 export type NewWarehouse = typeof warehouses.$inferInsert;

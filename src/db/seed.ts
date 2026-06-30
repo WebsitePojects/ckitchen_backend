@@ -6,7 +6,8 @@ import { runMigrations } from "./migrate.js";
 import { hashPassword } from "../modules/auth/service.js";
 import { kitchenStations, locations, users, warehouses, type Role } from "./schema.js";
 
-const LOCATION_NAME = "Main Cloud Kitchen";
+const LOCATION_CODE = "CK1";
+const LOCATION_NAME = "CloudKitchen ONE";
 
 const STATION_NAMES = ["Grill", "Fry", "Prep", "Beverage", "Packing"] as const;
 
@@ -49,12 +50,18 @@ export async function seed(db: DB): Promise<SeededUser[]> {
   let [location] = await db
     .select()
     .from(locations)
-    .where(eq(locations.name, LOCATION_NAME));
+    .where(eq(locations.code, LOCATION_CODE));
 
   if (!location) {
     [location] = await db
       .insert(locations)
-      .values({ name: LOCATION_NAME, address: "Prototype HQ" })
+      .values({
+        code: LOCATION_CODE,
+        name: LOCATION_NAME,
+        address: "Prototype HQ",
+        status: "ACTIVE",
+        timezone: "Asia/Manila",
+      })
       .returning();
   }
 

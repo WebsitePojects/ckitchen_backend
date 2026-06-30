@@ -22,6 +22,41 @@
       "when": 1782235409154,
       "tag": "0002_outgoing_liz_osborn",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1782823300000,
+      "tag": "0003_physical_outlets",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1782802936169,
+      "tag": "0004_black_blue_blade",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1782811347001,
+      "tag": "0005_daily_jazinda",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1782813597883,
+      "tag": "0006_sturdy_vapor",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1782822861143,
+      "tag": "0007_early_frank_castle",
+      "breakpoints": true
     }
   ]
 }

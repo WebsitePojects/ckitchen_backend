@@ -18,8 +18,8 @@
  * Task 8 — realtime emissions:
  *   stock.updated → after /inventory/receive (MAIN) and /itos/:id/confirm (KITCHEN)
  */
-import { Router } from "express";
-import { and, eq, sql } from "drizzle-orm";
+import { Router, type Response } from "express";
+import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -30,12 +30,15 @@ import {
   itoStatusEnum,
   itos,
   locations,
+  stockLedgerEntries,
   warehouseTypeEnum,
   warehouses,
 } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
+import { audit } from "../ems/audit.js";
+import { postLedger } from "./ledger.js";
 
 // ---------------------------------------------------------------------------
 // RBAC role sets (§1 role matrix)
@@ -62,6 +65,7 @@ const receiveItemSchema = z.object({
 });
 
 const receiveSchema = z.object({
+  outlet_id: z.string().uuid().optional(),
   items: z.array(receiveItemSchema).min(1),
 });
 
@@ -81,10 +85,13 @@ const itoItemSchema = z.object({
 });
 
 const createItoSchema = z.object({
+  outlet_id: z.string().uuid().optional(),
   from: z.literal("MAIN"),
   to: z.literal("KITCHEN"),
   items: z.array(itoItemSchema).min(1),
 });
+
+const outletIdParamSchema = z.string().uuid();
 
 // ---------------------------------------------------------------------------
 // Location resolution helper
@@ -96,6 +103,45 @@ async function getDefaultLocationId(db: DB): Promise<string | null> {
   return loc?.id ?? null;
 }
 
+function parseOutletIdParam(raw: unknown): string | undefined | null {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") return null;
+  const parsed = outletIdParamSchema.safeParse(raw);
+  return parsed.success ? parsed.data : null;
+}
+
+async function resolveLocationId(
+  db: DB,
+  res: Response,
+  rawOutletId: unknown,
+): Promise<string | null> {
+  const parsedOutletId = parseOutletIdParam(rawOutletId);
+  if (parsedOutletId === null) {
+    sendError(res, 400, "VALIDATION_ERROR", "Query param 'outlet_id' must be a UUID.");
+    return null;
+  }
+
+  if (parsedOutletId) {
+    const [location] = await db
+      .select({ id: locations.id })
+      .from(locations)
+      .where(eq(locations.id, parsedOutletId));
+    if (!location) {
+      sendError(res, 404, "NOT_FOUND", "Outlet not found.");
+      return null;
+    }
+    return location.id;
+  }
+
+  const defaultLocationId = await getDefaultLocationId(db);
+  if (!defaultLocationId) {
+    sendError(res, 500, "NOT_FOUND", "No outlet is configured for this deployment.");
+    return null;
+  }
+
+  return defaultLocationId;
+}
+
 // ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
@@ -105,11 +151,14 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
 
   // Helper: look up a warehouse by its type (MAIN | KITCHEN) for this prototype's
   // single-location deployment.
-  async function getWarehouseByType(type: typeof warehouseTypeEnum.enumValues[number]) {
+  async function getWarehouseByType(
+    type: typeof warehouseTypeEnum.enumValues[number],
+    locationId: string,
+  ) {
     const [warehouse] = await db
       .select()
       .from(warehouses)
-      .where(eq(warehouses.type, type));
+      .where(and(eq(warehouses.type, type), eq(warehouses.locationId, locationId)));
     return warehouse ?? null;
   }
 
@@ -148,7 +197,13 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // GET /warehouses — list the two tiers
   // -------------------------------------------------------------------------
   router.get("/warehouses", requireAuth, async (req, res) => {
-    const rows = await db.select().from(warehouses);
+    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    if (!locationId) return;
+
+    const rows = await db
+      .select()
+      .from(warehouses)
+      .where(eq(warehouses.locationId, locationId));
     res.json(rows);
   });
 
@@ -170,7 +225,10 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const warehouse = await getWarehouseByType(warehouseParam as "MAIN" | "KITCHEN");
+    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    if (!locationId) return;
+
+    const warehouse = await getWarehouseByType(warehouseParam as "MAIN" | "KITCHEN", locationId);
     if (!warehouse) {
       sendError(res, 404, "NOT_FOUND", `Warehouse of type ${warehouseParam} not found.`);
       return;
@@ -218,7 +276,10 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         return;
       }
 
-      const mainWarehouse = await getWarehouseByType("MAIN");
+      const locationId = await resolveLocationId(db, res, parsed.data.outlet_id);
+      if (!locationId) return;
+
+      const mainWarehouse = await getWarehouseByType("MAIN", locationId);
       if (!mainWarehouse) {
         sendError(res, 500, "NOT_FOUND", "MAIN warehouse not configured.");
         return;
@@ -236,29 +297,57 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         }
       }
 
-      // Upsert each item into MAIN inventory_stock (add to existing qty if row present)
-      for (const item of parsed.data.items) {
-        await db
-          .insert(inventoryStock)
-          .values({
-            warehouseId: mainWarehouse.id,
+      // Upsert each item into MAIN inventory_stock (add to existing qty if row present).
+      // Also post a RECEIVE ledger row inside the same transaction (ERP R1).
+      // Generate a receive document ref: RECV-<timestamp>-<mainWarehouseId-prefix>
+      const receiveDocNo = `RECV-${Date.now()}-${mainWarehouse.id.slice(0, 8)}`;
+
+      await db.transaction(async (tx) => {
+        for (const item of parsed.data.items) {
+          await tx
+            .insert(inventoryStock)
+            .values({
+              warehouseId: mainWarehouse.id,
+              ingredientId: item.ingredient_id,
+              quantity: String(item.quantity),
+            })
+            .onConflictDoUpdate({
+              target: [inventoryStock.warehouseId, inventoryStock.ingredientId],
+              set: {
+                // accumulate: existing + new delivery
+                quantity: sql`${inventoryStock.quantity} + EXCLUDED.quantity`,
+              },
+            });
+
+          // ERP R1: post RECEIVE IN ledger row (idempotent on unique key)
+          await postLedger(tx, {
+            sourceModule: "RECEIVE",
+            sourceDocumentNo: receiveDocNo,
+            sourceLineNo: item.ingredient_id,
             ingredientId: item.ingredient_id,
-            quantity: String(item.quantity),
-          })
-          .onConflictDoUpdate({
-            target: [inventoryStock.warehouseId, inventoryStock.ingredientId],
-            set: {
-              // accumulate: existing + new delivery
-              quantity: sql`${inventoryStock.quantity} + EXCLUDED.quantity`,
-            },
+            warehouseId: mainWarehouse.id,
+            movementType: "IN",
+            quantity: item.quantity,
+            encoderUserId: req.user?.id ?? null,
           });
-      }
+        }
+      });
 
       res.status(201).json({ ok: true });
 
+      // EMS: audit inventory.receive (non-blocking)
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "inventory.receive",
+        description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse`,
+        entityType: "warehouse",
+        metadata: { items: parsed.data.items },
+      });
+
       // Task 8: emit stock.updated for each received ingredient (MAIN warehouse)
-      const locationId = await getDefaultLocationId(db);
-      if (locationId) {
+      const emitLocationId = mainWarehouse.locationId;
+      if (emitLocationId) {
         for (const item of parsed.data.items) {
           // Read back the new MAIN balance
           const [stockRow] = await db
@@ -276,7 +365,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
             .where(eq(ingredients.id, item.ingredient_id));
 
           if (stockRow) {
-            hub.emitToLocation(locationId, "stock.updated", {
+            hub.emitToLocation(emitLocationId, "stock.updated", {
               ingredientId: item.ingredient_id,
               ingredientName: ing?.name ?? item.ingredient_id,
               warehouseType: "MAIN",
@@ -346,6 +435,8 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // -------------------------------------------------------------------------
   router.get("/itos", requireAuth, async (req, res) => {
     const statusParam = req.query.status as string | undefined;
+    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    if (!locationId) return;
 
     if (
       statusParam &&
@@ -360,12 +451,26 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const rows = statusParam
-      ? await db
-          .select()
-          .from(itos)
-          .where(eq(itos.status, statusParam as typeof itoStatusEnum.enumValues[number]))
-      : await db.select().from(itos);
+    const scopedWarehouses = await db
+      .select({ id: warehouses.id })
+      .from(warehouses)
+      .where(eq(warehouses.locationId, locationId));
+    const scopedWarehouseIds = scopedWarehouses.map((warehouse) => warehouse.id);
+
+    if (scopedWarehouseIds.length === 0) {
+      res.json([]);
+      return;
+    }
+
+    const conditions = [inArray(itos.fromWarehouseId, scopedWarehouseIds)];
+    if (statusParam) {
+      conditions.push(eq(itos.status, statusParam as typeof itoStatusEnum.enumValues[number]));
+    }
+
+    const rows = await db
+      .select()
+      .from(itos)
+      .where(and(...conditions));
 
     res.json(rows);
   });
@@ -380,8 +485,11 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const fromWarehouse = await getWarehouseByType(parsed.data.from);
-    const toWarehouse = await getWarehouseByType(parsed.data.to);
+    const locationId = await resolveLocationId(db, res, parsed.data.outlet_id);
+    if (!locationId) return;
+
+    const fromWarehouse = await getWarehouseByType(parsed.data.from, locationId);
+    const toWarehouse = await getWarehouseByType(parsed.data.to, locationId);
 
     if (!fromWarehouse) {
       sendError(res, 404, "NOT_FOUND", "Source warehouse (MAIN) not found.");
@@ -502,6 +610,29 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
                 quantity: sql`${inventoryStock.quantity} + EXCLUDED.quantity`,
               },
             });
+
+          // ERP R1: post ITO OUT(MAIN) + IN(KITCHEN) ledger rows
+          await postLedger(tx, {
+            sourceModule: "ITO",
+            sourceDocumentNo: id,
+            sourceLineNo: `OUT-${item.ingredientId}`,
+            ingredientId: item.ingredientId,
+            warehouseId: ito.fromWarehouseId,
+            movementType: "OUT",
+            quantity: item.quantity,
+            encoderUserId: req.user?.id ?? null,
+          });
+
+          await postLedger(tx, {
+            sourceModule: "ITO",
+            sourceDocumentNo: id,
+            sourceLineNo: `IN-${item.ingredientId}`,
+            ingredientId: item.ingredientId,
+            warehouseId: ito.toWarehouseId,
+            movementType: "IN",
+            quantity: item.quantity,
+            encoderUserId: req.user?.id ?? null,
+          });
         }
 
         // Step 3: mark ITO CONFIRMED with audit fields
@@ -518,8 +649,23 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
 
       res.json(confirmedIto!);
 
+      // EMS: audit ito.confirm (non-blocking)
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "ito.confirm",
+        description: `confirmed ITO ${id}`,
+        entityType: "ito",
+        entityId: id,
+        metadata: { itemCount: items.length },
+      });
+
       // Task 8: emit stock.updated for each ingredient moved to KITCHEN
-      const locationId = await getDefaultLocationId(db);
+      const [destinationWarehouse] = await db
+        .select({ locationId: warehouses.locationId })
+        .from(warehouses)
+        .where(eq(warehouses.id, ito.toWarehouseId));
+      const locationId = destinationWarehouse?.locationId;
       if (locationId) {
         for (const item of items) {
           // Read back the new KITCHEN balance after the transaction
@@ -549,6 +695,71 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       }
     },
   );
+
+  // -------------------------------------------------------------------------
+  // GET /stock-ledger — ERP R1 universal ledger query (requireAuth)
+  //
+  // Query params (all optional):
+  //   ingredient_id  — filter by ingredient UUID
+  //   warehouse_id   — filter by warehouse UUID
+  //   source_module  — filter by source module (RECEIVE|ITO|ORDER_DEDUCTION|…)
+  //   from           — ISO timestamp lower bound on posted_at (inclusive)
+  //   to             — ISO timestamp upper bound on posted_at (inclusive)
+  //   limit          — max rows (default 100)
+  //
+  // Returns rows newest-first.
+  // -------------------------------------------------------------------------
+  router.get("/stock-ledger", requireAuth, async (req, res) => {
+    const {
+      ingredient_id,
+      warehouse_id,
+      source_module,
+      from: fromParam,
+      to: toParam,
+      limit: limitParam,
+    } = req.query as Record<string, string | undefined>;
+
+    const conditions: ReturnType<typeof eq>[] = [];
+
+    if (ingredient_id) {
+      conditions.push(eq(stockLedgerEntries.ingredientId, ingredient_id));
+    }
+    if (warehouse_id) {
+      conditions.push(eq(stockLedgerEntries.warehouseId, warehouse_id));
+    }
+    if (source_module) {
+      conditions.push(
+        eq(
+          stockLedgerEntries.sourceModule,
+          source_module as typeof stockLedgerEntries.$inferSelect["sourceModule"],
+        ),
+      );
+    }
+    if (fromParam) {
+      conditions.push(gte(stockLedgerEntries.postedAt, new Date(fromParam)));
+    }
+    if (toParam) {
+      conditions.push(lte(stockLedgerEntries.postedAt, new Date(toParam)));
+    }
+
+    const limit = Math.min(Number(limitParam ?? 100), 500);
+
+    const rows =
+      conditions.length > 0
+        ? await db
+            .select()
+            .from(stockLedgerEntries)
+            .where(and(...(conditions as Parameters<typeof and>)))
+            .orderBy(desc(stockLedgerEntries.postedAt))
+            .limit(limit)
+        : await db
+            .select()
+            .from(stockLedgerEntries)
+            .orderBy(desc(stockLedgerEntries.postedAt))
+            .limit(limit);
+
+    res.json(rows);
+  });
 
   return router;
 }

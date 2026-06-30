@@ -43,6 +43,8 @@ export const printerStatusEnum = pgEnum("printer_status", ["ONLINE", "OFFLINE", 
 
 export const printJobStatusEnum = pgEnum("print_job_status", ["PENDING", "PRINTED", "FAILED"]);
 
+export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE"]);
+
 export const warehouseTypeEnum = pgEnum("warehouse_type", ["MAIN", "KITCHEN"]);
 
 export const roleEnum = pgEnum("role", [
@@ -59,11 +61,20 @@ export const roleEnum = pgEnum("role", [
 // location
 // ---------------------------------------------------------------------------
 
-export const locations = pgTable("location", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  name: text("name").notNull(),
-  address: text("address"),
-});
+export const locations = pgTable(
+  "location",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    code: text("code").notNull(),
+    name: text("name").notNull(),
+    address: text("address"),
+    status: locationStatusEnum("status").notNull().default("ACTIVE"),
+    timezone: text("timezone").notNull().default("Asia/Manila"),
+    contactName: text("contact_name"),
+    contactPhone: text("contact_phone"),
+  },
+  (table) => [uniqueIndex("location_code_unique").on(table.code)],
+);
 
 export type Location = typeof locations.$inferSelect;
 export type NewLocation = typeof locations.$inferInsert;
@@ -194,13 +205,17 @@ export type NewRecipeLine = typeof recipeLines.$inferInsert;
 // warehouse / inventory_stock
 // ---------------------------------------------------------------------------
 
-export const warehouses = pgTable("warehouse", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  locationId: uuid("location_id")
-    .notNull()
-    .references(() => locations.id),
-  type: warehouseTypeEnum("type").notNull(),
-});
+export const warehouses = pgTable(
+  "warehouse",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id),
+    type: warehouseTypeEnum("type").notNull(),
+  },
+  (table) => [uniqueIndex("warehouse_location_type_unique").on(table.locationId, table.type)],
+);
 
 export type Warehouse = typeof warehouses.$inferSelect;
 export type NewWarehouse = typeof warehouses.$inferInsert;
@@ -406,3 +421,216 @@ export const consumptionLogs = pgTable("consumption_log", {
 
 export type ConsumptionLog = typeof consumptionLogs.$inferSelect;
 export type NewConsumptionLog = typeof consumptionLogs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// ERP R1: stock_ledger_entry  (append-only audit trail, shadows inventoryStock)
+// ---------------------------------------------------------------------------
+
+export const stockLedgerSourceModuleEnum = pgEnum("stock_ledger_source_module", [
+  "RECEIVE",
+  "ITO",
+  "ORDER_DEDUCTION",
+  "ADJUSTMENT",
+  "RESTOCK",
+]);
+
+export const stockLedgerMovementTypeEnum = pgEnum("stock_ledger_movement_type", ["IN", "OUT"]);
+
+export const stockLedgerEntries = pgTable(
+  "stock_ledger_entry",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sourceModule: stockLedgerSourceModuleEnum("source_module").notNull(),
+    sourceDocumentNo: text("source_document_no").notNull(),
+    sourceLineNo: text("source_line_no"),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    warehouseId: uuid("warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    movementType: stockLedgerMovementTypeEnum("movement_type").notNull(),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+    postedAt: timestamp("posted_at", { withTimezone: true }).notNull().defaultNow(),
+    encoderUserId: uuid("encoder_user_id").references(() => users.id),
+    metadata: jsonb("metadata"),
+  },
+  (table) => [
+    uniqueIndex("stock_ledger_source_unique").on(
+      table.sourceModule,
+      table.sourceDocumentNo,
+      table.sourceLineNo,
+    ),
+  ],
+);
+
+export type StockLedgerEntry = typeof stockLedgerEntries.$inferSelect;
+export type NewStockLedgerEntry = typeof stockLedgerEntries.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// EMS: departmentEnum / employee / userSession / auditLog  (CK1-EMS-005)
+// ---------------------------------------------------------------------------
+
+export const departmentEnum = pgEnum("department", [
+  "KITCHEN",
+  "WAREHOUSE",
+  "PURCHASING",
+  "SALES",
+  "PRODUCTION",
+  "QA",
+  "ACCOUNTING",
+  "ADMIN",
+]);
+
+export const employeeStatusEnum = pgEnum("employee_status", ["ACTIVE", "INACTIVE"]);
+
+export const employees = pgTable("employee", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").references(() => users.id),
+  employeeNo: text("employee_no").notNull().unique(),
+  fullName: text("full_name").notNull(),
+  department: departmentEnum("department").notNull(),
+  position: text("position"),
+  photoUrl: text("photo_url"),
+  status: employeeStatusEnum("status").notNull().default("ACTIVE"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type Employee = typeof employees.$inferSelect;
+export type NewEmployee = typeof employees.$inferInsert;
+
+export const userSessions = pgTable("user_session", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id")
+    .notNull()
+    .references(() => users.id),
+  loginAt: timestamp("login_at", { withTimezone: true }).notNull().defaultNow(),
+  logoutAt: timestamp("logout_at", { withTimezone: true }),
+  ip: text("ip"),
+  userAgent: text("user_agent"),
+});
+
+export type UserSession = typeof userSessions.$inferSelect;
+export type NewUserSession = typeof userSessions.$inferInsert;
+
+export const auditLogs = pgTable("audit_log", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  actorUserId: uuid("actor_user_id").references(() => users.id),
+  actorName: text("actor_name"),
+  sessionId: uuid("session_id").references(() => userSessions.id),
+  action: text("action").notNull(),
+  description: text("description"),
+  entityType: text("entity_type"),
+  entityId: text("entity_id"),
+  metadata: jsonb("metadata"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type AuditLog = typeof auditLogs.$inferSelect;
+export type NewAuditLog = typeof auditLogs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// EMS E3: attendance_record  (photo-based DTR — CK1-EMS-005 §3)
+// ---------------------------------------------------------------------------
+
+export const attendanceTypeEnum = pgEnum("attendance_type", ["TIME_IN", "TIME_OUT"]);
+
+export const attendanceRecords = pgTable("attendance_record", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  employeeId: uuid("employee_id")
+    .notNull()
+    .references(() => employees.id),
+  type: attendanceTypeEnum("type").notNull(),
+  photoUrl: text("photo_url").notNull(),
+  photoPublicId: text("photo_public_id").notNull(),
+  capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
+  /** The authed user who recorded this punch — derived from req.user (anti-spoof). */
+  recordedByUserId: uuid("recorded_by_user_id")
+    .notNull()
+    .references(() => users.id),
+  /** Session from req.user.sessionId — links to the actor's login session. */
+  sessionId: uuid("session_id").references(() => userSessions.id),
+  note: text("note"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type AttendanceRecord = typeof attendanceRecords.$inferSelect;
+export type NewAttendanceRecord = typeof attendanceRecords.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// ERP R2: master data — suppliers / supplier_items / customers /
+// department_inventory_access  (CK1-ERP-006 §1-2). Additive. `ingredients`
+// stays the item catalog; supplier_items link a supplier to an ingredient.
+// ---------------------------------------------------------------------------
+
+export const suppliers = pgTable("supplier", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  code: text("code").notNull().unique(),
+  name: text("name").notNull(),
+  contactName: text("contact_name"),
+  contactPhone: text("contact_phone"),
+  email: text("email"),
+  address: text("address"),
+  paymentTermDays: integer("payment_term_days").notNull().default(0),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type Supplier = typeof suppliers.$inferSelect;
+export type NewSupplier = typeof suppliers.$inferInsert;
+
+export const supplierItems = pgTable(
+  "supplier_item",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    supplierId: uuid("supplier_id")
+      .notNull()
+      .references(() => suppliers.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    supplierSku: text("supplier_sku"),
+    lastUnitCost: numeric("last_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+  },
+  (table) => [uniqueIndex("supplier_item_unique").on(table.supplierId, table.ingredientId)],
+);
+export type SupplierItem = typeof supplierItems.$inferSelect;
+
+export const customers = pgTable("customer", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  code: text("code").notNull().unique(),
+  name: text("name").notNull(),
+  contactName: text("contact_name"),
+  contactPhone: text("contact_phone"),
+  email: text("email"),
+  address: text("address"),
+  paymentTermDays: integer("payment_term_days").notNull().default(0),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type Customer = typeof customers.$inferSelect;
+export type NewCustomer = typeof customers.$inferInsert;
+
+/** gprci-style per-department warehouse permissions (CK1-ERP-006 §2). */
+export const departmentInventoryAccess = pgTable(
+  "department_inventory_access",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    department: departmentEnum("department").notNull(),
+    warehouseType: warehouseTypeEnum("warehouse_type").notNull(),
+    canView: boolean("can_view").notNull().default(true),
+    canViewCost: boolean("can_view_cost").notNull().default(false),
+    canReceive: boolean("can_receive").notNull().default(false),
+    canIssue: boolean("can_issue").notNull().default(false),
+    canAdjust: boolean("can_adjust").notNull().default(false),
+    canApprove: boolean("can_approve").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("department_inventory_access_unique").on(table.department, table.warehouseType),
+  ],
+);
+export type DepartmentInventoryAccess = typeof departmentInventoryAccess.$inferSelect;

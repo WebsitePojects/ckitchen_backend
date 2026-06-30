@@ -6,6 +6,8 @@ import type { User } from "../../db/schema.js";
 export interface AuthenticatedUser {
   id: string;
   role: User["role"];
+  /** Session id from the JWT `sid` claim (set after login; absent for legacy tokens). */
+  sessionId?: string;
 }
 
 declare module "express-serve-static-core" {
@@ -40,7 +42,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   try {
     const { jwtSecret } = loadConfig();
     const payload = verifyToken(token, jwtSecret);
-    req.user = { id: payload.sub, role: payload.role };
+    req.user = { id: payload.sub, role: payload.role, sessionId: payload.sid };
     next();
   } catch {
     sendError(res, 401, "AUTH_REQUIRED", "Invalid or expired token.");

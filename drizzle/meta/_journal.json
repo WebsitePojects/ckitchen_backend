@@ -36,6 +36,13 @@
       "when": 1782802936169,
       "tag": "0004_black_blue_blade",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1782811347001,
+      "tag": "0005_daily_jazinda",
+      "breakpoints": true
     }
   ]
 }

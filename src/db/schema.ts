@@ -423,6 +423,52 @@ export type ConsumptionLog = typeof consumptionLogs.$inferSelect;
 export type NewConsumptionLog = typeof consumptionLogs.$inferInsert;
 
 // ---------------------------------------------------------------------------
+// ERP R1: stock_ledger_entry  (append-only audit trail, shadows inventoryStock)
+// ---------------------------------------------------------------------------
+
+export const stockLedgerSourceModuleEnum = pgEnum("stock_ledger_source_module", [
+  "RECEIVE",
+  "ITO",
+  "ORDER_DEDUCTION",
+  "ADJUSTMENT",
+  "RESTOCK",
+]);
+
+export const stockLedgerMovementTypeEnum = pgEnum("stock_ledger_movement_type", ["IN", "OUT"]);
+
+export const stockLedgerEntries = pgTable(
+  "stock_ledger_entry",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sourceModule: stockLedgerSourceModuleEnum("source_module").notNull(),
+    sourceDocumentNo: text("source_document_no").notNull(),
+    sourceLineNo: text("source_line_no"),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    warehouseId: uuid("warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    movementType: stockLedgerMovementTypeEnum("movement_type").notNull(),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+    postedAt: timestamp("posted_at", { withTimezone: true }).notNull().defaultNow(),
+    encoderUserId: uuid("encoder_user_id").references(() => users.id),
+    metadata: jsonb("metadata"),
+  },
+  (table) => [
+    uniqueIndex("stock_ledger_source_unique").on(
+      table.sourceModule,
+      table.sourceDocumentNo,
+      table.sourceLineNo,
+    ),
+  ],
+);
+
+export type StockLedgerEntry = typeof stockLedgerEntries.$inferSelect;
+export type NewStockLedgerEntry = typeof stockLedgerEntries.$inferInsert;
+
+// ---------------------------------------------------------------------------
 // EMS: departmentEnum / employee / userSession / auditLog  (CK1-EMS-005)
 // ---------------------------------------------------------------------------
 

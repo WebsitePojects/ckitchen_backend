@@ -19,7 +19,7 @@
  *   stock.updated → after /inventory/receive (MAIN) and /itos/:id/confirm (KITCHEN)
  */
 import { Router, type Response } from "express";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -30,6 +30,7 @@ import {
   itoStatusEnum,
   itos,
   locations,
+  stockLedgerEntries,
   warehouseTypeEnum,
   warehouses,
 } from "../../db/schema.js";
@@ -37,6 +38,7 @@ import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
+import { postLedger } from "./ledger.js";
 
 // ---------------------------------------------------------------------------
 // RBAC role sets (§1 role matrix)
@@ -295,23 +297,41 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         }
       }
 
-      // Upsert each item into MAIN inventory_stock (add to existing qty if row present)
-      for (const item of parsed.data.items) {
-        await db
-          .insert(inventoryStock)
-          .values({
-            warehouseId: mainWarehouse.id,
+      // Upsert each item into MAIN inventory_stock (add to existing qty if row present).
+      // Also post a RECEIVE ledger row inside the same transaction (ERP R1).
+      // Generate a receive document ref: RECV-<timestamp>-<mainWarehouseId-prefix>
+      const receiveDocNo = `RECV-${Date.now()}-${mainWarehouse.id.slice(0, 8)}`;
+
+      await db.transaction(async (tx) => {
+        for (const item of parsed.data.items) {
+          await tx
+            .insert(inventoryStock)
+            .values({
+              warehouseId: mainWarehouse.id,
+              ingredientId: item.ingredient_id,
+              quantity: String(item.quantity),
+            })
+            .onConflictDoUpdate({
+              target: [inventoryStock.warehouseId, inventoryStock.ingredientId],
+              set: {
+                // accumulate: existing + new delivery
+                quantity: sql`${inventoryStock.quantity} + EXCLUDED.quantity`,
+              },
+            });
+
+          // ERP R1: post RECEIVE IN ledger row (idempotent on unique key)
+          await postLedger(tx, {
+            sourceModule: "RECEIVE",
+            sourceDocumentNo: receiveDocNo,
+            sourceLineNo: item.ingredient_id,
             ingredientId: item.ingredient_id,
-            quantity: String(item.quantity),
-          })
-          .onConflictDoUpdate({
-            target: [inventoryStock.warehouseId, inventoryStock.ingredientId],
-            set: {
-              // accumulate: existing + new delivery
-              quantity: sql`${inventoryStock.quantity} + EXCLUDED.quantity`,
-            },
+            warehouseId: mainWarehouse.id,
+            movementType: "IN",
+            quantity: item.quantity,
+            encoderUserId: req.user?.id ?? null,
           });
-      }
+        }
+      });
 
       res.status(201).json({ ok: true });
 
@@ -590,6 +610,29 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
                 quantity: sql`${inventoryStock.quantity} + EXCLUDED.quantity`,
               },
             });
+
+          // ERP R1: post ITO OUT(MAIN) + IN(KITCHEN) ledger rows
+          await postLedger(tx, {
+            sourceModule: "ITO",
+            sourceDocumentNo: id,
+            sourceLineNo: `OUT-${item.ingredientId}`,
+            ingredientId: item.ingredientId,
+            warehouseId: ito.fromWarehouseId,
+            movementType: "OUT",
+            quantity: item.quantity,
+            encoderUserId: req.user?.id ?? null,
+          });
+
+          await postLedger(tx, {
+            sourceModule: "ITO",
+            sourceDocumentNo: id,
+            sourceLineNo: `IN-${item.ingredientId}`,
+            ingredientId: item.ingredientId,
+            warehouseId: ito.toWarehouseId,
+            movementType: "IN",
+            quantity: item.quantity,
+            encoderUserId: req.user?.id ?? null,
+          });
         }
 
         // Step 3: mark ITO CONFIRMED with audit fields
@@ -652,6 +695,71 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       }
     },
   );
+
+  // -------------------------------------------------------------------------
+  // GET /stock-ledger — ERP R1 universal ledger query (requireAuth)
+  //
+  // Query params (all optional):
+  //   ingredient_id  — filter by ingredient UUID
+  //   warehouse_id   — filter by warehouse UUID
+  //   source_module  — filter by source module (RECEIVE|ITO|ORDER_DEDUCTION|…)
+  //   from           — ISO timestamp lower bound on posted_at (inclusive)
+  //   to             — ISO timestamp upper bound on posted_at (inclusive)
+  //   limit          — max rows (default 100)
+  //
+  // Returns rows newest-first.
+  // -------------------------------------------------------------------------
+  router.get("/stock-ledger", requireAuth, async (req, res) => {
+    const {
+      ingredient_id,
+      warehouse_id,
+      source_module,
+      from: fromParam,
+      to: toParam,
+      limit: limitParam,
+    } = req.query as Record<string, string | undefined>;
+
+    const conditions: ReturnType<typeof eq>[] = [];
+
+    if (ingredient_id) {
+      conditions.push(eq(stockLedgerEntries.ingredientId, ingredient_id));
+    }
+    if (warehouse_id) {
+      conditions.push(eq(stockLedgerEntries.warehouseId, warehouse_id));
+    }
+    if (source_module) {
+      conditions.push(
+        eq(
+          stockLedgerEntries.sourceModule,
+          source_module as typeof stockLedgerEntries.$inferSelect["sourceModule"],
+        ),
+      );
+    }
+    if (fromParam) {
+      conditions.push(gte(stockLedgerEntries.postedAt, new Date(fromParam)));
+    }
+    if (toParam) {
+      conditions.push(lte(stockLedgerEntries.postedAt, new Date(toParam)));
+    }
+
+    const limit = Math.min(Number(limitParam ?? 100), 500);
+
+    const rows =
+      conditions.length > 0
+        ? await db
+            .select()
+            .from(stockLedgerEntries)
+            .where(and(...(conditions as Parameters<typeof and>)))
+            .orderBy(desc(stockLedgerEntries.postedAt))
+            .limit(limit)
+        : await db
+            .select()
+            .from(stockLedgerEntries)
+            .orderBy(desc(stockLedgerEntries.postedAt))
+            .limit(limit);
+
+    res.json(rows);
+  });
 
   return router;
 }

@@ -38,6 +38,7 @@ import {
   recipeLines,
   warehouses,
 } from "../../db/schema.js";
+import { postLedger } from "../inventory/ledger.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -559,6 +560,18 @@ export async function advanceOrder(
             orderId,
           });
 
+          // ERP R1: post ORDER_DEDUCTION OUT ledger row (same tx, atomic)
+          await postLedger(tx, {
+            sourceModule: "ORDER_DEDUCTION",
+            sourceDocumentNo: orderId,
+            sourceLineNo: line.ingredientId,
+            ingredientId: line.ingredientId,
+            warehouseId: kitchenWarehouse.id,
+            movementType: "OUT",
+            quantity: qtyToDeduct,
+            encoderUserId: userId ?? null,
+          });
+
           // Read back the new balance to check threshold
           const [stockRow] = await tx
             .select({
@@ -687,6 +700,17 @@ export async function cancelOrder(db: DB, orderId: string): Promise<{ status: st
                 eq(inventoryStock.ingredientId, ingredientId),
               ),
             );
+
+          // ERP R1: post RESTOCK IN ledger row (compensating entry, same tx)
+          await postLedger(tx, {
+            sourceModule: "RESTOCK",
+            sourceDocumentNo: orderId,
+            sourceLineNo: ingredientId,
+            ingredientId,
+            warehouseId: kitchenWarehouse.id,
+            movementType: "IN",
+            quantity: qtyToRestore,
+          });
         }
 
         // Delete the consumption log rows for this order AFTER restocking.

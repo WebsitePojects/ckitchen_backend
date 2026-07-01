@@ -14,6 +14,7 @@ import { createAnalyticsRouter } from "./modules/analytics/routes.js";
 import { createOutletsRouter } from "./modules/outlets/routes.js";
 import { createEmsRouter } from "./modules/ems/routes.js";
 import { createMasterRouter } from "./modules/master/routes.js";
+import { createPurchasingRouter } from "./modules/purchasing/routes.js";
 
 /**
  * Express app factory.
@@ -42,6 +43,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.use("/api/v1", createAnalyticsRouter(db));
   app.use("/api/v1", createEmsRouter(db));
   app.use("/api/v1", createMasterRouter(db));
+  app.use("/api/v1", createPurchasingRouter(db));
 
   return app;
 }

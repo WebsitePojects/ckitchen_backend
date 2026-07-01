@@ -634,3 +634,89 @@ export const departmentInventoryAccess = pgTable(
   ],
 );
 export type DepartmentInventoryAccess = typeof departmentInventoryAccess.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// ERP R3: purchasing — Purchase Request → Purchase Order → Receiving Report
+// (CK1-ERP-006 §4). Receiving posts a RECEIVE IN ledger row into the MAIN
+// warehouse (reuses postLedger + inventoryStock).
+// ---------------------------------------------------------------------------
+
+export const purchaseRequestStatusEnum = pgEnum("purchase_request_status", [
+  "DRAFT",
+  "SUBMITTED",
+  "APPROVED",
+  "REJECTED",
+  "CLOSED",
+]);
+export const purchaseOrderStatusEnum = pgEnum("purchase_order_status", [
+  "DRAFT",
+  "SENT",
+  "PARTIAL",
+  "RECEIVED",
+  "CANCELLED",
+]);
+
+export const purchaseRequests = pgTable("purchase_request", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  prNo: text("pr_no").notNull().unique(),
+  department: departmentEnum("department").notNull(),
+  status: purchaseRequestStatusEnum("status").notNull().default("DRAFT"),
+  requestedByUserId: uuid("requested_by_user_id").notNull().references(() => users.id),
+  approvedByUserId: uuid("approved_by_user_id").references(() => users.id),
+  notes: text("notes"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type PurchaseRequest = typeof purchaseRequests.$inferSelect;
+
+export const purchaseRequestLines = pgTable("purchase_request_line", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  prId: uuid("pr_id").notNull().references(() => purchaseRequests.id),
+  ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
+  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+  estUnitCost: numeric("est_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+});
+export type PurchaseRequestLine = typeof purchaseRequestLines.$inferSelect;
+
+export const purchaseOrders = pgTable("purchase_order", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  poNo: text("po_no").notNull().unique(),
+  supplierId: uuid("supplier_id").notNull().references(() => suppliers.id),
+  prId: uuid("pr_id").references(() => purchaseRequests.id),
+  status: purchaseOrderStatusEnum("status").notNull().default("DRAFT"),
+  createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id),
+  notes: text("notes"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type PurchaseOrder = typeof purchaseOrders.$inferSelect;
+
+export const purchaseOrderLines = pgTable("purchase_order_line", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
+  ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
+  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+  unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+  qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull().default("0"),
+});
+export type PurchaseOrderLine = typeof purchaseOrderLines.$inferSelect;
+
+export const receivingReports = pgTable("receiving_report", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  rrNo: text("rr_no").notNull().unique(),
+  poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
+  warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
+  receivedByUserId: uuid("received_by_user_id").notNull().references(() => users.id),
+  notes: text("notes"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+export type ReceivingReport = typeof receivingReports.$inferSelect;
+
+export const receivingReportLines = pgTable("receiving_report_line", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  rrId: uuid("rr_id").notNull().references(() => receivingReports.id),
+  poLineId: uuid("po_line_id").notNull().references(() => purchaseOrderLines.id),
+  ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
+  qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull(),
+});
+export type ReceivingReportLine = typeof receivingReportLines.$inferSelect;

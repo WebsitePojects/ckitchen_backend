@@ -239,6 +239,166 @@ describe("Idempotency: DUPLICATE_ORDER on duplicate (aggregator, external_ref)",
 });
 
 // ---------------------------------------------------------------------------
+// LISTING-SCOPED IDEMPOTENCY: same external_ref on a DIFFERENT aggregator
+// account (channel listing) is a DISTINCT order; same external_ref replayed
+// on the SAME listing is still an idempotent no-op (Cardinal Business Rule #5,
+// listing-scoped variant — migration 0010).
+// ---------------------------------------------------------------------------
+
+describe("Idempotency is listing-scoped: (aggregator_account_id, external_ref)", () => {
+  const SHARED_REF = "FP-LISTING-SCOPED-001";
+  let brandTwoId: string;
+  let brandTwoAccountId: string;
+  let brandTwoItemId: string;
+  let firstListingOrderId: string;
+  let secondListingOrderId: string;
+
+  beforeAll(async () => {
+    // A second brand with its own FOODPANDA aggregator account == a distinct
+    // channel listing, even though it shares the SAME aggregator enum value
+    // ("FOODPANDA") as fpAccountId used above.
+    const brandRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Test Brand Orders — Second Listing", color: "#654321" });
+    expect(brandRes.status).toBe(201);
+    brandTwoId = brandRes.body.id as string;
+
+    const accRes = await request(app)
+      .post(`/api/v1/brands/${brandTwoId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "FOODPANDA", external_merchant_id: "FP-TB2", credential_ref: "ref-tb2" });
+    expect(accRes.status).toBe(201);
+    brandTwoAccountId = accRes.body.id as string;
+    expect(brandTwoAccountId).not.toBe(fpAccountId);
+
+    const menuRes = await request(app)
+      .post(`/api/v1/brands/${brandTwoId}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Second Listing Dish", price: "99", station_id: grillStationId });
+    expect(menuRes.status).toBe(201);
+    brandTwoItemId = menuRes.body.id as string;
+  });
+
+  it("ingests order for brand 1's listing with SHARED_REF → 201", async () => {
+    const res = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: SHARED_REF,
+        items: [{ menu_item_id: grillItemId, qty: 1 }],
+      });
+
+    expect(res.status).toBe(201);
+    firstListingOrderId = res.body.order_id as string;
+    expect(firstListingOrderId).toBeTruthy();
+  });
+
+  it("same external_ref via a DIFFERENT listing (brand 2's account) → 201, DISTINCT order", async () => {
+    const res = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandTwoId,
+        aggregator: "FOODPANDA",
+        external_ref: SHARED_REF,
+        items: [{ menu_item_id: brandTwoItemId, qty: 1 }],
+      });
+
+    expect(res.status).toBe(201);
+    secondListingOrderId = res.body.order_id as string;
+    expect(secondListingOrderId).toBeTruthy();
+    expect(secondListingOrderId).not.toBe(firstListingOrderId);
+  });
+
+  it("replaying SHARED_REF again on listing 1 → 200 DUPLICATE_ORDER, returns listing 1's order", async () => {
+    const res = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: SHARED_REF,
+        items: [{ menu_item_id: grillItemId, qty: 1 }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.code).toBe("DUPLICATE_ORDER");
+    expect(res.body.order_id).toBe(firstListingOrderId);
+  });
+
+  it("replaying SHARED_REF again on listing 2 → 200 DUPLICATE_ORDER, returns listing 2's order", async () => {
+    const res = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandTwoId,
+        aggregator: "FOODPANDA",
+        external_ref: SHARED_REF,
+        items: [{ menu_item_id: brandTwoItemId, qty: 1 }],
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.code).toBe("DUPLICATE_ORDER");
+    expect(res.body.order_id).toBe(secondListingOrderId);
+  });
+
+  it("exactly TWO order rows exist for SHARED_REF — one per listing", async () => {
+    const listRes = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ aggregator: "FOODPANDA" });
+
+    const rowsForRef = (listRes.body as Array<{ id: string; externalRef: string }>).filter(
+      (o) => o.externalRef === SHARED_REF,
+    );
+    expect(rowsForRef).toHaveLength(2);
+    const ids = rowsForRef.map((r) => r.id).sort();
+    expect(ids).toEqual([firstListingOrderId, secondListingOrderId].sort());
+  });
+
+  it("concurrent duplicate ingests on the SAME listing race down to exactly ONE order (FIX C)", async () => {
+    const RACE_REF = "FP-LISTING-RACE-001";
+    const [resA, resB] = await Promise.all([
+      request(app)
+        .post("/api/v1/ingest/order")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({
+          brand_id: brandId,
+          aggregator: "FOODPANDA",
+          external_ref: RACE_REF,
+          items: [{ menu_item_id: grillItemId, qty: 1 }],
+        }),
+      request(app)
+        .post("/api/v1/ingest/order")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({
+          brand_id: brandId,
+          aggregator: "FOODPANDA",
+          external_ref: RACE_REF,
+          items: [{ menu_item_id: grillItemId, qty: 1 }],
+        }),
+    ]);
+
+    const statuses = [resA.status, resB.status].sort();
+    expect(statuses).toEqual([200, 201]);
+    const orderIds = new Set([resA.body.order_id, resB.body.order_id]);
+    expect(orderIds.size).toBe(1); // both resolve to the same order
+
+    const listRes = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ aggregator: "FOODPANDA" });
+    const rowsForRef = (listRes.body as Array<{ externalRef: string }>).filter(
+      (o) => o.externalRef === RACE_REF,
+    );
+    expect(rowsForRef).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PRINT JOBS: one print job per distinct station (Cardinal Business Rule #6)
 // ---------------------------------------------------------------------------
 
@@ -461,10 +621,37 @@ describe("POST /orders/:id/cancel — cancel before PREPARING", () => {
     newOrderId = res.body.order_id as string;
   });
 
+  it("cancelling WITHOUT a reason → 400 VALIDATION_ERROR (MOTM: reason required)", async () => {
+    const ingest = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: nextRef(),
+        items: [{ menu_item_id: grillItemId, qty: 1 }],
+      });
+    const freshId = ingest.body.order_id as string;
+
+    const noReason = await request(app)
+      .post(`/api/v1/orders/${freshId}/cancel`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({});
+    expect(noReason.status).toBe(400);
+    expect(noReason.body.error.code).toBe("VALIDATION_ERROR");
+
+    const blankReason = await request(app)
+      .post(`/api/v1/orders/${freshId}/cancel`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "   " });
+    expect(blankReason.status).toBe(400);
+  });
+
   it("cancelling a NEW order → 200 with status=CANCELLED (no stock deduction occurred)", async () => {
     const res = await request(app)
       .post(`/api/v1/orders/${newOrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "customer no-show" });
 
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("CANCELLED");

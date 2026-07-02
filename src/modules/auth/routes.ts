@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { users, userSessions } from "../../db/schema.js";
 import { loadConfig } from "../../config.js";
-import { signToken, verifyPassword } from "./service.js";
+import { signToken, verifyPassword, fakeVerifyPassword } from "./service.js";
 import { requireAuth } from "./middleware.js";
 import { audit } from "../ems/audit.js";
 
@@ -34,6 +34,9 @@ export function createAuthRouter(db: DB): Router {
 
     const [user] = await db.select().from(users).where(eq(users.email, email));
     if (!user) {
+      // Spend the same time as a real bcrypt check so response timing does not
+      // reveal whether the email is registered (user-enumeration oracle).
+      await fakeVerifyPassword(password);
       sendError(res, 401, "AUTH_REQUIRED", "Invalid email or password.");
       return;
     }

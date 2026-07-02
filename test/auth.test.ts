@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
-import { Router } from "express";
+import express, { Router } from "express";
 import type { Express } from "express";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
@@ -40,11 +40,19 @@ beforeAll(async () => {
   app = createApp(db);
 
   // Test-only route guarded by requireRole("SUPER_ADMIN") to exercise RBAC middleware.
+  // Mounted on its own app (not appended to `createApp`'s), because createApp now
+  // finalizes with a terminal catch-all 404 handler that would shadow any route
+  // registered after the factory returns.
   const testRouter = Router();
   testRouter.get("/api/v1/test/admin-only", requireAuth, requireRole("SUPER_ADMIN"), (_req, res) => {
     res.json({ ok: true });
   });
+  app = express();
+  app.set("db", db);
+  // Test route FIRST so it is matched before the mounted createApp sub-app (which
+  // ends in a terminal 404 catch-all); auth endpoints fall through to createApp.
   app.use(testRouter);
+  app.use(createApp(db));
 });
 
 describe("POST /api/v1/auth/login", () => {
@@ -126,6 +134,31 @@ describe("POST /api/v1/auth/logout", () => {
       .post("/api/v1/auth/logout")
       .set("Authorization", `Bearer ${loginRes.body.token}`);
     expect(res.status).toBe(200);
+  });
+
+  it("invalidates the token immediately after logout (SF-4 revocation)", async () => {
+    const loginRes = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD });
+    const token = loginRes.body.token;
+
+    // Token works before logout
+    const before = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${token}`);
+    expect(before.status).toBe(200);
+
+    // Log out (closes the session row)
+    await request(app)
+      .post("/api/v1/auth/logout")
+      .set("Authorization", `Bearer ${token}`);
+
+    // Same token is now rejected — not left valid until 12h expiry
+    const after = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${token}`);
+    expect(after.status).toBe(401);
+    expect(after.body.error.code).toBe("AUTH_REQUIRED");
   });
 });
 

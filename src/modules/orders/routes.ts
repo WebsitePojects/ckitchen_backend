@@ -296,20 +296,21 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     requireRole(...ORDER_STAGE_ROLES),
     async (req, res) => {
       const id = paramAsString(req.params.id);
+      const reason = typeof req.body?.reason === "string" ? req.body.reason : "";
 
       try {
-        const result = await cancelOrder(db, id);
+        const result = await cancelOrder(db, id, reason);
         res.json(result);
 
-        // EMS: audit order.cancel (non-blocking)
+        // EMS: audit order.cancel WITH reason (non-blocking)
         void audit(db, {
           actorUserId: req.user?.id ?? null,
           sessionId: req.user?.sessionId ?? null,
           action: "order.cancel",
-          description: `cancelled order ${id}`,
+          description: `cancelled order ${id}: ${reason.trim()}`,
           entityType: "order",
           entityId: id,
-          metadata: { status: result.status },
+          metadata: { status: result.status, reason: reason.trim() },
         });
 
         // Task 8: emit order.updated with CANCELLED status

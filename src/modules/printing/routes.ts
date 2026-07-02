@@ -3,7 +3,10 @@
  *
  * Agent endpoints (X-Agent-Token, NOT user JWT):
  *   POST /agent/register                 — agent self-registration
- *   GET  /agent/print-jobs/pending       — pull pending jobs (oldest-first, §8.3 shape)
+ *   GET  /agent/print-jobs/pending       — pull pending jobs for ?location_id=<uuid>,
+ *                                           oldest-first (§8.3 shape). Outlet-scoped:
+ *                                           requires a print_agent already registered
+ *                                           for that location (audit-db.md §3).
  *   POST /agent/print-jobs/:id/ack       — ack PRINTED | FAILED (§8.4)
  *   POST /agent/printers/status          — heartbeat, updates printer status
  *
@@ -38,6 +41,7 @@ import {
   listPrintJobs,
   registerAgent,
   reprintJob,
+  resolveAgentLocationId,
   updatePrinterStatuses,
 } from "./service.js";
 
@@ -140,9 +144,26 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
   });
 
   // ── GET /agent/print-jobs/pending ──────────────────────────────────────
-  router.get("/agent/print-jobs/pending", requireAgentToken, async (_req, res) => {
+  // Outlet-scoped (audit-db.md §3): the agent must identify its own location
+  // via ?location_id=<uuid> (the same location_id it sent to /agent/register).
+  // The service verifies a print_agent row is actually registered for that
+  // location before returning anything — an agent cannot pull another
+  // outlet's queue by guessing a different location_id.
+  router.get("/agent/print-jobs/pending", requireAgentToken, async (req, res) => {
+    const locationId = req.query.location_id;
+    if (typeof locationId !== "string" || locationId.length === 0) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "location_id query parameter is required (register the agent first via /agent/register).",
+      );
+      return;
+    }
+
     try {
-      const jobs = await listPendingJobs(db);
+      const scopedLocationId = await resolveAgentLocationId(db, locationId);
+      const jobs = await listPendingJobs(db, scopedLocationId);
       res.json(jobs);
     } catch (err) {
       handleServiceError(err, res);

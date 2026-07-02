@@ -576,3 +576,124 @@ describe("PUT /api/v1/menu/:id/recipe + GET — Cardinal Rule: shared ingredient
     expect(res.body.error.code).toBe("NOT_FOUND");
   });
 });
+
+// ---------------------------------------------------------------------------
+// MOTM 2026-07-01: item_no / remarks / image_url + photo upload
+// ---------------------------------------------------------------------------
+
+describe("Menu item MOTM fields: item_no, remarks, image_url", () => {
+  let brandA: string;
+  let brandB: string;
+  let stationId: string;
+
+  beforeAll(async () => {
+    // Deterministic 503 for the upload test regardless of a local .env — this
+    // file never performs a real upload, and vitest isolates files (forks pool).
+    delete process.env.CLOUDINARY_CLOUD_NAME;
+    delete process.env.CLOUDINARY_API_KEY;
+    delete process.env.CLOUDINARY_API_SECRET;
+
+    const a = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "ItemNo Brand A", color: "#123456" });
+    brandA = a.body.id as string;
+    const b = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "ItemNo Brand B", color: "#654321" });
+    brandB = b.body.id as string;
+
+    const stationsRes = await request(app)
+      .get("/api/v1/stations")
+      .set("Authorization", `Bearer ${adminToken}`);
+    stationId = stationsRes.body.find((s: { name: string }) => s.name === "Grill").id as string;
+  });
+
+  it("creates a menu item with item_no, remarks, image_url and persists them", async () => {
+    const res = await request(app)
+      .post(`/api/v1/brands/${brandA}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        name: "Photo Item",
+        price: "120.00",
+        station_id: stationId,
+        item_no: "SKU-001",
+        remarks: "bestseller",
+        image_url: "https://res.cloudinary.com/demo/image/upload/x.jpg",
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.itemNo).toBe("SKU-001");
+    expect(res.body.remarks).toBe("bestseller");
+    expect(res.body.imageUrl).toBe("https://res.cloudinary.com/demo/image/upload/x.jpg");
+  });
+
+  it("rejects a non-https image_url with 400", async () => {
+    const res = await request(app)
+      .post(`/api/v1/brands/${brandA}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Bad Img", price: "10", station_id: stationId, image_url: "http://insecure/x.jpg" });
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("rejects a duplicate item_no within the SAME brand with 409", async () => {
+    const res = await request(app)
+      .post(`/api/v1/brands/${brandA}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Dup SKU", price: "10", station_id: stationId, item_no: "SKU-001" });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("CONFLICT");
+  });
+
+  it("ALLOWS the same item_no in a DIFFERENT brand", async () => {
+    const res = await request(app)
+      .post(`/api/v1/brands/${brandB}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Same SKU other brand", price: "10", station_id: stationId, item_no: "SKU-001" });
+    expect(res.status).toBe(201);
+    expect(res.body.itemNo).toBe("SKU-001");
+  });
+
+  it("PATCH to an already-taken item_no in the same brand → 409", async () => {
+    // Create a second item in brandA with its own SKU
+    const created = await request(app)
+      .post(`/api/v1/brands/${brandA}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Second A", price: "10", station_id: stationId, item_no: "SKU-002" });
+    // Try to rename it to the existing SKU-001
+    const res = await request(app)
+      .patch(`/api/v1/menu/${created.body.id}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ item_no: "SKU-001" });
+    expect(res.status).toBe(409);
+  });
+
+  it("POST /menu/upload-photo without a data URL → 400", async () => {
+    const res = await request(app)
+      .post("/api/v1/menu/upload-photo")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /menu/upload-photo returns 503 when Cloudinary is not configured (no env in tests)", async () => {
+    const res = await request(app)
+      .post("/api/v1/menu/upload-photo")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ data_url: "data:image/png;base64,iVBORw0KGgo=" });
+    // In CI/test there are no CLOUDINARY_* env vars → ConfigError → 503.
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe("UPLOAD_UNAVAILABLE");
+  });
+
+  it("rejects KITCHEN_STAFF from uploading a photo with 403", async () => {
+    const res = await request(app)
+      .post("/api/v1/menu/upload-photo")
+      .set("Authorization", `Bearer ${staffToken}`)
+      .send({ data_url: "data:image/png;base64,iVBORw0KGgo=" });
+    expect(res.status).toBe(403);
+  });
+});

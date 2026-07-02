@@ -25,7 +25,15 @@ import { eq } from "drizzle-orm";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
-import { kitchenStations } from "../src/db/schema.js";
+import {
+  aggregatorAccounts,
+  kitchenStations,
+  locations,
+  orderItems,
+  orders,
+  printers,
+  printJobs,
+} from "../src/db/schema.js";
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -43,6 +51,7 @@ let grillStationId: string;
 let printerId: string;
 let brandId: string;
 let menuItemId: string;
+let locationId: string; // seeded CK1 location — this file's agent is registered here
 
 // Ingested order's print job ids (from the pending list)
 let pendingJobId: string; // first PENDING job to use in ack / reprint tests
@@ -61,6 +70,14 @@ function nextRef(): string {
   return `PRINT-TEST-${Date.now()}-${++_refSeq}`;
 }
 
+/** GET /agent/print-jobs/pending scoped to this file's location. */
+function getPending() {
+  return request(app)
+    .get("/api/v1/agent/print-jobs/pending")
+    .query({ location_id: locationId })
+    .set("X-Agent-Token", AGENT_TOKEN);
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -74,11 +91,19 @@ beforeAll(async () => {
   adminToken = await login("admin@cloudkitchen.local", "admin123");
   kitchenToken = await login("kitchen_staff@cloudkitchen.local", "password123");
 
-  // ── Resolve seeded Grill station ────────────────────────────────────────
+  // ── Resolve seeded Grill station + location ─────────────────────────────
   const stations = await db.select().from(kitchenStations);
   const grillStation = stations.find((s) => s.name === "Grill");
   if (!grillStation) throw new Error("Grill station not seeded");
   grillStationId = grillStation.id;
+  locationId = grillStation.locationId;
+
+  // ── Register the print agent for this location (outlet-scoped pull requires it) ──
+  const registerRes = await request(app)
+    .post("/api/v1/agent/register")
+    .set("X-Agent-Token", AGENT_TOKEN)
+    .send({ agent_name: "Printing Test Agent", location_id: locationId });
+  expect(registerRes.status).toBe(200);
 
   // ── Create a printer ────────────────────────────────────────────────────
   const printerRes = await request(app)
@@ -138,9 +163,7 @@ beforeAll(async () => {
 
 describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
   it("returns pending jobs with agent token (includes payload + printer)", async () => {
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const res = await getPending();
 
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
@@ -183,20 +206,19 @@ describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
         items: [{ menu_item_id: menuItemId, qty: 1 }],
       });
 
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const res = await getPending();
 
     expect(res.status).toBe(200);
     expect(res.body.length).toBeGreaterThanOrEqual(2);
 
-    const dates = (res.body as Array<{ id: string }>).map((j) => (j as unknown as { id: string }) );
     // Verify IDs are present (order verified by checking the fixture job is first or earlier)
     expect(res.body[0].id).toBeTruthy();
   });
 
   it("returns 401 AGENT_TOKEN_INVALID when X-Agent-Token is missing", async () => {
-    const res = await request(app).get("/api/v1/agent/print-jobs/pending");
+    const res = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .query({ location_id: locationId });
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
@@ -205,6 +227,7 @@ describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
   it("returns 401 AGENT_TOKEN_INVALID when X-Agent-Token is wrong", async () => {
     const res = await request(app)
       .get("/api/v1/agent/print-jobs/pending")
+      .query({ location_id: locationId })
       .set("X-Agent-Token", "wrong-token");
 
     expect(res.status).toBe(401);
@@ -215,10 +238,180 @@ describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
     // A valid user JWT in X-Agent-Token should be rejected, not accepted
     const res = await request(app)
       .get("/api/v1/agent/print-jobs/pending")
+      .query({ location_id: locationId })
       .set("X-Agent-Token", adminToken); // user JWT is NOT the agent token
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
+  });
+
+  it("returns 400 VALIDATION_ERROR when location_id query param is missing", async () => {
+    const res = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .set("X-Agent-Token", AGENT_TOKEN);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("returns 404 NOT_FOUND when location_id does not exist", async () => {
+    const res = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .query({ location_id: "00000000-0000-4000-a000-000000000001" })
+      .set("X-Agent-Token", AGENT_TOKEN);
+
+    expect(res.status).toBe(404);
+    expect(res.body.error.code).toBe("NOT_FOUND");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OUTLET ISOLATION (audit-db.md §3 — "Service-layer leak found while
+// auditing": printing/service.ts pulled ALL PENDING jobs with no location
+// filter, so a second outlet's agent could print outlet 1's KOTs).
+//
+// Two locations, two agents (both share the same global X-Agent-Token in
+// this prototype, but each identifies its OWN location via ?location_id=):
+// jobs must route ONLY to the agent pulling for the matching location.
+// ---------------------------------------------------------------------------
+
+describe("Outlet isolation: print-job pull is scoped to the pulling agent's location", () => {
+  let secondLocationId: string;
+  let secondStationId: string;
+  let secondPrinterId: string;
+  let outlet1OnlyJobId: string;
+  let outlet2OnlyJobId: string;
+
+  beforeAll(async () => {
+    // ── Second physical outlet, created directly (no multi-location HTTP
+    // route yet — /stations POST always targets the single seeded location;
+    // see resolveLocationId in src/modules/stations/routes.ts). ────────────
+    const [secondLocation] = await db
+      .insert(locations)
+      .values({ code: "CK2-PRINTTEST", name: "Second Outlet (Print Test)" })
+      .returning();
+    secondLocationId = secondLocation.id;
+
+    const [secondStation] = await db
+      .insert(kitchenStations)
+      .values({ locationId: secondLocationId, name: "Outlet 2 Grill" })
+      .returning();
+    secondStationId = secondStation.id;
+
+    const [secondPrinter] = await db
+      .insert(printers)
+      .values({ name: "Outlet 2 Printer", connection: "NETWORK", address: "192.168.2.50:9100" })
+      .returning();
+    secondPrinterId = secondPrinter.id;
+
+    // Register a SECOND agent for the second location. Both agents share the
+    // same global AGENT_TOKEN in this prototype (single secret) — isolation
+    // comes from each pull declaring ITS OWN location_id, verified server-side
+    // against a registered print_agent row for that location.
+    const registerRes = await request(app)
+      .post("/api/v1/agent/register")
+      .set("X-Agent-Token", AGENT_TOKEN)
+      .send({ agent_name: "Outlet 2 Agent", location_id: secondLocationId });
+    expect(registerRes.status).toBe(200);
+
+    // ── An order/print_job scoped to OUTLET 1 (this file's existing brand + FOODPANDA account) ──
+    const [account] = await db
+      .select()
+      .from(aggregatorAccounts)
+      .where(eq(aggregatorAccounts.brandId, brandId));
+
+    const [outlet1Order] = await db
+      .insert(orders)
+      .values({
+        brandId,
+        aggregatorAccountId: account.id,
+        aggregator: "FOODPANDA",
+        externalRef: nextRef(),
+        total: "1.00",
+      })
+      .returning();
+    await db.insert(orderItems).values({
+      orderId: outlet1Order.id,
+      menuItemId,
+      qty: 1,
+      stationId: grillStationId, // outlet 1's station
+    });
+    const [outlet1Job] = await db
+      .insert(printJobs)
+      .values({
+        orderId: outlet1Order.id,
+        stationId: grillStationId,
+        printerId,
+        payload: { type: "KOT", note: "outlet-1-only" },
+        status: "PENDING",
+      })
+      .returning();
+    outlet1OnlyJobId = outlet1Job.id;
+
+    // ── An order/print_job scoped to OUTLET 2 ────────────────────────────
+    const [outlet2Order] = await db
+      .insert(orders)
+      .values({
+        brandId,
+        aggregatorAccountId: account.id,
+        aggregator: "FOODPANDA",
+        externalRef: nextRef(),
+        total: "1.00",
+      })
+      .returning();
+    await db.insert(orderItems).values({
+      orderId: outlet2Order.id,
+      menuItemId,
+      qty: 1,
+      stationId: secondStationId, // outlet 2's station
+    });
+    const [outlet2Job] = await db
+      .insert(printJobs)
+      .values({
+        orderId: outlet2Order.id,
+        stationId: secondStationId,
+        printerId: secondPrinterId,
+        payload: { type: "KOT", note: "outlet-2-only" },
+        status: "PENDING",
+      })
+      .returning();
+    outlet2OnlyJobId = outlet2Job.id;
+  });
+
+  it("outlet 1's agent pull includes outlet 1's job but NOT outlet 2's job", async () => {
+    const res = await getPending();
+
+    expect(res.status).toBe(200);
+    const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
+    expect(ids).toContain(outlet1OnlyJobId);
+    expect(ids).not.toContain(outlet2OnlyJobId);
+  });
+
+  it("outlet 2's agent pull includes outlet 2's job but NOT outlet 1's job", async () => {
+    const res = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .query({ location_id: secondLocationId })
+      .set("X-Agent-Token", AGENT_TOKEN);
+
+    expect(res.status).toBe(200);
+    const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
+    expect(ids).toContain(outlet2OnlyJobId);
+    expect(ids).not.toContain(outlet1OnlyJobId);
+  });
+
+  it("an agent cannot pull for a location that has no print_agent registered there", async () => {
+    const [unregisteredLocation] = await db
+      .insert(locations)
+      .values({ code: "CK3-UNREGISTERED", name: "Unregistered Outlet" })
+      .returning();
+
+    const res = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .query({ location_id: unregisteredLocation.id })
+      .set("X-Agent-Token", AGENT_TOKEN);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
   });
 });
 
@@ -288,9 +481,7 @@ describe("POST /api/v1/agent/print-jobs/:id/ack — PRINTED", () => {
   });
 
   it("PRINTED job no longer appears in pending list", async () => {
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const res = await getPending();
 
     expect(res.status).toBe(200);
     const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
@@ -343,9 +534,7 @@ describe("POST /api/v1/agent/print-jobs/:id/ack — FAILED", () => {
   });
 
   it("FAILED job no longer appears in pending list", async () => {
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const res = await getPending();
 
     expect(res.status).toBe(200);
     const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
@@ -416,9 +605,7 @@ describe("POST /api/v1/print-jobs/:id/reprint — reprint FAILED job", () => {
     // Note: this creates ANOTHER clone — that's fine for this test
     const cloneId = reprintRes.body.id as string;
 
-    const pendingRes = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const pendingRes = await getPending();
 
     expect(pendingRes.status).toBe(200);
     const ids = (pendingRes.body as Array<{ id: string }>).map((j) => j.id);

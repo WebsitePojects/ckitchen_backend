@@ -19,6 +19,19 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   return bcrypt.compare(plain, hash);
 }
 
+/**
+ * A real bcrypt hash of a throwaway value, computed once at startup. Used to
+ * equalize response time on the "email not found" login path so an attacker
+ * cannot distinguish a registered email (bcrypt runs) from an unknown one
+ * (bcrypt skipped) by timing — a user-enumeration oracle (audit-backend.md).
+ */
+const DUMMY_HASH = bcrypt.hashSync("timing-equalizer-not-a-real-password", BCRYPT_ROUNDS);
+
+/** Runs a bcrypt comparison against a dummy hash purely to spend the same time. */
+export async function fakeVerifyPassword(plain: string): Promise<void> {
+  await bcrypt.compare(plain, DUMMY_HASH);
+}
+
 /** Signs a JWT carrying the user id (`sub`), role, and optional session id (`sid`). */
 export function signToken(
   user: Pick<User, "id" | "role">,

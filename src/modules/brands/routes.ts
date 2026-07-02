@@ -1,8 +1,14 @@
 import { Router } from "express";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq, gte, lte } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { aggregatorAccounts, aggregatorEnum, brands, locations } from "../../db/schema.js";
+import {
+  aggregatorAccounts,
+  aggregatorEnum,
+  brandActivityLog,
+  brands,
+  locations,
+} from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 
@@ -110,13 +116,74 @@ export function createBrandsRouter(db: DB): Router {
     if (parsed.data.sales_perf_id !== undefined) updates.salesPerfId = parsed.data.sales_perf_id;
     if (parsed.data.is_active !== undefined) updates.isActive = parsed.data.is_active;
 
+    // MOTM 2026-07-01: record an activity-log row when active/inactive actually flips.
+    const activeChanged =
+      parsed.data.is_active !== undefined && parsed.data.is_active !== existing.isActive;
+
     const [updated] = await db
       .update(brands)
       .set(updates)
       .where(eq(brands.id, id))
       .returning();
 
+    if (activeChanged) {
+      await db.insert(brandActivityLog).values({
+        brandId: id,
+        status: parsed.data.is_active ? "ACTIVE" : "INACTIVE",
+        changedBy: req.user?.id ?? null,
+        note: typeof req.body?.activity_note === "string" ? req.body.activity_note : null,
+      });
+    }
+
     res.json(updated);
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /brands/:id/activity?from=&to= — active/inactive history (MOTM)
+  // Defaults to the current calendar month; returns events chronologically.
+  // -------------------------------------------------------------------------
+  router.get("/brands/:id/activity", requireAuth, async (req, res) => {
+    const id = paramAsString(req.params.id);
+    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+    if (!brand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const now = new Date();
+    const defaultFrom = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const parseDate = (v: unknown, fallback: Date): Date | null => {
+      if (v === undefined) return fallback;
+      if (typeof v !== "string") return null;
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+
+    const from = parseDate(req.query.from, defaultFrom);
+    const to = parseDate(req.query.to, now);
+    if (from === null || to === null) {
+      sendError(res, 400, "VALIDATION_ERROR", "from/to must be valid ISO dates.");
+      return;
+    }
+    if (from > to) {
+      sendError(res, 400, "VALIDATION_ERROR", "'from' must be on or before 'to'.");
+      return;
+    }
+
+    const events = await db
+      .select()
+      .from(brandActivityLog)
+      .where(
+        and(
+          eq(brandActivityLog.brandId, id),
+          gte(brandActivityLog.changedAt, from),
+          lte(brandActivityLog.changedAt, to),
+        ),
+      )
+      .orderBy(asc(brandActivityLog.changedAt));
+
+    res.json({ events });
   });
 
   router.get("/brands/:id/accounts", requireAuth, async (req, res) => {

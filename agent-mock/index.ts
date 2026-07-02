@@ -13,14 +13,29 @@
  * Configuration (environment variables):
  *   BASE_URL     — API base URL (default: http://localhost:4000/api/v1)
  *   AGENT_TOKEN  — value for X-Agent-Token header        (default: test-agent-token)
+ *   LOCATION_ID  — outlet this agent pulls jobs for (uuid, REQUIRED). The pull
+ *                  endpoint is outlet-scoped (audit-db.md §3): the agent
+ *                  registers for this location on startup, then every poll
+ *                  declares it via ?location_id=, and the server verifies a
+ *                  print_agent row is actually registered there before
+ *                  returning any jobs — an agent can only ever see its own
+ *                  outlet's queue.
  *
  * Run:
- *   npx tsx agent-mock/index.ts
- *   (or via `npm run agent:mock`)
+ *   LOCATION_ID=<uuid> npx tsx agent-mock/index.ts
+ *   (or via `npm run agent:mock` with LOCATION_ID set in the environment)
  */
 
 const BASE_URL = (process.env["BASE_URL"] ?? "http://localhost:4000/api/v1").replace(/\/$/, "");
 const AGENT_TOKEN = process.env["AGENT_TOKEN"] ?? "test-agent-token";
+const LOCATION_ID = process.env["LOCATION_ID"];
+
+if (!LOCATION_ID) {
+  console.error(
+    "[agent] LOCATION_ID environment variable is required (the outlet this agent pulls jobs for).",
+  );
+  process.exit(1);
+}
 
 const POLL_INTERVAL_MS = 1500;  // §8.1: every ~1.5 s
 const HEARTBEAT_INTERVAL_MS = 10_000; // §8.1: every ~10 s
@@ -130,7 +145,9 @@ function printKot(job: PendingJob): void {
 async function pollPrintJobs(): Promise<void> {
   let jobs: PendingJob[];
   try {
-    jobs = await getJson<PendingJob[]>("/agent/print-jobs/pending");
+    jobs = await getJson<PendingJob[]>(
+      `/agent/print-jobs/pending?location_id=${encodeURIComponent(LOCATION_ID!)}`,
+    );
   } catch (err) {
     console.warn(`[agent] poll failed: ${(err as Error).message}`);
     return;
@@ -178,19 +195,29 @@ async function sendHeartbeat(): Promise<void> {
 // Main
 // ---------------------------------------------------------------------------
 
-console.log(`[agent] CloudKitchen ONE Mock Print Agent starting`);
-console.log(`[agent] Base URL    : ${BASE_URL}`);
-console.log(`[agent] Poll every  : ${POLL_INTERVAL_MS} ms`);
-console.log(`[agent] Heartbeat   : every ${HEARTBEAT_INTERVAL_MS} ms`);
-console.log(`[agent] Press Ctrl+C to stop\n`);
+async function main(): Promise<void> {
+  console.log(`[agent] CloudKitchen ONE Mock Print Agent starting`);
+  console.log(`[agent] Base URL    : ${BASE_URL}`);
+  console.log(`[agent] Location    : ${LOCATION_ID}`);
+  console.log(`[agent] Poll every  : ${POLL_INTERVAL_MS} ms`);
+  console.log(`[agent] Heartbeat   : every ${HEARTBEAT_INTERVAL_MS} ms`);
 
-// Start polling
-setInterval(() => {
-  void pollPrintJobs();
-}, POLL_INTERVAL_MS);
+  // Register before polling — the pull endpoint is outlet-scoped and 400s
+  // until a print_agent row exists for this location.
+  await postJson("/agent/register", { agent_name: "Mock Agent", location_id: LOCATION_ID });
+  console.log(`[agent] registered for location ${LOCATION_ID}`);
+  console.log(`[agent] Press Ctrl+C to stop\n`);
 
-// Start heartbeat
-sendHeartbeat(); // immediate first heartbeat
-setInterval(() => {
-  void sendHeartbeat();
-}, HEARTBEAT_INTERVAL_MS);
+  // Start polling
+  setInterval(() => {
+    void pollPrintJobs();
+  }, POLL_INTERVAL_MS);
+
+  // Start heartbeat
+  await sendHeartbeat(); // immediate first heartbeat
+  setInterval(() => {
+    void sendHeartbeat();
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+void main();

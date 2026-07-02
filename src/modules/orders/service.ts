@@ -4,7 +4,9 @@
  * Cardinal Business Rules:
  *   #2  Deduct at PREPARING; cancel-after → compensating restock.
  *   #3  Shared ingredient, per-recipe portion_qty (one pool, brand-specific deduction).
- *   #5  Idempotent ingestion on (aggregator, external_ref).
+ *   #5  Idempotent ingestion, listing-scoped on (aggregator_account_id, external_ref):
+ *       a replay on the SAME channel listing is a no-op; the same external_ref via a
+ *       DIFFERENT listing (e.g. a different outlet's Foodpanda account) is distinct.
  *
  * All multi-step writes run inside db.transaction() for atomicity.
  *
@@ -16,8 +18,8 @@
  *   FIX A — conditional update (WHERE status=expected) prevents concurrent double-deduction
  *   FIX B — consumption_log with order_id tracks what was actually deducted; cancel uses
  *            the ledger (not current recipe) and deletes rows to prevent double-restock
- *   FIX C — unique constraint violation on (aggregator,external_ref) is caught and
- *            returned as DUPLICATE_ORDER instead of a 500
+ *   FIX C — unique constraint violation on (aggregator_account_id,external_ref) is
+ *            caught and returned as DUPLICATE_ORDER instead of a 500
  *   FIX D — missing KITCHEN inventory_stock row is created at qty=0 before deducting,
  *            allowing the balance to go visibly negative (prototype allows oversell;
  *            production should decide INSUFFICIENT_STOCK block vs allow+flag)
@@ -181,26 +183,14 @@ function isUniqueViolation(err: unknown): boolean {
 // ---------------------------------------------------------------------------
 
 export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<IngestResult> {
-  // ── IDEMPOTENCY CHECK (Rule #5) ──────────────────────────────────────────
-  const [existing] = await db
-    .select()
-    .from(orders)
-    .where(
-      and(
-        eq(orders.aggregator, input.aggregator),
-        eq(orders.externalRef, input.external_ref),
-      ),
-    );
-
-  if (existing) {
-    return buildDuplicateResponse(db, existing);
-  }
-
   // ── VALIDATE BRAND ───────────────────────────────────────────────────────
   const [brand] = await db.select().from(brands).where(eq(brands.id, input.brand_id));
   if (!brand) throw new NotFoundError(`Brand ${input.brand_id} not found.`);
 
-  // ── RESOLVE AGGREGATOR ACCOUNT ───────────────────────────────────────────
+  // ── RESOLVE AGGREGATOR ACCOUNT (the channel listing) ─────────────────────
+  // Must happen BEFORE the idempotency check: idempotency is scoped to the
+  // listing (aggregator_account_id), not the raw aggregator enum, so the
+  // account has to be resolved first (Rule #5, listing-scoped variant).
   const [account] = await db
     .select()
     .from(aggregatorAccounts)
@@ -214,6 +204,26 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     throw new NotFoundError(
       `No aggregator account found for brand ${input.brand_id} + ${input.aggregator}.`,
     );
+  }
+
+  // ── IDEMPOTENCY CHECK (Rule #5 — listing-scoped) ─────────────────────────
+  // Scoped to (aggregator_account_id, external_ref): a replay of the same
+  // external_ref on the SAME channel listing is an idempotent no-op. The same
+  // external_ref arriving via a DIFFERENT listing (different
+  // aggregator_account_id — e.g. a different outlet's Foodpanda listing) is a
+  // distinct order, matching the new order_listing_external_ref_unique index.
+  const [existing] = await db
+    .select()
+    .from(orders)
+    .where(
+      and(
+        eq(orders.aggregatorAccountId, account.id),
+        eq(orders.externalRef, input.external_ref),
+      ),
+    );
+
+  if (existing) {
+    return buildDuplicateResponse(db, existing);
   }
 
   // ── VALIDATE ITEMS, RESOLVE STATIONS ────────────────────────────────────
@@ -361,16 +371,18 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     });
   } catch (err) {
     // FIX C — graceful handling of concurrent duplicate ingests.
-    // If two requests with the same (aggregator, external_ref) race past the
-    // pre-check above, one INSERT wins and the other hits a UNIQUE violation
-    // (PG code 23505). Return the existing order instead of a 500.
+    // If two requests with the same (aggregator_account_id, external_ref) race
+    // past the pre-check above, one INSERT wins and the other hits a UNIQUE
+    // violation (PG code 23505) on order_listing_external_ref_unique. Return
+    // the existing order instead of a 500. Scoped to the listing (account.id),
+    // matching the idempotency check above.
     if (isUniqueViolation(err)) {
       const [raceExisting] = await db
         .select()
         .from(orders)
         .where(
           and(
-            eq(orders.aggregator, input.aggregator),
+            eq(orders.aggregatorAccountId, account.id),
             eq(orders.externalRef, input.external_ref),
           ),
         );

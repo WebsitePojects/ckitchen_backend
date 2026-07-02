@@ -64,6 +64,20 @@
       "when": 1782868634185,
       "tag": "0008_exotic_scarlet_spider",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1782973667488,
+      "tag": "0009_hardening_indexes_rls",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1782979295239,
+      "tag": "0010_listing_scoped_idempotency_and_consumption_warehouse",
+      "breakpoints": true
     }
   ]
 }

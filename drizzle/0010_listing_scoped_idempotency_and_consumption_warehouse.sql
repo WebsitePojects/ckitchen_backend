@@ -1,0 +1,70 @@
+-- ============================================================================
+-- Migration 0010 — listing-scoped order idempotency + consumption_log
+-- outlet-tenancy backfill (audit-db.md §2c-2, §3).
+--
+-- (a) Listing-scoped order idempotency: today's uniqueness is global
+-- (aggregator, external_ref) — two different outlets' Foodpanda listings can
+-- never reuse the same external ref. Replace with
+-- (aggregator_account_id, external_ref): a replay of the same external_ref
+-- on the SAME channel listing is an idempotent no-op; the same external_ref
+-- arriving via a DIFFERENT listing (different aggregator_account_id, even
+-- same aggregator) is a distinct order. Coordinated with
+-- src/modules/orders/service.ts (ingestOrder idempotency lookup + race-
+-- recheck) in this same change — see that file.
+--
+-- (b) consumption_log.warehouse_id: the ONE mechanical, no-product-decision
+-- tenancy backfill from audit §3 / BUILDER TASK 5. Nullable, additive, FK
+-- only — no backfill needed for existing rows, no NOT NULL step. NOT wired
+-- to any insert call site here: POST /inventory/consumption
+-- (src/modules/inventory/routes.ts) takes no warehouse in its request shape
+-- today, and choosing one for it would be an API/product decision, not a
+-- backfill. advanceOrder's PREPARING-deduction consumption_log insert
+-- (src/modules/orders/service.ts) always logs against the KITCHEN warehouse,
+-- but is intentionally left unwired too, to keep this migration schema-only
+-- and match the "coordinated service-code changes stay separate" rule this
+-- batch is scoped under. Column is superseded long-term by
+-- stock_ledger_entry, which already carries warehouse_id.
+--
+-- SKIPPED from audit BUILDER TASK 5 (ambiguous / requires product or roles
+-- decisions per instruction — not implemented here):
+--   - printer.location_id            - POST /printers has no location/station
+--                                       input today; a printer isn't owned by
+--                                       exactly one outlet in the current API
+--                                       contract, so "backfill from the single
+--                                       existing location" would silently
+--                                       encode an assumption the API doesn't
+--                                       yet enforce. Needs a product decision
+--                                       on printer provisioning first.
+--   - employee.location_id           - named explicitly in scope as an
+--                                       employee/roles decision to defer.
+--   - audit_log.location_id          - no structured per-entity-type way to
+--                                       derive a location from audit_log's
+--                                       free-text entity_type/entity_id
+--                                       without a larger, per-module wiring
+--                                       change across every audit_log writer.
+--   - purchase_request.location_id   - named explicitly (PR/PO tenancy).
+--   - purchase_order.location_id     - named explicitly (PR/PO tenancy).
+--   - department_inventory_access    - extending the unique key to include
+--     (location_id, ...)               location_id changes permission
+--                                       semantics (does NULL mean "all
+--                                       outlets"?) - a policy decision, not
+--                                       mechanical.
+--   - "order".location_id /          - requires coordinated service-code
+--     print_job.location_id            changes in 2+ modules + seed updates
+--                                       per the audit's own task 5 spec, and
+--                                       is not needed for correctness today:
+--                                       the print-job pull is already scoped
+--                                       correctly (this same change set) via
+--                                       the existing print_job ->
+--                                       kitchen_station -> location join,
+--                                       with no schema change. Denormalizing
+--                                       location_id onto these hot tables is
+--                                       a genuine follow-up for query
+--                                       performance / RLS readiness, deferred
+--                                       as its own migration.
+-- ============================================================================
+DROP INDEX "order_aggregator_external_ref_unique";--> statement-breakpoint
+ALTER TABLE "consumption_log" ADD COLUMN "warehouse_id" uuid;--> statement-breakpoint
+ALTER TABLE "consumption_log" ADD CONSTRAINT "consumption_log_warehouse_id_warehouse_id_fk" FOREIGN KEY ("warehouse_id") REFERENCES "public"."warehouse"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "consumption_log_warehouse_id_idx" ON "consumption_log" USING btree ("warehouse_id");--> statement-breakpoint
+CREATE UNIQUE INDEX "order_listing_external_ref_unique" ON "order" USING btree ("aggregator_account_id","external_ref");

@@ -1,5 +1,7 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
+  index,
   integer,
   jsonb,
   numeric,
@@ -74,7 +76,7 @@ export const locations = pgTable(
     contactPhone: text("contact_phone"),
   },
   (table) => [uniqueIndex("location_code_unique").on(table.code)],
-);
+).enableRLS();
 
 export type Location = typeof locations.$inferSelect;
 export type NewLocation = typeof locations.$inferInsert;
@@ -83,17 +85,21 @@ export type NewLocation = typeof locations.$inferInsert;
 // brand
 // ---------------------------------------------------------------------------
 
-export const brands = pgTable("brand", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  locationId: uuid("location_id")
-    .notNull()
-    .references(() => locations.id),
-  name: text("name").notNull(),
-  logoUrl: text("logo_url"),
-  color: text("color").notNull(),
-  salesPerfId: text("sales_perf_id").notNull(),
-  isActive: boolean("is_active").notNull().default(true),
-});
+export const brands = pgTable(
+  "brand",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id),
+    name: text("name").notNull(),
+    logoUrl: text("logo_url"),
+    color: text("color").notNull(),
+    salesPerfId: text("sales_perf_id").notNull(),
+    isActive: boolean("is_active").notNull().default(true),
+  },
+  (table) => [index("brand_location_id_idx").on(table.locationId)],
+).enableRLS();
 
 export type Brand = typeof brands.$inferSelect;
 export type NewBrand = typeof brands.$inferInsert;
@@ -102,16 +108,20 @@ export type NewBrand = typeof brands.$inferInsert;
 // aggregator_account
 // ---------------------------------------------------------------------------
 
-export const aggregatorAccounts = pgTable("aggregator_account", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  brandId: uuid("brand_id")
-    .notNull()
-    .references(() => brands.id),
-  aggregator: aggregatorEnum("aggregator").notNull(),
-  externalMerchantId: text("external_merchant_id").notNull(),
-  credentialRef: text("credential_ref"),
-  isActive: boolean("is_active").notNull().default(true),
-});
+export const aggregatorAccounts = pgTable(
+  "aggregator_account",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    brandId: uuid("brand_id")
+      .notNull()
+      .references(() => brands.id),
+    aggregator: aggregatorEnum("aggregator").notNull(),
+    externalMerchantId: text("external_merchant_id").notNull(),
+    credentialRef: text("credential_ref"),
+    isActive: boolean("is_active").notNull().default(true),
+  },
+  (table) => [index("aggregator_account_brand_id_idx").on(table.brandId)],
+).enableRLS();
 
 export type AggregatorAccount = typeof aggregatorAccounts.$inferSelect;
 export type NewAggregatorAccount = typeof aggregatorAccounts.$inferInsert;
@@ -127,7 +137,7 @@ export const printers = pgTable("printer", {
   address: text("address").notNull(),
   status: printerStatusEnum("status").notNull().default("OFFLINE"),
   lastSeen: timestamp("last_seen", { withTimezone: true }),
-});
+}).enableRLS();
 
 export type Printer = typeof printers.$inferSelect;
 export type NewPrinter = typeof printers.$inferInsert;
@@ -136,14 +146,21 @@ export type NewPrinter = typeof printers.$inferInsert;
 // kitchen_station
 // ---------------------------------------------------------------------------
 
-export const kitchenStations = pgTable("kitchen_station", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  locationId: uuid("location_id")
-    .notNull()
-    .references(() => locations.id),
-  name: text("name").notNull(),
-  defaultPrinterId: uuid("default_printer_id").references(() => printers.id),
-});
+export const kitchenStations = pgTable(
+  "kitchen_station",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id),
+    name: text("name").notNull(),
+    defaultPrinterId: uuid("default_printer_id").references(() => printers.id),
+  },
+  (table) => [
+    index("kitchen_station_location_id_idx").on(table.locationId),
+    index("kitchen_station_printer_id_idx").on(table.defaultPrinterId),
+  ],
+).enableRLS();
 
 export type KitchenStation = typeof kitchenStations.$inferSelect;
 export type NewKitchenStation = typeof kitchenStations.$inferInsert;
@@ -158,7 +175,7 @@ export const ingredients = pgTable("ingredient", {
   unit: text("unit").notNull(),
   unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull(),
   lowStockThreshold: numeric("low_stock_threshold", { precision: 14, scale: 4 }).notNull(),
-});
+}).enableRLS();
 
 export type Ingredient = typeof ingredients.$inferSelect;
 export type NewIngredient = typeof ingredients.$inferInsert;
@@ -167,17 +184,24 @@ export type NewIngredient = typeof ingredients.$inferInsert;
 // menu_item
 // ---------------------------------------------------------------------------
 
-export const menuItems = pgTable("menu_item", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  brandId: uuid("brand_id")
-    .notNull()
-    .references(() => brands.id),
-  name: text("name").notNull(),
-  price: numeric("price", { precision: 14, scale: 2 }).notNull(),
-  prepTimeMin: integer("prep_time_min"),
-  stationId: uuid("station_id").references(() => kitchenStations.id),
-  availability: availabilityEnum("availability").notNull().default("AVAILABLE"),
-});
+export const menuItems = pgTable(
+  "menu_item",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    brandId: uuid("brand_id")
+      .notNull()
+      .references(() => brands.id),
+    name: text("name").notNull(),
+    price: numeric("price", { precision: 14, scale: 2 }).notNull(),
+    prepTimeMin: integer("prep_time_min"),
+    stationId: uuid("station_id").references(() => kitchenStations.id),
+    availability: availabilityEnum("availability").notNull().default("AVAILABLE"),
+  },
+  (table) => [
+    index("menu_item_brand_id_idx").on(table.brandId),
+    index("menu_item_station_id_idx").on(table.stationId),
+  ],
+).enableRLS();
 
 export type MenuItem = typeof menuItems.$inferSelect;
 export type NewMenuItem = typeof menuItems.$inferInsert;
@@ -186,17 +210,24 @@ export type NewMenuItem = typeof menuItems.$inferInsert;
 // recipe_line
 // ---------------------------------------------------------------------------
 
-export const recipeLines = pgTable("recipe_line", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  menuItemId: uuid("menu_item_id")
-    .notNull()
-    .references(() => menuItems.id),
-  ingredientId: uuid("ingredient_id")
-    .notNull()
-    .references(() => ingredients.id),
-  portionQty: numeric("portion_qty", { precision: 14, scale: 4 }).notNull(),
-  unit: text("unit").notNull(),
-});
+export const recipeLines = pgTable(
+  "recipe_line",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    menuItemId: uuid("menu_item_id")
+      .notNull()
+      .references(() => menuItems.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    portionQty: numeric("portion_qty", { precision: 14, scale: 4 }).notNull(),
+    unit: text("unit").notNull(),
+  },
+  (table) => [
+    index("recipe_line_menu_item_id_idx").on(table.menuItemId),
+    index("recipe_line_ingredient_id_idx").on(table.ingredientId),
+  ],
+).enableRLS();
 
 export type RecipeLine = typeof recipeLines.$inferSelect;
 export type NewRecipeLine = typeof recipeLines.$inferInsert;
@@ -215,7 +246,7 @@ export const warehouses = pgTable(
     type: warehouseTypeEnum("type").notNull(),
   },
   (table) => [uniqueIndex("warehouse_location_type_unique").on(table.locationId, table.type)],
-);
+).enableRLS();
 
 export type Warehouse = typeof warehouses.$inferSelect;
 export type NewWarehouse = typeof warehouses.$inferInsert;
@@ -237,8 +268,9 @@ export const inventoryStock = pgTable(
       table.warehouseId,
       table.ingredientId,
     ),
+    index("inventory_stock_ingredient_idx").on(table.ingredientId),
   ],
-);
+).enableRLS();
 
 export type InventoryStock = typeof inventoryStock.$inferSelect;
 export type NewInventoryStock = typeof inventoryStock.$inferInsert;
@@ -255,7 +287,7 @@ export const users = pgTable("user", {
   role: roleEnum("role").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}).enableRLS();
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
@@ -274,8 +306,9 @@ export const userBrands = pgTable(
   },
   (table) => [
     uniqueIndex("user_brand_user_brand_unique").on(table.userId, table.brandId),
+    index("user_brand_brand_id_idx").on(table.brandId),
   ],
-);
+).enableRLS();
 
 export type UserBrand = typeof userBrands.$inferSelect;
 export type NewUserBrand = typeof userBrands.$inferInsert;
@@ -307,30 +340,46 @@ export const orders = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    uniqueIndex("order_aggregator_external_ref_unique").on(
-      table.aggregator,
+    // Listing-scoped idempotency (D-migration 0010, supersedes the old global
+    // (aggregator, external_ref) unique): a replay of the same external_ref on
+    // the SAME channel listing (aggregator_account_id) is an idempotent no-op;
+    // the same external_ref arriving via a DIFFERENT listing is a distinct
+    // order. See orders/service.ts ingestOrder/buildDuplicateResponse.
+    uniqueIndex("order_listing_external_ref_unique").on(
+      table.aggregatorAccountId,
       table.externalRef,
     ),
+    index("order_status_placed_at_idx").on(table.status, table.placedAt.desc()),
+    index("order_brand_placed_at_idx").on(table.brandId, table.placedAt.desc()),
+    index("order_aggregator_account_id_idx").on(table.aggregatorAccountId),
   ],
-);
+).enableRLS();
 
 export type Order = typeof orders.$inferSelect;
 export type NewOrder = typeof orders.$inferInsert;
 
-export const orderItems = pgTable("order_item", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  orderId: uuid("order_id")
-    .notNull()
-    .references(() => orders.id),
-  menuItemId: uuid("menu_item_id")
-    .notNull()
-    .references(() => menuItems.id),
-  qty: integer("qty").notNull(),
-  stationId: uuid("station_id")
-    .notNull()
-    .references(() => kitchenStations.id),
-  notes: text("notes"),
-});
+export const orderItems = pgTable(
+  "order_item",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orderId: uuid("order_id")
+      .notNull()
+      .references(() => orders.id),
+    menuItemId: uuid("menu_item_id")
+      .notNull()
+      .references(() => menuItems.id),
+    qty: integer("qty").notNull(),
+    stationId: uuid("station_id")
+      .notNull()
+      .references(() => kitchenStations.id),
+    notes: text("notes"),
+  },
+  (table) => [
+    index("order_item_order_id_idx").on(table.orderId),
+    index("order_item_menu_item_id_idx").on(table.menuItemId),
+    index("order_item_station_id_idx").on(table.stationId),
+  ],
+).enableRLS();
 
 export type OrderItem = typeof orderItems.$inferSelect;
 export type NewOrderItem = typeof orderItems.$inferInsert;
@@ -339,34 +388,49 @@ export type NewOrderItem = typeof orderItems.$inferInsert;
 // ito / ito_item   (Internal Transfer Order)
 // ---------------------------------------------------------------------------
 
-export const itos = pgTable("ito", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  fromWarehouseId: uuid("from_warehouse_id")
-    .notNull()
-    .references(() => warehouses.id),
-  toWarehouseId: uuid("to_warehouse_id")
-    .notNull()
-    .references(() => warehouses.id),
-  status: itoStatusEnum("status").notNull().default("REQUESTED"),
-  requestedBy: uuid("requested_by").references(() => users.id),
-  confirmedBy: uuid("confirmed_by").references(() => users.id),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
-});
+export const itos = pgTable(
+  "ito",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    fromWarehouseId: uuid("from_warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    toWarehouseId: uuid("to_warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    status: itoStatusEnum("status").notNull().default("REQUESTED"),
+    requestedBy: uuid("requested_by").references(() => users.id),
+    confirmedBy: uuid("confirmed_by").references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+  },
+  (table) => [
+    index("ito_from_warehouse_idx").on(table.fromWarehouseId),
+    index("ito_to_warehouse_idx").on(table.toWarehouseId),
+    index("ito_status_idx").on(table.status),
+  ],
+).enableRLS();
 
 export type Ito = typeof itos.$inferSelect;
 export type NewIto = typeof itos.$inferInsert;
 
-export const itoItems = pgTable("ito_item", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  itoId: uuid("ito_id")
-    .notNull()
-    .references(() => itos.id),
-  ingredientId: uuid("ingredient_id")
-    .notNull()
-    .references(() => ingredients.id),
-  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-});
+export const itoItems = pgTable(
+  "ito_item",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    itoId: uuid("ito_id")
+      .notNull()
+      .references(() => itos.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+  },
+  (table) => [
+    index("ito_item_ito_id_idx").on(table.itoId),
+    index("ito_item_ingredient_id_idx").on(table.ingredientId),
+  ],
+).enableRLS();
 
 export type ItoItem = typeof itoItems.$inferSelect;
 export type NewItoItem = typeof itoItems.$inferInsert;
@@ -375,49 +439,83 @@ export type NewItoItem = typeof itoItems.$inferInsert;
 // print_job / print_agent / consumption_log
 // ---------------------------------------------------------------------------
 
-export const printJobs = pgTable("print_job", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  orderId: uuid("order_id")
-    .notNull()
-    .references(() => orders.id),
-  stationId: uuid("station_id")
-    .notNull()
-    .references(() => kitchenStations.id),
-  printerId: uuid("printer_id").references(() => printers.id),
-  payload: jsonb("payload").notNull(),
-  status: printJobStatusEnum("status").notNull().default("PENDING"),
-  error: text("error"),
-  retries: integer("retries").notNull().default(0),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  printedAt: timestamp("printed_at", { withTimezone: true }),
-});
+export const printJobs = pgTable(
+  "print_job",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orderId: uuid("order_id")
+      .notNull()
+      .references(() => orders.id),
+    stationId: uuid("station_id")
+      .notNull()
+      .references(() => kitchenStations.id),
+    printerId: uuid("printer_id").references(() => printers.id),
+    payload: jsonb("payload").notNull(),
+    status: printJobStatusEnum("status").notNull().default("PENDING"),
+    error: text("error"),
+    retries: integer("retries").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    printedAt: timestamp("printed_at", { withTimezone: true }),
+  },
+  (table) => [
+    // Partial: agent pull loop hits this continuously (`WHERE status='PENDING' ORDER BY
+    // created_at ASC`); tiny + always hot, so a partial index stays cheap as print_job grows.
+    index("print_job_pending_created_at_idx")
+      .on(table.createdAt)
+      .where(sql`${table.status} = 'PENDING'`),
+    index("print_job_status_idx").on(table.status),
+    index("print_job_order_id_idx").on(table.orderId),
+    index("print_job_station_id_idx").on(table.stationId),
+    index("print_job_printer_id_idx").on(table.printerId),
+  ],
+).enableRLS();
 
 export type PrintJob = typeof printJobs.$inferSelect;
 export type NewPrintJob = typeof printJobs.$inferInsert;
 
-export const printAgents = pgTable("print_agent", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  locationId: uuid("location_id")
-    .notNull()
-    .references(() => locations.id),
-  apiToken: text("api_token").notNull(),
-  name: text("name"),
-  lastSeen: timestamp("last_seen", { withTimezone: true }),
-});
+export const printAgents = pgTable(
+  "print_agent",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id),
+    apiToken: text("api_token").notNull(),
+    name: text("name"),
+    lastSeen: timestamp("last_seen", { withTimezone: true }),
+  },
+  (table) => [index("print_agent_location_id_idx").on(table.locationId)],
+).enableRLS();
 
 export type PrintAgent = typeof printAgents.$inferSelect;
 export type NewPrintAgent = typeof printAgents.$inferInsert;
 
-export const consumptionLogs = pgTable("consumption_log", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  ingredientId: uuid("ingredient_id")
-    .notNull()
-    .references(() => ingredients.id),
-  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-  logDate: timestamp("log_date", { withTimezone: true }).notNull().defaultNow(),
-  loggedBy: uuid("logged_by").references(() => users.id),
-  orderId: uuid("order_id").references(() => orders.id),
-});
+export const consumptionLogs = pgTable(
+  "consumption_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    logDate: timestamp("log_date", { withTimezone: true }).notNull().defaultNow(),
+    loggedBy: uuid("logged_by").references(() => users.id),
+    orderId: uuid("order_id").references(() => orders.id),
+    // Tenancy backfill (audit-db.md §3, BUILDER TASK 5, mechanical subset only):
+    // nullable, no product decision required — outlet is derivable via
+    // warehouse once populated. NOT wired to any insert call site in this
+    // migration: POST /inventory/consumption (inventory/routes.ts) takes no
+    // warehouse in its request shape today, and picking one would be an API
+    // change, not a backfill. Left null until that's decided; superseded
+    // long-term by stock_ledger_entry, which already carries warehouse_id.
+    warehouseId: uuid("warehouse_id").references(() => warehouses.id),
+  },
+  (table) => [
+    index("consumption_log_ingredient_idx").on(table.ingredientId, table.logDate.desc()),
+    index("consumption_log_order_id_idx").on(table.orderId),
+    index("consumption_log_warehouse_id_idx").on(table.warehouseId),
+  ],
+).enableRLS();
 
 export type ConsumptionLog = typeof consumptionLogs.$inferSelect;
 export type NewConsumptionLog = typeof consumptionLogs.$inferInsert;
@@ -462,8 +560,15 @@ export const stockLedgerEntries = pgTable(
       table.sourceDocumentNo,
       table.sourceLineNo,
     ),
+    index("stock_ledger_ing_wh_posted_idx").on(
+      table.ingredientId,
+      table.warehouseId,
+      table.postedAt.desc(),
+    ),
+    index("stock_ledger_wh_posted_idx").on(table.warehouseId, table.postedAt.desc()),
+    index("stock_ledger_encoder_idx").on(table.encoderUserId),
   ],
-);
+).enableRLS();
 
 export type StockLedgerEntry = typeof stockLedgerEntries.$inferSelect;
 export type NewStockLedgerEntry = typeof stockLedgerEntries.$inferInsert;
@@ -485,48 +590,64 @@ export const departmentEnum = pgEnum("department", [
 
 export const employeeStatusEnum = pgEnum("employee_status", ["ACTIVE", "INACTIVE"]);
 
-export const employees = pgTable("employee", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  userId: uuid("user_id").references(() => users.id),
-  employeeNo: text("employee_no").notNull().unique(),
-  fullName: text("full_name").notNull(),
-  department: departmentEnum("department").notNull(),
-  position: text("position"),
-  photoUrl: text("photo_url"),
-  status: employeeStatusEnum("status").notNull().default("ACTIVE"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const employees = pgTable(
+  "employee",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id").references(() => users.id),
+    employeeNo: text("employee_no").notNull().unique(),
+    fullName: text("full_name").notNull(),
+    department: departmentEnum("department").notNull(),
+    position: text("position"),
+    photoUrl: text("photo_url"),
+    status: employeeStatusEnum("status").notNull().default("ACTIVE"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("employee_user_id_idx").on(table.userId)],
+).enableRLS();
 
 export type Employee = typeof employees.$inferSelect;
 export type NewEmployee = typeof employees.$inferInsert;
 
-export const userSessions = pgTable("user_session", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  userId: uuid("user_id")
-    .notNull()
-    .references(() => users.id),
-  loginAt: timestamp("login_at", { withTimezone: true }).notNull().defaultNow(),
-  logoutAt: timestamp("logout_at", { withTimezone: true }),
-  ip: text("ip"),
-  userAgent: text("user_agent"),
-});
+export const userSessions = pgTable(
+  "user_session",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    loginAt: timestamp("login_at", { withTimezone: true }).notNull().defaultNow(),
+    logoutAt: timestamp("logout_at", { withTimezone: true }),
+    ip: text("ip"),
+    userAgent: text("user_agent"),
+  },
+  (table) => [index("user_session_user_id_idx").on(table.userId)],
+).enableRLS();
 
 export type UserSession = typeof userSessions.$inferSelect;
 export type NewUserSession = typeof userSessions.$inferInsert;
 
-export const auditLogs = pgTable("audit_log", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  actorUserId: uuid("actor_user_id").references(() => users.id),
-  actorName: text("actor_name"),
-  sessionId: uuid("session_id").references(() => userSessions.id),
-  action: text("action").notNull(),
-  description: text("description"),
-  entityType: text("entity_type"),
-  entityId: text("entity_id"),
-  metadata: jsonb("metadata"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const auditLogs = pgTable(
+  "audit_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    actorUserId: uuid("actor_user_id").references(() => users.id),
+    actorName: text("actor_name"),
+    sessionId: uuid("session_id").references(() => userSessions.id),
+    action: text("action").notNull(),
+    description: text("description"),
+    entityType: text("entity_type"),
+    entityId: text("entity_id"),
+    metadata: jsonb("metadata"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("audit_log_created_at_idx").on(table.createdAt.desc()),
+    index("audit_log_actor_idx").on(table.actorUserId),
+    index("audit_log_entity_idx").on(table.entityType, table.entityId),
+  ],
+).enableRLS();
 
 export type AuditLog = typeof auditLogs.$inferSelect;
 export type NewAuditLog = typeof auditLogs.$inferInsert;
@@ -537,24 +658,32 @@ export type NewAuditLog = typeof auditLogs.$inferInsert;
 
 export const attendanceTypeEnum = pgEnum("attendance_type", ["TIME_IN", "TIME_OUT"]);
 
-export const attendanceRecords = pgTable("attendance_record", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  employeeId: uuid("employee_id")
-    .notNull()
-    .references(() => employees.id),
-  type: attendanceTypeEnum("type").notNull(),
-  photoUrl: text("photo_url").notNull(),
-  photoPublicId: text("photo_public_id").notNull(),
-  capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
-  /** The authed user who recorded this punch — derived from req.user (anti-spoof). */
-  recordedByUserId: uuid("recorded_by_user_id")
-    .notNull()
-    .references(() => users.id),
-  /** Session from req.user.sessionId — links to the actor's login session. */
-  sessionId: uuid("session_id").references(() => userSessions.id),
-  note: text("note"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const attendanceRecords = pgTable(
+  "attendance_record",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    employeeId: uuid("employee_id")
+      .notNull()
+      .references(() => employees.id),
+    type: attendanceTypeEnum("type").notNull(),
+    photoUrl: text("photo_url").notNull(),
+    photoPublicId: text("photo_public_id").notNull(),
+    capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
+    /** The authed user who recorded this punch — derived from req.user (anti-spoof). */
+    recordedByUserId: uuid("recorded_by_user_id")
+      .notNull()
+      .references(() => users.id),
+    /** Session from req.user.sessionId — links to the actor's login session. */
+    sessionId: uuid("session_id").references(() => userSessions.id),
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("attendance_employee_captured_idx").on(table.employeeId, table.capturedAt.desc()),
+    index("attendance_captured_at_idx").on(table.capturedAt.desc()),
+    index("attendance_recorded_by_idx").on(table.recordedByUserId),
+  ],
+).enableRLS();
 
 export type AttendanceRecord = typeof attendanceRecords.$inferSelect;
 export type NewAttendanceRecord = typeof attendanceRecords.$inferInsert;
@@ -577,7 +706,7 @@ export const suppliers = pgTable("supplier", {
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}).enableRLS();
 export type Supplier = typeof suppliers.$inferSelect;
 export type NewSupplier = typeof suppliers.$inferInsert;
 
@@ -594,8 +723,11 @@ export const supplierItems = pgTable(
     supplierSku: text("supplier_sku"),
     lastUnitCost: numeric("last_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
   },
-  (table) => [uniqueIndex("supplier_item_unique").on(table.supplierId, table.ingredientId)],
-);
+  (table) => [
+    uniqueIndex("supplier_item_unique").on(table.supplierId, table.ingredientId),
+    index("supplier_item_ingredient_idx").on(table.ingredientId),
+  ],
+).enableRLS();
 export type SupplierItem = typeof supplierItems.$inferSelect;
 
 export const customers = pgTable("customer", {
@@ -610,7 +742,7 @@ export const customers = pgTable("customer", {
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}).enableRLS();
 export type Customer = typeof customers.$inferSelect;
 export type NewCustomer = typeof customers.$inferInsert;
 
@@ -632,7 +764,7 @@ export const departmentInventoryAccess = pgTable(
   (table) => [
     uniqueIndex("department_inventory_access_unique").on(table.department, table.warehouseType),
   ],
-);
+).enableRLS();
 export type DepartmentInventoryAccess = typeof departmentInventoryAccess.$inferSelect;
 
 // ---------------------------------------------------------------------------
@@ -656,67 +788,108 @@ export const purchaseOrderStatusEnum = pgEnum("purchase_order_status", [
   "CANCELLED",
 ]);
 
-export const purchaseRequests = pgTable("purchase_request", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  prNo: text("pr_no").notNull().unique(),
-  department: departmentEnum("department").notNull(),
-  status: purchaseRequestStatusEnum("status").notNull().default("DRAFT"),
-  requestedByUserId: uuid("requested_by_user_id").notNull().references(() => users.id),
-  approvedByUserId: uuid("approved_by_user_id").references(() => users.id),
-  notes: text("notes"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const purchaseRequests = pgTable(
+  "purchase_request",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    prNo: text("pr_no").notNull().unique(),
+    department: departmentEnum("department").notNull(),
+    status: purchaseRequestStatusEnum("status").notNull().default("DRAFT"),
+    requestedByUserId: uuid("requested_by_user_id").notNull().references(() => users.id),
+    approvedByUserId: uuid("approved_by_user_id").references(() => users.id),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("pr_status_idx").on(table.status, table.createdAt.desc())],
+).enableRLS();
 export type PurchaseRequest = typeof purchaseRequests.$inferSelect;
 
-export const purchaseRequestLines = pgTable("purchase_request_line", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  prId: uuid("pr_id").notNull().references(() => purchaseRequests.id),
-  ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
-  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-  estUnitCost: numeric("est_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
-});
+export const purchaseRequestLines = pgTable(
+  "purchase_request_line",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    prId: uuid("pr_id").notNull().references(() => purchaseRequests.id),
+    ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    estUnitCost: numeric("est_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+  },
+  (table) => [
+    index("pr_line_pr_id_idx").on(table.prId),
+    index("pr_line_ingredient_idx").on(table.ingredientId),
+  ],
+).enableRLS();
 export type PurchaseRequestLine = typeof purchaseRequestLines.$inferSelect;
 
-export const purchaseOrders = pgTable("purchase_order", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  poNo: text("po_no").notNull().unique(),
-  supplierId: uuid("supplier_id").notNull().references(() => suppliers.id),
-  prId: uuid("pr_id").references(() => purchaseRequests.id),
-  status: purchaseOrderStatusEnum("status").notNull().default("DRAFT"),
-  createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id),
-  notes: text("notes"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const purchaseOrders = pgTable(
+  "purchase_order",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    poNo: text("po_no").notNull().unique(),
+    supplierId: uuid("supplier_id").notNull().references(() => suppliers.id),
+    prId: uuid("pr_id").references(() => purchaseRequests.id),
+    status: purchaseOrderStatusEnum("status").notNull().default("DRAFT"),
+    createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("po_supplier_id_idx").on(table.supplierId),
+    index("po_pr_id_idx").on(table.prId),
+    index("po_status_idx").on(table.status, table.createdAt.desc()),
+  ],
+).enableRLS();
 export type PurchaseOrder = typeof purchaseOrders.$inferSelect;
 
-export const purchaseOrderLines = pgTable("purchase_order_line", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
-  ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
-  quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-  unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
-  qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull().default("0"),
-});
+export const purchaseOrderLines = pgTable(
+  "purchase_order_line",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
+    ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+    qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull().default("0"),
+  },
+  (table) => [
+    index("po_line_po_id_idx").on(table.poId),
+    index("po_line_ingredient_idx").on(table.ingredientId),
+  ],
+).enableRLS();
 export type PurchaseOrderLine = typeof purchaseOrderLines.$inferSelect;
 
-export const receivingReports = pgTable("receiving_report", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  rrNo: text("rr_no").notNull().unique(),
-  poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
-  warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
-  receivedByUserId: uuid("received_by_user_id").notNull().references(() => users.id),
-  notes: text("notes"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const receivingReports = pgTable(
+  "receiving_report",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    rrNo: text("rr_no").notNull().unique(),
+    poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
+    warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
+    receivedByUserId: uuid("received_by_user_id").notNull().references(() => users.id),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("rr_po_id_idx").on(table.poId),
+    index("rr_warehouse_id_idx").on(table.warehouseId),
+  ],
+).enableRLS();
 export type ReceivingReport = typeof receivingReports.$inferSelect;
 
-export const receivingReportLines = pgTable("receiving_report_line", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  rrId: uuid("rr_id").notNull().references(() => receivingReports.id),
-  poLineId: uuid("po_line_id").notNull().references(() => purchaseOrderLines.id),
-  ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
-  qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull(),
-});
+export const receivingReportLines = pgTable(
+  "receiving_report_line",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    rrId: uuid("rr_id").notNull().references(() => receivingReports.id),
+    poLineId: uuid("po_line_id").notNull().references(() => purchaseOrderLines.id),
+    ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
+    qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull(),
+  },
+  (table) => [
+    index("rr_line_rr_id_idx").on(table.rrId),
+    index("rr_line_po_line_id_idx").on(table.poLineId),
+    index("rr_line_ingredient_idx").on(table.ingredientId),
+  ],
+).enableRLS();
 export type ReceivingReportLine = typeof receivingReportLines.$inferSelect;

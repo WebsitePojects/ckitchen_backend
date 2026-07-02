@@ -137,19 +137,75 @@ export async function registerAgent(
 }
 
 // ---------------------------------------------------------------------------
+// resolveAgentLocationId — outlet-scoping helper for the print pull loop
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves which location a print agent is authorized to pull for.
+ *
+ * Tenancy note (audit-db.md §3, "Service-layer leak found while auditing"):
+ * `print_agent` already carries `location_id` (migration 0003). The pull
+ * endpoint must use it so an agent registered for outlet 2 can never see
+ * outlet 1's KOTs, even though all agents currently share one global
+ * `X-Agent-Token` secret (per-agent tokens are a follow-up, audit §8 builder
+ * task 6). The caller supplies `location_id` (required query param — the
+ * agent knows its own location from its `/agent/register` call, which
+ * already takes `{ agent_name, location_id }` per CK1-API-003 §8.1); this
+ * helper verifies a `print_agent` row is actually registered for that
+ * location before the pull is allowed to proceed, so an unregistered/guessed
+ * location_id cannot be used to read another outlet's queue.
+ */
+export async function resolveAgentLocationId(
+  db: DB,
+  locationId: string,
+): Promise<string> {
+  const [location] = await db
+    .select({ id: locations.id })
+    .from(locations)
+    .where(eq(locations.id, locationId));
+  if (!location) {
+    throw new PrintNotFoundError(`Location ${locationId} not found.`);
+  }
+
+  const [agent] = await db
+    .select({ id: printAgents.id })
+    .from(printAgents)
+    .where(eq(printAgents.locationId, locationId));
+  if (!agent) {
+    throw new PrintValidationError(
+      `No print agent is registered for location ${locationId}. Call /agent/register first.`,
+    );
+  }
+
+  return locationId;
+}
+
+// ---------------------------------------------------------------------------
 // listPendingJobs — GET /agent/print-jobs/pending
 // ---------------------------------------------------------------------------
 
 /**
- * Returns all PENDING print jobs, oldest-first (by created_at).
+ * Returns PENDING print jobs for ONE location, oldest-first (by created_at).
  * Each job is shaped per §8.3: { id, printer, payload }.
  * Printer may be null if the station has no default printer assigned.
+ *
+ * Outlet-scoping (audit-db.md §3 + business-rules.md D20/D21): scoped via
+ * print_job -> kitchen_station -> location so an agent from one outlet never
+ * receives another outlet's KOTs. `print_job` has no location_id column of
+ * its own yet (that denormalization is a separate, larger tenancy migration
+ * — audit builder task 5/13); the station join is unambiguous and correct
+ * today because every print_job.station_id is NOT NULL.
  */
-export async function listPendingJobs(db: DB): Promise<PendingJobResponse[]> {
+export async function listPendingJobs(db: DB, locationId: string): Promise<PendingJobResponse[]> {
   const pendingJobs = await db
-    .select()
+    .select({
+      id: printJobs.id,
+      printerId: printJobs.printerId,
+      payload: printJobs.payload,
+    })
     .from(printJobs)
-    .where(eq(printJobs.status, "PENDING"))
+    .innerJoin(kitchenStations, eq(printJobs.stationId, kitchenStations.id))
+    .where(and(eq(printJobs.status, "PENDING"), eq(kitchenStations.locationId, locationId)))
     .orderBy(asc(printJobs.createdAt));
 
   if (pendingJobs.length === 0) return [];

@@ -25,6 +25,7 @@ import type { Express } from "express";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seedPilot } from "../src/db/seed-pilot.js";
+import { locations } from "../src/db/schema.js";
 
 // ---------------------------------------------------------------------------
 // Shared state (set up once in the file-level beforeAll)
@@ -35,6 +36,7 @@ let db: DB;
 let adminToken: string;
 let kitchenToken: string;
 let warehouseToken: string;
+let locationId: string; // seeded CK1 location — pilot agent is registered here
 
 // Ids resolved from the pilot seed
 let brandIds: Record<string, string>;
@@ -47,6 +49,14 @@ let warehouseIds: { main: string; kitchen: string };
 let _refSeq = 0;
 function nextRef(prefix = "E2E"): string {
   return `${prefix}-${Date.now()}-${++_refSeq}`;
+}
+
+/** GET /agent/print-jobs/pending scoped to the pilot's single location (outlet-scoped pull). */
+function getPending(agentToken: string) {
+  return request(app)
+    .get("/api/v1/agent/print-jobs/pending")
+    .query({ location_id: locationId })
+    .set("X-Agent-Token", agentToken);
 }
 
 async function login(email: string, password: string): Promise<string> {
@@ -73,6 +83,19 @@ beforeAll(async () => {
   adminToken   = await login("admin@cloudkitchen.local",     "admin123");
   kitchenToken = await login("kitchen_staff@cloudkitchen.local", "password123");
   warehouseToken = await login("warehouse@cloudkitchen.local", "password123");
+
+  // Resolve the pilot's single seeded location + register the mock print
+  // agent there (outlet-scoped pull requires a registered print_agent —
+  // see src/modules/printing/service.ts resolveAgentLocationId).
+  const [location] = await db.select().from(locations);
+  if (!location) throw new Error("No location found — pilot seed must run first.");
+  locationId = location.id;
+
+  const registerRes = await request(app)
+    .post("/api/v1/agent/register")
+    .set("X-Agent-Token", "test-agent-token")
+    .send({ agent_name: "E2E Mock Agent", location_id: locationId });
+  expect(registerRes.status, "agent register").toBe(200);
 }, 60_000); // generous timeout for in-memory Postgres migrations
 
 // ---------------------------------------------------------------------------
@@ -276,9 +299,7 @@ describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () =>
   const AGENT_TOKEN = "test-agent-token"; // matches config.ts test default
 
   it("GET /agent/print-jobs/pending returns at least 5 PENDING jobs", async () => {
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const res = await getPending(AGENT_TOKEN);
 
     expect(res.status).toBe(200);
     const jobs = res.body as Array<{ id: string; payload: unknown }>;
@@ -289,9 +310,7 @@ describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () =>
     // Drain loop (mirrors agent-mock/index.ts logic)
     let rounds = 0;
     while (rounds < 10) {
-      const res = await request(app)
-        .get("/api/v1/agent/print-jobs/pending")
-        .set("X-Agent-Token", AGENT_TOKEN);
+      const res = await getPending(AGENT_TOKEN);
 
       const jobs = res.body as Array<{ id: string }>;
       if (jobs.length === 0) break;
@@ -308,9 +327,7 @@ describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () =>
     }
 
     // Verify: no PENDING jobs remain
-    const finalRes = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const finalRes = await getPending(AGENT_TOKEN);
     expect(finalRes.body).toHaveLength(0);
   });
 
@@ -655,9 +672,7 @@ describe("Step (g): Failed print job reprinted via web app → new PENDING job",
     expect(reprintRes.body.status).toBe("PENDING");
 
     // Verify the new PENDING job is visible in the agent's poll
-    const pendingRes = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
+    const pendingRes = await getPending(AGENT_TOKEN);
     expect(pendingRes.status).toBe(200);
     const pending = pendingRes.body as Array<{ id: string }>;
     expect(pending.some((j) => j.id === newJobId)).toBe(true);

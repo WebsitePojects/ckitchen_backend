@@ -15,6 +15,7 @@ import { createOutletsRouter } from "./modules/outlets/routes.js";
 import { createEmsRouter } from "./modules/ems/routes.js";
 import { createMasterRouter } from "./modules/master/routes.js";
 import { createPurchasingRouter } from "./modules/purchasing/routes.js";
+import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 
 /**
  * Express app factory.
@@ -44,6 +45,11 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.use("/api/v1", createEmsRouter(db));
   app.use("/api/v1", createMasterRouter(db));
   app.use("/api/v1", createPurchasingRouter(db));
+
+  // Safety net — unmatched routes → 404; anything thrown/rejected in a handler
+  // is normalized here so internals (stack/SQL) never leak to the client.
+  app.use(notFoundHandler);
+  app.use(errorHandler);
 
   return app;
 }

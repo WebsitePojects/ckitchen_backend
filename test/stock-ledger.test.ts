@@ -415,7 +415,8 @@ describe("Ledger: cancel after PREPARING posts RESTOCK IN rows", () => {
     // Cancel the order → triggers compensating restock
     const cancelRes = await request(app)
       .post(`/api/v1/orders/${orderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "ledger restock test" });
     expect(cancelRes.status).toBe(200);
   });
 

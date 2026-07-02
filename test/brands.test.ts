@@ -164,6 +164,74 @@ describe("PATCH /api/v1/brands/{id}", () => {
   });
 });
 
+describe("Brand activity log (MOTM 2026-07-01)", () => {
+  let brandId: string;
+
+  beforeAll(async () => {
+    const createRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Activity Brand", color: "#0f0f0f" });
+    brandId = createRes.body.id;
+  });
+
+  it("records an event only when is_active actually flips", async () => {
+    // Toggle to inactive → 1 event
+    await request(app)
+      .patch(`/api/v1/brands/${brandId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ is_active: false, activity_note: "closed for the day" });
+
+    // A no-op patch (same value, different field) → NO new event
+    await request(app)
+      .patch(`/api/v1/brands/${brandId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Activity Brand Renamed" });
+
+    // Toggle back to active → 2nd event
+    await request(app)
+      .patch(`/api/v1/brands/${brandId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ is_active: true });
+
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity`)
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.events)).toBe(true);
+    expect(res.body.events).toHaveLength(2);
+    // Chronological: INACTIVE first, then ACTIVE
+    expect(res.body.events[0].status).toBe("INACTIVE");
+    expect(res.body.events[0].note).toBe("closed for the day");
+    expect(res.body.events[1].status).toBe("ACTIVE");
+    expect(res.body.events[0].changedBy).toBeTruthy();
+  });
+
+  it("rejects from > to with 400", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity?from=2026-07-31&to=2026-07-01`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("returns 404 for an unknown brand", async () => {
+    const res = await request(app)
+      .get("/api/v1/brands/00000000-0000-0000-0000-000000000000/activity")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(404);
+  });
+
+  it("a date window that excludes all events returns an empty list", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity?from=2020-01-01&to=2020-01-31`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.events).toHaveLength(0);
+  });
+});
+
 describe("Aggregator accounts", () => {
   let brandId: string;
 

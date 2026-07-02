@@ -621,10 +621,37 @@ describe("POST /orders/:id/cancel — cancel before PREPARING", () => {
     newOrderId = res.body.order_id as string;
   });
 
+  it("cancelling WITHOUT a reason → 400 VALIDATION_ERROR (MOTM: reason required)", async () => {
+    const ingest = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: nextRef(),
+        items: [{ menu_item_id: grillItemId, qty: 1 }],
+      });
+    const freshId = ingest.body.order_id as string;
+
+    const noReason = await request(app)
+      .post(`/api/v1/orders/${freshId}/cancel`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({});
+    expect(noReason.status).toBe(400);
+    expect(noReason.body.error.code).toBe("VALIDATION_ERROR");
+
+    const blankReason = await request(app)
+      .post(`/api/v1/orders/${freshId}/cancel`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "   " });
+    expect(blankReason.status).toBe(400);
+  });
+
   it("cancelling a NEW order → 200 with status=CANCELLED (no stock deduction occurred)", async () => {
     const res = await request(app)
       .post(`/api/v1/orders/${newOrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "customer no-show" });
 
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("CANCELLED");

@@ -655,7 +655,20 @@ export async function advanceOrder(
 // If at/after PREPARING: compensating restock (Rule #2).
 // ---------------------------------------------------------------------------
 
-export async function cancelOrder(db: DB, orderId: string): Promise<{ status: string }> {
+export async function cancelOrder(
+  db: DB,
+  orderId: string,
+  reason: string,
+): Promise<{ status: string }> {
+  // MOTM 2026-07-01: a cancellation must record WHY.
+  const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+  if (trimmedReason.length === 0) {
+    throw new ValidationError("A cancellation reason is required.");
+  }
+  if (trimmedReason.length > 500) {
+    throw new ValidationError("Cancellation reason must be 500 characters or fewer.");
+  }
+
   const [order] = await db.select().from(orders).where(eq(orders.id, orderId));
   if (!order) throw new NotFoundError("Order not found.");
 
@@ -734,10 +747,10 @@ export async function cancelOrder(db: DB, orderId: string): Promise<{ status: st
       }
     }
 
-    // Mark the order CANCELLED
+    // Mark the order CANCELLED with the recorded reason
     await tx
       .update(orders)
-      .set({ status: "CANCELLED", updatedAt: new Date() })
+      .set({ status: "CANCELLED", cancelReason: trimmedReason, updatedAt: new Date() })
       .where(eq(orders.id, orderId));
   });
 

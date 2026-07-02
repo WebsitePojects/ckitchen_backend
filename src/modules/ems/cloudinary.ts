@@ -31,7 +31,7 @@ export interface UploadResult {
  * @throws        ConfigError if required env vars are missing.
  * @throws        On Cloudinary upload failure.
  */
-export async function uploadAttendancePhoto(dataUrl: string): Promise<UploadResult> {
+export async function uploadImage(dataUrl: string, folder: string): Promise<UploadResult> {
   const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
   const apiKey = process.env.CLOUDINARY_API_KEY;
   const apiSecret = process.env.CLOUDINARY_API_SECRET;
@@ -45,9 +45,19 @@ export async function uploadAttendancePhoto(dataUrl: string): Promise<UploadResu
   cloudinary.config({ cloud_name: cloudName, api_key: apiKey, api_secret: apiSecret });
 
   const result = await cloudinary.uploader.upload(dataUrl, {
-    folder: "ck1/attendance",
+    folder,
     resource_type: "image",
   });
 
   return { url: result.secure_url, publicId: result.public_id };
+}
+
+/** Uploads an attendance photo (folder `ck1/attendance`). */
+export async function uploadAttendancePhoto(dataUrl: string): Promise<UploadResult> {
+  return uploadImage(dataUrl, "ck1/attendance");
+}
+
+/** Uploads a menu-item photo (folder `ck1/menu`) — MOTM 2026-07-01. */
+export async function uploadMenuPhoto(dataUrl: string): Promise<UploadResult> {
+  return uploadImage(dataUrl, "ck1/menu");
 }

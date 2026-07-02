@@ -344,7 +344,8 @@ describe("Cancel-after-preparing: compensating restock restores KITCHEN Pork to 
   it("cancelling the PREPARING order restores KITCHEN Pork back to 1000g exactly", async () => {
     const cancelRes = await request(app)
       .post(`/api/v1/orders/${cancelOrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "customer changed mind" });
 
     expect(cancelRes.status).toBe(200);
     expect(cancelRes.body.status).toBe("CANCELLED");
@@ -364,7 +365,8 @@ describe("Cancel-after-preparing: compensating restock restores KITCHEN Pork to 
   it("cancelling a CANCELLED order → 400 VALIDATION_ERROR (idempotent guard)", async () => {
     const res = await request(app)
       .post(`/api/v1/orders/${cancelOrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "second attempt" });
 
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("VALIDATION_ERROR");
@@ -463,7 +465,8 @@ describe("RBAC: advance/cancel require SUPER_ADMIN or KITCHEN_STAFF", () => {
   it("KITCHEN_STAFF can cancel an order", async () => {
     const res = await request(app)
       .post(`/api/v1/orders/${rbacOrderId}/cancel`)
-      .set("Authorization", `Bearer ${kitchenToken}`);
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .send({ reason: "out of stock" });
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("CANCELLED");
   });
@@ -712,7 +715,8 @@ describe("FIX B2: cancel restores from ledger even after recipe change (1000 →
   it("cancel restores to exactly 1000g (ledger 200g restored, NOT current recipe 500g)", async () => {
     const cancelRes = await request(app)
       .post(`/api/v1/orders/${b2OrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "recipe change test" });
     expect(cancelRes.status).toBe(200);
     expect(cancelRes.body.status).toBe("CANCELLED");
 
@@ -814,7 +818,8 @@ describe("FIX B3: double-cancel does NOT double-restock", () => {
   it("first cancel succeeds and restores KITCHEN Lamb_B3 to exactly 1000g", async () => {
     const cancelRes = await request(app)
       .post(`/api/v1/orders/${b3OrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "double-cancel guard test" });
     expect(cancelRes.status).toBe(200);
     expect(cancelRes.body.status).toBe("CANCELLED");
 
@@ -830,7 +835,8 @@ describe("FIX B3: double-cancel does NOT double-restock", () => {
   it("second cancel → 400 VALIDATION_ERROR (already CANCELLED)", async () => {
     const res = await request(app)
       .post(`/api/v1/orders/${b3OrderId}/cancel`)
-      .set("Authorization", `Bearer ${adminToken}`);
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ reason: "second attempt" });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("VALIDATION_ERROR");
   });

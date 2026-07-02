@@ -78,6 +78,13 @@
       "when": 1782979295239,
       "tag": "0010_listing_scoped_idempotency_and_consumption_warehouse",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1782991447693,
+      "tag": "0011_lucky_shinko_yamashiro",
+      "breakpoints": true
     }
   ]
 }

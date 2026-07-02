@@ -19,6 +19,9 @@ import {
 
 export const aggregatorEnum = pgEnum("aggregator", ["FOODPANDA", "GRABFOOD", "OTHER"]);
 
+/** MOTM 2026-07-01: per-brand active/inactive history. */
+export const brandActivityStatusEnum = pgEnum("brand_activity_status", ["ACTIVE", "INACTIVE"]);
+
 export const availabilityEnum = pgEnum("availability", [
   "AVAILABLE",
   "PAUSED",
@@ -127,6 +130,33 @@ export type AggregatorAccount = typeof aggregatorAccounts.$inferSelect;
 export type NewAggregatorAccount = typeof aggregatorAccounts.$inferInsert;
 
 // ---------------------------------------------------------------------------
+// brand_activity_log  (MOTM 2026-07-01: active/inactive history per brand/day)
+// ---------------------------------------------------------------------------
+
+export const brandActivityLog = pgTable(
+  "brand_activity_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    brandId: uuid("brand_id")
+      .notNull()
+      .references(() => brands.id),
+    // Optional: which channel listing toggled (a brand may toggle at the brand
+    // level or per Foodpanda/Grab listing).
+    aggregatorAccountId: uuid("aggregator_account_id").references(() => aggregatorAccounts.id),
+    status: brandActivityStatusEnum("status").notNull(),
+    changedAt: timestamp("changed_at", { withTimezone: true }).notNull().defaultNow(),
+    changedBy: uuid("changed_by").references(() => users.id),
+    note: text("note"),
+  },
+  (table) => [
+    index("brand_activity_log_brand_changed_at_idx").on(table.brandId, table.changedAt),
+  ],
+).enableRLS();
+
+export type BrandActivityLog = typeof brandActivityLog.$inferSelect;
+export type NewBrandActivityLog = typeof brandActivityLog.$inferInsert;
+
+// ---------------------------------------------------------------------------
 // printer
 // ---------------------------------------------------------------------------
 
@@ -196,10 +226,18 @@ export const menuItems = pgTable(
     prepTimeMin: integer("prep_time_min"),
     stationId: uuid("station_id").references(() => kitchenStations.id),
     availability: availabilityEnum("availability").notNull().default("AVAILABLE"),
+    /** MOTM 2026-07-01: per-item photo, product number, and remarks. */
+    imageUrl: text("image_url"),
+    itemNo: text("item_no"),
+    remarks: text("remarks"),
   },
   (table) => [
     index("menu_item_brand_id_idx").on(table.brandId),
     index("menu_item_station_id_idx").on(table.stationId),
+    // Product number unique within a brand (only when set).
+    uniqueIndex("menu_item_brand_item_no_unique")
+      .on(table.brandId, table.itemNo)
+      .where(sql`${table.itemNo} IS NOT NULL`),
   ],
 ).enableRLS();
 
@@ -331,6 +369,8 @@ export const orders = pgTable(
     externalRef: text("external_ref").notNull(),
     customerName: text("customer_name"),
     status: orderStatusEnum("status").notNull().default("NEW"),
+    /** Required when status transitions to CANCELLED (MOTM 2026-07-01). */
+    cancelReason: text("cancel_reason"),
     total: numeric("total", { precision: 14, scale: 2 }).notNull(),
     placedAt: timestamp("placed_at", { withTimezone: true }).notNull().defaultNow(),
     prepAt: timestamp("prep_at", { withTimezone: true }),

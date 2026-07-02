@@ -1,7 +1,9 @@
 import type { NextFunction, Request, Response } from "express";
+import { eq } from "drizzle-orm";
 import { loadConfig } from "../../config.js";
 import { verifyToken } from "./service.js";
-import type { User } from "../../db/schema.js";
+import { userSessions, type User } from "../../db/schema.js";
+import type { DB } from "../../db/client.js";
 
 export interface AuthenticatedUser {
   id: string;
@@ -25,8 +27,17 @@ function sendError(
   res.status(status).json({ error: { code, message } });
 }
 
-/** Parses `Authorization: Bearer <jwt>` and attaches `req.user = { id, role }`. */
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+/**
+ * Parses `Authorization: Bearer <jwt>` and attaches `req.user = { id, role }`.
+ *
+ * Also enforces session revocation (audit-backend.md SF-4): a token whose `sid`
+ * points at a session row that is missing or has `logoutAt` set is rejected, so
+ * logging out (or an admin closing a session) invalidates the token immediately
+ * instead of leaving it valid until its 12h expiry. The session lookup is
+ * skipped only when no DB is wired onto the app (never the case in prod/tests);
+ * any DB error fails closed (401), never 500.
+ */
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const header = req.headers.authorization;
   if (!header || !header.startsWith("Bearer ")) {
     sendError(res, 401, "AUTH_REQUIRED", "Missing or malformed Authorization header.");
@@ -42,6 +53,22 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   try {
     const { jwtSecret } = loadConfig();
     const payload = verifyToken(token, jwtSecret);
+
+    // Session revocation check (only for tokens minted with a session id).
+    if (payload.sid) {
+      const db = req.app.get("db") as DB | undefined;
+      if (db) {
+        const [session] = await db
+          .select({ logoutAt: userSessions.logoutAt })
+          .from(userSessions)
+          .where(eq(userSessions.id, payload.sid));
+        if (!session || session.logoutAt !== null) {
+          sendError(res, 401, "AUTH_REQUIRED", "Session ended. Please log in again.");
+          return;
+        }
+      }
+    }
+
     req.user = { id: payload.sub, role: payload.role, sessionId: payload.sid };
     next();
   } catch {

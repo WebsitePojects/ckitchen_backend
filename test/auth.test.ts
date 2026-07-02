@@ -135,6 +135,31 @@ describe("POST /api/v1/auth/logout", () => {
       .set("Authorization", `Bearer ${loginRes.body.token}`);
     expect(res.status).toBe(200);
   });
+
+  it("invalidates the token immediately after logout (SF-4 revocation)", async () => {
+    const loginRes = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD });
+    const token = loginRes.body.token;
+
+    // Token works before logout
+    const before = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${token}`);
+    expect(before.status).toBe(200);
+
+    // Log out (closes the session row)
+    await request(app)
+      .post("/api/v1/auth/logout")
+      .set("Authorization", `Bearer ${token}`);
+
+    // Same token is now rejected — not left valid until 12h expiry
+    const after = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${token}`);
+    expect(after.status).toBe(401);
+    expect(after.body.error.code).toBe("AUTH_REQUIRED");
+  });
 });
 
 describe("RBAC: requireRole", () => {

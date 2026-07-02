@@ -24,6 +24,7 @@ import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
 import { createSocketHub } from "../src/realtime/hub.js";
+import { loadConfig } from "../src/config.js";
 import { locations } from "../src/db/schema.js";
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,8 @@ beforeAll(async () => {
   // 3. Build http server + Socket.IO + hub + Express app all sharing the same server
   httpServer = createServer();
   ioServer = new IOServer(httpServer, { cors: { origin: "*" } });
-  const hub = createSocketHub(ioServer);
+  // Hub verifies handshake JWTs against the same secret the app signs with.
+  const hub = createSocketHub(ioServer, loadConfig().jwtSecret);
   const app = createApp(db, hub);
   // Attach Express as the HTTP request handler on the same server as Socket.IO
   httpServer.on("request", app);
@@ -165,8 +167,9 @@ beforeAll(async () => {
   // 10. Connect a socket.io-client to the same httpServer
   const addr = httpServer.address() as { port: number };
   clientSocket = ioc(`http://localhost:${addr.port}`, {
-    // Pass locationId so the server auto-joins the client to the location room
-    auth: { locationId },
+    // Pass a valid user JWT (required by the handshake auth middleware) plus the
+    // locationId so the server auto-joins the client to the location room.
+    auth: { token: adminToken, locationId },
     transports: ["websocket"],
   });
 
@@ -282,5 +285,42 @@ describe("order.updated + stock.updated — socket events on advance", () => {
     expect(orderUpdated.status).toBe("PREPARING");
     expect(stockUpdated.warehouseType).toBe("KITCHEN");
     expect(typeof stockUpdated.quantity).toBe("number");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: handshake authentication (SF-1)
+// ---------------------------------------------------------------------------
+
+describe("socket handshake auth — rejects unauthenticated / bad tokens", () => {
+  const addr = () => (httpServer.address() as { port: number }).port;
+
+  function expectRejected(auth: Record<string, unknown>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const s = ioc(`http://localhost:${addr()}`, { auth, transports: ["websocket"] });
+      const timer = setTimeout(() => {
+        s.disconnect();
+        reject(new Error("expected connect_error but socket connected/hung"));
+      }, 3000);
+      s.once("connect", () => {
+        clearTimeout(timer);
+        s.disconnect();
+        reject(new Error("socket connected but should have been rejected"));
+      });
+      s.once("connect_error", (err) => {
+        clearTimeout(timer);
+        s.disconnect();
+        expect(err.message).toMatch(/UNAUTHORIZED/);
+        resolve();
+      });
+    });
+  }
+
+  it("rejects a socket with no token", async () => {
+    await expectRejected({ locationId });
+  });
+
+  it("rejects a socket with a garbage token", async () => {
+    await expectRejected({ token: "not-a-real-jwt", locationId });
   });
 });

@@ -33,8 +33,8 @@ const io = new IOServer(httpServer, {
   },
 });
 
-// 3. Hub backed by the live Socket.IO server
-const hub = createSocketHub(io);
+// 3. Hub backed by the live Socket.IO server (verifies handshake JWTs)
+const hub = createSocketHub(io, config.jwtSecret);
 
 // 4. Express app with the hub injected
 const app = createApp(db, hub);

@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import type { User } from "../../db/schema.js";
+import { outletScopeForRole, type OutletScope } from "./roles.js";
 
 const BCRYPT_ROUNDS = 10;
 
@@ -9,6 +10,17 @@ export interface AuthTokenPayload {
   role: User["role"];
   /** Session id — links this token to a user_session row. */
   sid?: string;
+  /** Tenancy (D22): 'ALL' for HQ roles, else 'ASSIGNED'. Optional on legacy tokens. */
+  outlet_scope?: OutletScope;
+  /** Tenancy (D22): outlet ids the user may act in (from user_outlet_access). */
+  outlet_ids?: string[];
+}
+
+/** Options for {@link signToken}: session id + tenancy claims (D22). */
+export interface SignTokenOptions {
+  sessionId?: string;
+  outletScope?: OutletScope;
+  outletIds?: string[];
 }
 
 export async function hashPassword(plain: string): Promise<string> {
@@ -32,14 +44,26 @@ export async function fakeVerifyPassword(plain: string): Promise<void> {
   await bcrypt.compare(plain, DUMMY_HASH);
 }
 
-/** Signs a JWT carrying the user id (`sub`), role, and optional session id (`sid`). */
+/**
+ * Signs a JWT carrying the user id (`sub`), role, optional session id (`sid`),
+ * and the tenancy claims `outlet_scope`/`outlet_ids` (D22). When scope/ids are
+ * not supplied, scope defaults to the role's default (HQ→ALL, else ASSIGNED)
+ * and ids default to empty, so callers that don't care still mint a valid token.
+ */
 export function signToken(
   user: Pick<User, "id" | "role">,
   jwtSecret: string,
-  sessionId?: string,
+  opts: SignTokenOptions = {},
 ): string {
-  const payload: AuthTokenPayload = { sub: user.id, role: user.role };
-  if (sessionId) payload.sid = sessionId;
+  const outletScope = opts.outletScope ?? outletScopeForRole(user.role);
+  const outletIds = opts.outletIds ?? [];
+  const payload: AuthTokenPayload = {
+    sub: user.id,
+    role: user.role,
+    outlet_scope: outletScope,
+    outlet_ids: outletIds,
+  };
+  if (opts.sessionId) payload.sid = opts.sessionId;
   return jwt.sign(payload, jwtSecret, { algorithm: "HS256", expiresIn: "12h" });
 }
 

@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { eq } from "drizzle-orm";
 import { loadConfig } from "../../config.js";
 import { verifyToken } from "./service.js";
+import { normalizeRole, outletScopeForRole, type OutletScope } from "./roles.js";
 import { userSessions, type User } from "../../db/schema.js";
 import type { DB } from "../../db/client.js";
 
@@ -10,11 +11,24 @@ export interface AuthenticatedUser {
   role: User["role"];
   /** Session id from the JWT `sid` claim (set after login; absent for legacy tokens). */
   sessionId?: string;
+  /** Tenancy scope (D22): 'ALL' for HQ roles, else 'ASSIGNED'. */
+  outletScope: OutletScope;
+  /** Outlet ids this user may act in (JWT `outlet_ids` claim; [] if unscoped/legacy). */
+  outletIds: string[];
+}
+
+/** Resolved outlet context for a request (set by {@link resolveOutletContext}). */
+export interface OutletContext {
+  scope: OutletScope;
+  outletIds: string[];
+  /** The outlet selected via the `X-Outlet-Id` header, if present + permitted. */
+  selectedOutletId?: string;
 }
 
 declare module "express-serve-static-core" {
   interface Request {
     user?: AuthenticatedUser;
+    outletContext?: OutletContext;
   }
 }
 
@@ -28,7 +42,9 @@ function sendError(
 }
 
 /**
- * Parses `Authorization: Bearer <jwt>` and attaches `req.user = { id, role }`.
+ * Parses `Authorization: Bearer <jwt>` and attaches `req.user = { id, role, ... }`,
+ * including the tenancy claims `outletScope`/`outletIds` (D22). Legacy tokens
+ * minted before the claim existed fall back to the role's default scope + [].
  *
  * Also enforces session revocation (audit-backend.md SF-4): a token whose `sid`
  * points at a session row that is missing or has `logoutAt` set is rejected, so
@@ -69,24 +85,72 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       }
     }
 
-    req.user = { id: payload.sub, role: payload.role, sessionId: payload.sid };
+    req.user = {
+      id: payload.sub,
+      role: payload.role,
+      sessionId: payload.sid,
+      outletScope: payload.outlet_scope ?? outletScopeForRole(payload.role),
+      outletIds: Array.isArray(payload.outlet_ids) ? payload.outlet_ids : [],
+    };
     next();
   } catch {
     sendError(res, 401, "AUTH_REQUIRED", "Invalid or expired token.");
   }
 }
 
-/** 403 FORBIDDEN if `req.user.role` is not one of the allowed roles. Must run after requireAuth. */
+/**
+ * 403 FORBIDDEN if `req.user.role` is not one of the allowed roles. Must run
+ * after requireAuth. Roles v2 (D24): both the allow-list and the user's role are
+ * normalized to canonical v2 form (via ROLE_ALIASES), so a route may be written
+ * in v2 names while a still-valid v1 token (e.g. SUPER_ADMIN) keeps working, and
+ * vice-versa. RIDER (and any unknown role) normalizes to null → always denied.
+ */
 export function requireRole(...roles: User["role"][]) {
+  const allowed = new Set(
+    roles.map((r) => normalizeRole(r)).filter((r): r is User["role"] => r !== null),
+  );
   return (req: Request, res: Response, next: NextFunction): void => {
     if (!req.user) {
       sendError(res, 401, "AUTH_REQUIRED", "Authentication required.");
       return;
     }
-    if (!roles.includes(req.user.role)) {
+    const userRole = normalizeRole(req.user.role);
+    if (!userRole || !allowed.has(userRole)) {
       sendError(res, 403, "FORBIDDEN", "Role not permitted for this action.");
       return;
     }
     next();
   };
+}
+
+/**
+ * Resolves the request's outlet context from the authenticated user + the
+ * `X-Outlet-Id` header (D22). Must run after requireAuth.
+ *
+ * - No header → `req.outletContext = { scope, outletIds }` (no specific selection).
+ * - Header present → ALL-scope passes for any outlet; an ASSIGNED user must have
+ *   the id in their `outletIds` or the request is 403'd. The header is NEVER a
+ *   trusted scoping input on its own — it is membership-checked here.
+ */
+export function resolveOutletContext(req: Request, res: Response, next: NextFunction): void {
+  const user = req.user;
+  if (!user) {
+    sendError(res, 401, "AUTH_REQUIRED", "Authentication required.");
+    return;
+  }
+
+  const scope = user.outletScope;
+  const outletIds = user.outletIds ?? [];
+  const raw = req.header("X-Outlet-Id");
+  const selectedOutletId = typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+
+  if (selectedOutletId && scope !== "ALL" && !outletIds.includes(selectedOutletId)) {
+    sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+    return;
+  }
+
+  req.outletContext = selectedOutletId
+    ? { scope, outletIds, selectedOutletId }
+    : { scope, outletIds };
+  next();
 }

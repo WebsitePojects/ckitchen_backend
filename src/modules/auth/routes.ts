@@ -1,10 +1,11 @@
 import { Router } from "express";
 import { eq } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
-import { users, userSessions } from "../../db/schema.js";
+import { users, userSessions, userOutletAccess } from "../../db/schema.js";
 import { loadConfig } from "../../config.js";
 import { signToken, verifyPassword, fakeVerifyPassword } from "./service.js";
 import { requireAuth } from "./middleware.js";
+import { outletScopeForRole } from "./roles.js";
 import { audit } from "../ems/audit.js";
 
 function sendError(
@@ -58,8 +59,22 @@ export function createAuthRouter(db: DB): Router {
       .values({ userId: user.id, ip, userAgent })
       .returning();
 
+    // Tenancy claims (D22): HQ roles get ALL scope; everyone else is scoped to
+    // their user_outlet_access rows. The ids are always loaded (small at 4
+    // outlets) so an ASSIGNED user's token carries WHERE they may act.
+    const outletScope = outletScopeForRole(user.role);
+    const accessRows = await db
+      .select({ locationId: userOutletAccess.locationId })
+      .from(userOutletAccess)
+      .where(eq(userOutletAccess.userId, user.id));
+    const outletIds = accessRows.map((row) => row.locationId);
+
     const { jwtSecret } = loadConfig();
-    const token = signToken(user, jwtSecret, session.id);
+    const token = signToken(user, jwtSecret, {
+      sessionId: session.id,
+      outletScope,
+      outletIds,
+    });
 
     // Audit the login (non-blocking — errors are swallowed inside audit())
     void audit(db, {

@@ -49,7 +49,7 @@ import {
 // RBAC role sets
 // ---------------------------------------------------------------------------
 
-const REPRINT_ROLES = ["SUPER_ADMIN", "KITCHEN_STAFF"] as const;
+const REPRINT_ROLES = ["OWNER", "KITCHEN_CREW"] as const;
 
 // ---------------------------------------------------------------------------
 // Validation schemas

@@ -12,7 +12,7 @@ import {
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 
-const WRITE_ROLES = ["SUPER_ADMIN", "BRAND_MANAGER"] as const;
+const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 
 const createBrandSchema = z.object({
   name: z.string().min(1),

@@ -6,7 +6,7 @@ import { locationStatusEnum, locations, warehouses } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 
-const WRITE_ROLES = ["SUPER_ADMIN"] as const;
+const WRITE_ROLES = ["OWNER"] as const;
 
 const outletStatusValues = locationStatusEnum.enumValues;
 

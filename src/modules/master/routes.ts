@@ -20,7 +20,7 @@ import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
 
-const WRITE_ROLES = ["SUPER_ADMIN"] as const;
+const WRITE_ROLES = ["OWNER"] as const;
 
 function normalizeCode(code: string): string {
   return code.trim().toUpperCase();

@@ -32,10 +32,10 @@ import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
 import { postLedger } from "../inventory/ledger.js";
 
-const REQUESTER_ROLES = ["SUPER_ADMIN", "SUPPLIER_COORDINATOR", "WAREHOUSE", "KITCHEN_STAFF"] as const;
-const APPROVER_ROLES = ["SUPER_ADMIN"] as const;
-const PO_ROLES = ["SUPER_ADMIN", "SUPPLIER_COORDINATOR"] as const;
-const RECEIVE_ROLES = ["SUPER_ADMIN", "WAREHOUSE"] as const;
+const REQUESTER_ROLES = ["OWNER", "PURCHASING", "WAREHOUSE_OUTLET", "KITCHEN_CREW"] as const;
+const APPROVER_ROLES = ["OWNER"] as const;
+const PO_ROLES = ["OWNER", "PURCHASING"] as const;
+const RECEIVE_ROLES = ["OWNER", "WAREHOUSE_OUTLET"] as const;
 
 function docNo(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e4).toString().padStart(4, "0")}`;

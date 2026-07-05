@@ -26,7 +26,7 @@ import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { uploadMenuPhoto, ConfigError } from "../ems/cloudinary.js";
 
-const WRITE_ROLES = ["SUPER_ADMIN", "BRAND_MANAGER"] as const;
+const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 
 // MOTM 2026-07-01 fields shared by create + update.
 const imageUrlField = z.string().url().startsWith("https://").max(2048);

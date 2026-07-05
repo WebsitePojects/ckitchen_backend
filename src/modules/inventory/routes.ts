@@ -18,7 +18,7 @@
  * Task 8 — realtime emissions:
  *   stock.updated → after /inventory/receive (MAIN) and /itos/:id/confirm (KITCHEN)
  */
-import { Router, type Response } from "express";
+import { Router, type Request, type Response } from "express";
 import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
@@ -34,7 +34,7 @@ import {
   warehouseTypeEnum,
   warehouses,
 } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
@@ -44,9 +44,9 @@ import { postLedger } from "./ledger.js";
 // RBAC role sets (§1 role matrix)
 // ---------------------------------------------------------------------------
 
-const ADMIN_ONLY = ["SUPER_ADMIN"] as const;
-const INVENTORY_ROLES = ["SUPER_ADMIN", "WAREHOUSE"] as const; // receive + confirm
-const ITO_REQUEST_ROLES = ["SUPER_ADMIN", "KITCHEN_STAFF"] as const; // request + consumption
+const ADMIN_ONLY = ["OWNER"] as const;
+const INVENTORY_ROLES = ["OWNER", "WAREHOUSE_OUTLET"] as const; // receive + confirm
+const ITO_REQUEST_ROLES = ["OWNER", "KITCHEN_CREW"] as const; // request + consumption
 
 // ---------------------------------------------------------------------------
 // Validation schemas
@@ -110,8 +110,23 @@ function parseOutletIdParam(raw: unknown): string | undefined | null {
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * Resolves which outlet (location) a scoped inventory request targets, enforcing
+ * the tenancy rule (D22 / SF-5): the client-supplied `outlet_id` (and the
+ * `X-Outlet-Id` header) are NOT trusted scoping inputs on their own.
+ *
+ *   • An explicitly requested outlet (body/query `outlet_id`, else `X-Outlet-Id`)
+ *     is allowed for an ALL-scope user (benign filter), but an ASSIGNED user must
+ *     be a member of it — otherwise 403.
+ *   • With no explicit request, we fall back to the single prototype outlet
+ *     (`getDefaultLocationId`) exactly as before, so single-outlet flows are
+ *     unchanged.
+ *
+ * Requires `resolveOutletContext` to have run (so `req.outletContext` is set).
+ */
 async function resolveLocationId(
   db: DB,
+  req: Request,
   res: Response,
   rawOutletId: unknown,
 ): Promise<string | null> {
@@ -121,11 +136,20 @@ async function resolveLocationId(
     return null;
   }
 
-  if (parsedOutletId) {
+  const ctx = req.outletContext;
+  // Explicit request: the body/query param wins, else the X-Outlet-Id selection.
+  const requested = parsedOutletId ?? ctx?.selectedOutletId;
+
+  if (requested) {
+    // SF-5: an ASSIGNED user may only target outlets they are a member of.
+    if (ctx && ctx.scope !== "ALL" && !ctx.outletIds.includes(requested)) {
+      sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+      return null;
+    }
     const [location] = await db
       .select({ id: locations.id })
       .from(locations)
-      .where(eq(locations.id, parsedOutletId));
+      .where(eq(locations.id, requested));
     if (!location) {
       sendError(res, 404, "NOT_FOUND", "Outlet not found.");
       return null;
@@ -133,6 +157,7 @@ async function resolveLocationId(
     return location.id;
   }
 
+  // No explicit outlet requested → the deployment's default (single) outlet.
   const defaultLocationId = await getDefaultLocationId(db);
   if (!defaultLocationId) {
     sendError(res, 500, "NOT_FOUND", "No outlet is configured for this deployment.");
@@ -196,8 +221,8 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // -------------------------------------------------------------------------
   // GET /warehouses — list the two tiers
   // -------------------------------------------------------------------------
-  router.get("/warehouses", requireAuth, async (req, res) => {
-    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+  router.get("/warehouses", requireAuth, resolveOutletContext, async (req, res) => {
+    const locationId = await resolveLocationId(db, req, res, req.query.outlet_id);
     if (!locationId) return;
 
     const rows = await db
@@ -212,7 +237,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   //
   // Cardinal Rule #8: when qty <= low_stock_threshold the item is flagged.
   // -------------------------------------------------------------------------
-  router.get("/inventory", requireAuth, async (req, res) => {
+  router.get("/inventory", requireAuth, resolveOutletContext, async (req, res) => {
     const warehouseParam = req.query.warehouse as string | undefined;
 
     if (!warehouseParam || !["MAIN", "KITCHEN"].includes(warehouseParam)) {
@@ -225,7 +250,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    const locationId = await resolveLocationId(db, req, res, req.query.outlet_id);
     if (!locationId) return;
 
     const warehouse = await getWarehouseByType(warehouseParam as "MAIN" | "KITCHEN", locationId);
@@ -269,6 +294,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
     "/inventory/receive",
     requireAuth,
     requireRole(...INVENTORY_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = receiveSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
@@ -276,7 +302,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         return;
       }
 
-      const locationId = await resolveLocationId(db, res, parsed.data.outlet_id);
+      const locationId = await resolveLocationId(db, req, res, parsed.data.outlet_id);
       if (!locationId) return;
 
       const mainWarehouse = await getWarehouseByType("MAIN", locationId);
@@ -433,9 +459,9 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // -------------------------------------------------------------------------
   // GET /itos — list Internal Transfer Orders, optionally filter by status
   // -------------------------------------------------------------------------
-  router.get("/itos", requireAuth, async (req, res) => {
+  router.get("/itos", requireAuth, resolveOutletContext, async (req, res) => {
     const statusParam = req.query.status as string | undefined;
-    const locationId = await resolveLocationId(db, res, req.query.outlet_id);
+    const locationId = await resolveLocationId(db, req, res, req.query.outlet_id);
     if (!locationId) return;
 
     if (
@@ -478,14 +504,14 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // -------------------------------------------------------------------------
   // POST /itos — request a transfer MAIN → KITCHEN (status REQUESTED)
   // -------------------------------------------------------------------------
-  router.post("/itos", requireAuth, requireRole(...ITO_REQUEST_ROLES), async (req, res) => {
+  router.post("/itos", requireAuth, requireRole(...ITO_REQUEST_ROLES), resolveOutletContext, async (req, res) => {
     const parsed = createItoSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid ITO payload.", parsed.error.issues);
       return;
     }
 
-    const locationId = await resolveLocationId(db, res, parsed.data.outlet_id);
+    const locationId = await resolveLocationId(db, req, res, parsed.data.outlet_id);
     if (!locationId) return;
 
     const fromWarehouse = await getWarehouseByType(parsed.data.from, locationId);

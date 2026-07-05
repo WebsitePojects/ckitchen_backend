@@ -48,8 +48,8 @@ import { startSimulator, stopSimulator } from "./simulator.js";
 // RBAC role sets
 // ---------------------------------------------------------------------------
 
-const ORDER_STAGE_ROLES = ["SUPER_ADMIN", "KITCHEN_STAFF"] as const;
-const SIMULATOR_ROLES = ["SUPER_ADMIN"] as const;
+const ORDER_STAGE_ROLES = ["OWNER", "KITCHEN_CREW"] as const;
+const SIMULATOR_ROLES = ["OWNER"] as const;
 
 // ---------------------------------------------------------------------------
 // Validation schemas

@@ -27,6 +27,7 @@ import {
   users,
 } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
+import { normalizeRole } from "../auth/roles.js";
 import { sendError } from "../http-errors.js";
 import { uploadAttendancePhoto } from "./cloudinary.js";
 import { audit } from "./audit.js";
@@ -88,7 +89,7 @@ export function createEmsRouter(db: DB): Router {
   });
 
   // ── POST /employees ───────────────────────────────────────────────────────
-  router.post("/employees", requireAuth, requireRole("SUPER_ADMIN"), async (req, res) => {
+  router.post("/employees", requireAuth, requireRole("OWNER"), async (req, res) => {
     const parsed = createEmployeeSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
@@ -124,7 +125,7 @@ export function createEmsRouter(db: DB): Router {
   router.get(
     "/audit",
     requireAuth,
-    requireRole("SUPER_ADMIN", "BRAND_MANAGER"),
+    requireRole("OWNER", "BRAND_MANAGER"),
     async (req, res) => {
       const {
         actor,
@@ -162,9 +163,10 @@ export function createEmsRouter(db: DB): Router {
     const targetUserId = req.params.userId as string;
     const { from, to } = req.query as Record<string, string | undefined>;
 
-    // Only self or SUPER_ADMIN/BRAND_MANAGER can view
+    // Only self or an OWNER/BRAND_MANAGER can view (roles v2, alias-normalized).
     const isSelf = req.user!.id === targetUserId;
-    const isAdmin = req.user!.role === "SUPER_ADMIN" || req.user!.role === "BRAND_MANAGER";
+    const viewerRole = normalizeRole(req.user!.role);
+    const isAdmin = viewerRole === "OWNER" || viewerRole === "BRAND_MANAGER";
     if (!isSelf && !isAdmin) {
       sendError(res, 403, "FORBIDDEN", "Can only view your own analytics.");
       return;
@@ -287,8 +289,8 @@ export function createEmsRouter(db: DB): Router {
     const { employee_id, type, from, to } = req.query as Record<string, string | undefined>;
     const limitParam = req.query.limit as string | undefined;
 
-    if (!employee_id && req.user!.role !== "SUPER_ADMIN") {
-      sendError(res, 403, "FORBIDDEN", "Only SUPER_ADMIN may list all attendance. Filter by employee_id.");
+    if (!employee_id && normalizeRole(req.user!.role) !== "OWNER") {
+      sendError(res, 403, "FORBIDDEN", "Only an OWNER may list all attendance. Filter by employee_id.");
       return;
     }
     if (type && !(attendanceTypeEnum.enumValues as readonly string[]).includes(type)) {

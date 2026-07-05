@@ -6,7 +6,7 @@ import { kitchenStations, locations, printerConnectionEnum, printers } from "../
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { sendError } from "../http-errors.js";
 
-const WRITE_ROLES = ["SUPER_ADMIN"] as const;
+const WRITE_ROLES = ["OWNER"] as const;
 
 const createStationSchema = z.object({
   name: z.string().min(1),

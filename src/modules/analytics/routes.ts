@@ -29,7 +29,7 @@ import {
 // RBAC — CK1-API-003 §1 role matrix
 // ---------------------------------------------------------------------------
 
-const ANALYTICS_ROLES = ["SUPER_ADMIN", "BRAND_MANAGER", "ACCOUNTANT"] as const;
+const ANALYTICS_ROLES = ["OWNER", "BRAND_MANAGER", "ACCOUNTING"] as const;
 
 // ---------------------------------------------------------------------------
 // Validation schemas

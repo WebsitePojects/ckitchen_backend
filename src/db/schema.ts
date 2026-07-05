@@ -7,6 +7,7 @@ import {
   numeric,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -52,14 +53,30 @@ export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE
 
 export const warehouseTypeEnum = pgEnum("warehouse_type", ["MAIN", "KITCHEN"]);
 
+// Roles v2 (D24/D29): the enum keeps BOTH the original v1 values (as accepted
+// aliases — Postgres can't cheaply drop enum values, and legacy tokens/rows may
+// still carry them) AND the v2 values. Migration 0012 remaps existing user rows
+// v1→v2 via a fresh-type swap (an ALTER TYPE ADD VALUE cannot be used in the same
+// transaction that adds it, and the drizzle migrator wraps all pending migrations
+// in one transaction). Order below MUST match 0012's role_v2 label order.
 export const roleEnum = pgEnum("role", [
+  // --- v1 (kept as aliases) ---
   "SUPER_ADMIN",
-  "BRAND_MANAGER",
+  "BRAND_MANAGER", // shared: also a v2 role
   "KITCHEN_STAFF",
   "WAREHOUSE",
   "SUPPLIER_COORDINATOR",
   "ACCOUNTANT",
   "RIDER",
+  // --- v2 (D24) ---
+  "OWNER",
+  "OUTLET_MANAGER",
+  "KITCHEN_CREW",
+  "WAREHOUSE_MAIN",
+  "WAREHOUSE_OUTLET",
+  "PURCHASING",
+  "HR",
+  "ACCOUNTING",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -350,6 +367,35 @@ export const userBrands = pgTable(
 
 export type UserBrand = typeof userBrands.$inferSelect;
 export type NewUserBrand = typeof userBrands.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// user_outlet_access  (D22/D31 tenancy: source of truth for WHERE a user may act)
+//
+// Role = WHAT a user can do; this table = WHICH outlets. Consulted at login to
+// build the JWT `outlet_ids` claim, and by the X-Outlet-Id membership middleware.
+// HQ/ALL-scope roles (OWNER, HR, ACCOUNTING, WAREHOUSE_MAIN) ignore this table
+// for authorization, but rows may still exist for them (harmless).
+// ---------------------------------------------------------------------------
+
+export const userOutletAccess = pgTable(
+  "user_outlet_access",
+  {
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.locationId] }),
+    index("user_outlet_access_location_id_idx").on(table.locationId),
+  ],
+).enableRLS();
+
+export type UserOutletAccess = typeof userOutletAccess.$inferSelect;
+export type NewUserOutletAccess = typeof userOutletAccess.$inferInsert;
 
 // ---------------------------------------------------------------------------
 // order / order_item   (table name is the reserved word "order"; exported as `orders`)

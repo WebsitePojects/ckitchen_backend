@@ -58,7 +58,14 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   // the full policy (env override, Vercel prod + preview, local dev origins).
   const { corsOrigins } = loadConfig();
   const isOriginAllowed = createOriginAllowlist(corsOrigins);
-  app.use(cors({ origin: corsOriginCallback(isOriginAllowed) }));
+  // exposedHeaders: the reports export UI reads Content-Disposition to name the
+  // downloaded .xlsx/.pdf; a cross-origin browser hides that header unless exposed.
+  app.use(
+    cors({
+      origin: corsOriginCallback(isOriginAllowed),
+      exposedHeaders: ["Content-Disposition"],
+    }),
+  );
 
   app.use(express.json({ limit: "12mb" })); // base64 attendance photos (≤8 MB) must reach the handler, not be 413'd by the parser
   app.set("db", db);

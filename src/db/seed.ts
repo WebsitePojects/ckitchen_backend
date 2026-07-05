@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { DB } from "./client.js";
 import { runMigrations } from "./migrate.js";
 import { hashPassword } from "../modules/auth/service.js";
@@ -9,6 +9,7 @@ import {
   employees,
   kitchenStations,
   locations,
+  userOutletAccess,
   users,
   warehouses,
   type Role,
@@ -17,9 +18,13 @@ import {
 const LOCATION_CODE = "CK1";
 const LOCATION_NAME = "CloudKitchen ONE";
 
-/** Maps a system role to a department for the initial employee seed. */
+/**
+ * Maps a system role to a department for the initial employee seed. Covers both
+ * v1 (alias) and v2 role values so the map stays total over the `Role` union.
+ */
 function roleToDepartment(role: Role): typeof departmentEnum.enumValues[number] {
   const map: Record<Role, typeof departmentEnum.enumValues[number]> = {
+    // v1 aliases
     SUPER_ADMIN: "ADMIN",
     BRAND_MANAGER: "SALES",
     KITCHEN_STAFF: "KITCHEN",
@@ -27,6 +32,15 @@ function roleToDepartment(role: Role): typeof departmentEnum.enumValues[number] 
     SUPPLIER_COORDINATOR: "PURCHASING",
     ACCOUNTANT: "ACCOUNTING",
     RIDER: "SALES",
+    // v2 (D24)
+    OWNER: "ADMIN",
+    OUTLET_MANAGER: "ADMIN",
+    KITCHEN_CREW: "KITCHEN",
+    WAREHOUSE_MAIN: "WAREHOUSE",
+    WAREHOUSE_OUTLET: "WAREHOUSE",
+    PURCHASING: "PURCHASING",
+    HR: "ADMIN",
+    ACCOUNTING: "ACCOUNTING",
   };
   return map[role] ?? "ADMIN";
 }
@@ -35,16 +49,6 @@ const STATION_NAMES = ["Grill", "Fry", "Prep", "Beverage", "Packing"] as const;
 
 const ADMIN_CREDENTIAL = { email: "admin@cloudkitchen.local", password: "admin123" };
 
-const ROLES: Role[] = [
-  "SUPER_ADMIN",
-  "BRAND_MANAGER",
-  "KITCHEN_STAFF",
-  "WAREHOUSE",
-  "SUPPLIER_COORDINATOR",
-  "ACCOUNTANT",
-  "RIDER",
-];
-
 interface SeededUser {
   name: string;
   email: string;
@@ -52,14 +56,23 @@ interface SeededUser {
   role: Role;
 }
 
-function roleUserCredential(role: Role): SeededUser {
-  return {
-    name: `${role} User`,
-    email: `${role.toLowerCase()}@cloudkitchen.local`,
-    password: "password123",
-    role,
-  };
-}
+/**
+ * One user per v2 role (D24). Emails for the roles that existed in v1 keep their
+ * historical address (e.g. kitchen_staff@, warehouse@, supplier_coordinator@,
+ * accountant@) so tokens/tests that log in by those addresses keep working — the
+ * ROLE is v2 even though the local-part echoes the old name.
+ */
+const SEED_USERS: SeededUser[] = [
+  { name: "Admin", email: ADMIN_CREDENTIAL.email, password: ADMIN_CREDENTIAL.password, role: "OWNER" },
+  { name: "Outlet Manager", email: "outlet_manager@cloudkitchen.local", password: "password123", role: "OUTLET_MANAGER" },
+  { name: "Brand Manager", email: "brand_manager@cloudkitchen.local", password: "password123", role: "BRAND_MANAGER" },
+  { name: "Kitchen Crew", email: "kitchen_staff@cloudkitchen.local", password: "password123", role: "KITCHEN_CREW" },
+  { name: "Warehouse Main", email: "warehouse_main@cloudkitchen.local", password: "password123", role: "WAREHOUSE_MAIN" },
+  { name: "Warehouse Outlet", email: "warehouse@cloudkitchen.local", password: "password123", role: "WAREHOUSE_OUTLET" },
+  { name: "Purchasing", email: "supplier_coordinator@cloudkitchen.local", password: "password123", role: "PURCHASING" },
+  { name: "HR", email: "hr@cloudkitchen.local", password: "password123", role: "HR" },
+  { name: "Accounting", email: "accountant@cloudkitchen.local", password: "password123", role: "ACCOUNTING" },
+];
 
 /**
  * Idempotently seeds: 1 location, 5 kitchen stations linked to it, one user per
@@ -113,11 +126,8 @@ export async function seed(db: DB): Promise<SeededUser[]> {
     }
   }
 
-  // --- users: admin + one per role (idempotent on email) ----------------
-  const seededCreds: SeededUser[] = [
-    { name: "Admin", email: ADMIN_CREDENTIAL.email, password: ADMIN_CREDENTIAL.password, role: "SUPER_ADMIN" },
-    ...ROLES.map(roleUserCredential),
-  ];
+  // --- users: one per v2 role (idempotent on email) ---------------------
+  const seededCreds: SeededUser[] = SEED_USERS;
 
   for (const candidate of seededCreds) {
     const [existing] = await db.select().from(users).where(eq(users.email, candidate.email));
@@ -128,6 +138,28 @@ export async function seed(db: DB): Promise<SeededUser[]> {
         passwordHash: await hashPassword(candidate.password),
         role: candidate.role,
       });
+    }
+  }
+
+  // --- user_outlet_access: grant every seeded user the pilot outlet ------
+  // (D22/D31) — source of truth for WHERE a user may act. ALL-scope roles don't
+  // need a row for authorization, but a row is harmless and keeps the pilot data
+  // consistent. Idempotent on (user_id, location_id).
+  const seededEmails = seededCreds.map((c) => c.email);
+  const seededUserRows = await db.select().from(users);
+  for (const usr of seededUserRows) {
+    if (!seededEmails.includes(usr.email)) continue;
+    const [existingAccess] = await db
+      .select()
+      .from(userOutletAccess)
+      .where(
+        and(
+          eq(userOutletAccess.userId, usr.id),
+          eq(userOutletAccess.locationId, location.id),
+        ),
+      );
+    if (!existingAccess) {
+      await db.insert(userOutletAccess).values({ userId: usr.id, locationId: location.id });
     }
   }
 

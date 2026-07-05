@@ -125,6 +125,37 @@ export type Brand = typeof brands.$inferSelect;
 export type NewBrand = typeof brands.$inferInsert;
 
 // ---------------------------------------------------------------------------
+// brand_outlet  (D30 many-to-many: a brand may operate in 2+ outlets)
+//
+// TRANSITION STATE: `brand.location_id` is KEPT as the brand's "home" outlet.
+// This table records the FULL set of outlets a brand is deployed to. Each brand
+// gets one active row for its home outlet (backfilled in migration 0015 + on
+// create). Deactivation is a soft `is_active = false`, never a hard delete, so
+// the deployment history stays audit-friendly.
+// ---------------------------------------------------------------------------
+
+export const brandOutlet = pgTable(
+  "brand_outlet",
+  {
+    brandId: uuid("brand_id")
+      .notNull()
+      .references(() => brands.id, { onDelete: "cascade" }),
+    locationId: uuid("location_id")
+      .notNull()
+      .references(() => locations.id, { onDelete: "cascade" }),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.brandId, table.locationId] }),
+    index("brand_outlet_location_id_idx").on(table.locationId),
+  ],
+).enableRLS();
+
+export type BrandOutlet = typeof brandOutlet.$inferSelect;
+export type NewBrandOutlet = typeof brandOutlet.$inferInsert;
+
+// ---------------------------------------------------------------------------
 // aggregator_account
 // ---------------------------------------------------------------------------
 

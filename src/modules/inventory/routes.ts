@@ -35,6 +35,7 @@ import {
   warehouses,
 } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { isOutletInScope } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
@@ -138,7 +139,27 @@ async function resolveLocationId(
 
   const ctx = req.outletContext;
   // Explicit request: the body/query param wins, else the X-Outlet-Id selection.
-  const requested = parsedOutletId ?? ctx?.selectedOutletId;
+  let requested = parsedOutletId ?? ctx?.selectedOutletId;
+
+  // M1: an ASSIGNED user who names NO outlet must resolve to their OWN outlet —
+  // never the deployment's "first location row" (a membership bypass). One
+  // assigned outlet → use it; several → force an explicit choice; none → deny.
+  if (!requested && ctx && ctx.scope !== "ALL") {
+    if (ctx.outletIds.length === 1) {
+      requested = ctx.outletIds[0];
+    } else if (ctx.outletIds.length === 0) {
+      sendError(res, 403, "FORBIDDEN", "No outlet in your access scope.");
+      return null;
+    } else {
+      sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Multiple outlets in your access scope; specify one via 'outlet_id' or the X-Outlet-Id header.",
+      );
+      return null;
+    }
+  }
 
   if (requested) {
     // SF-5: an ASSIGNED user may only target outlets they are a member of.
@@ -157,7 +178,7 @@ async function resolveLocationId(
     return location.id;
   }
 
-  // No explicit outlet requested → the deployment's default (single) outlet.
+  // ALL-scope (or no ctx) with no explicit selection → deployment default outlet.
   const defaultLocationId = await getDefaultLocationId(db);
   if (!defaultLocationId) {
     sendError(res, 500, "NOT_FOUND", "No outlet is configured for this deployment.");
@@ -582,12 +603,26 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
     "/itos/:id/confirm",
     requireAuth,
     requireRole(...INVENTORY_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const id = paramAsString(req.params.id);
 
       const [ito] = await db.select().from(itos).where(eq(itos.id, id));
       if (!ito) {
         sendError(res, 404, "NOT_FOUND", "ITO not found.");
+        return;
+      }
+
+      // H4: membership-check the ITO's own outlet. Both warehouses share one
+      // location in this model (POST /itos resolves from/to at the same outlet),
+      // so the source warehouse's location is the ITO's outlet. ALL-scope passes;
+      // an ASSIGNED caller outside that outlet is 403'd — no cross-outlet stock move.
+      const [itoWarehouse] = await db
+        .select({ locationId: warehouses.locationId })
+        .from(warehouses)
+        .where(eq(warehouses.id, ito.fromWarehouseId));
+      if (!isOutletInScope(req.outletContext, itoWarehouse?.locationId)) {
+        sendError(res, 403, "FORBIDDEN", "ITO is outside your access scope.");
         return;
       }
 

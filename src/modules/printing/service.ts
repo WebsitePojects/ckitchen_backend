@@ -16,7 +16,7 @@
  * without an extra DB round-trip.
  */
 import { randomBytes } from "node:crypto";
-import { and, eq, asc, inArray } from "drizzle-orm";
+import { and, eq, asc, inArray, getTableColumns } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
   kitchenStations,
@@ -337,13 +337,20 @@ export async function updatePrinterStatuses(
 // ---------------------------------------------------------------------------
 
 /**
- * List print jobs with optional status filter.
+ * List print jobs with an optional status filter.
  * Used by the web app for monitoring and reprint management.
+ *
+ * H3 tenancy: `locationIds` restricts to jobs whose owning outlet (via
+ * print_job → kitchen_station → location) is in the set. `undefined` = no
+ * location filter (ALL-scope); `[]` = caller has no outlets in scope → empty.
+ * The join is unambiguous today because every print_job.station_id is NOT NULL.
  */
 export async function listPrintJobs(
   db: DB,
-  filters: { status?: string },
+  filters: { status?: string; locationIds?: string[] },
 ): Promise<PrintJob[]> {
+  const conditions = [];
+
   if (filters.status) {
     const validStatuses = printJobStatusEnum.enumValues as readonly string[];
     if (!validStatuses.includes(filters.status)) {
@@ -351,14 +358,21 @@ export async function listPrintJobs(
         `Invalid status filter. Valid values: ${validStatuses.join(", ")}.`,
       );
     }
-    return db
-      .select()
-      .from(printJobs)
-      .where(eq(printJobs.status, filters.status as PrintJob["status"]))
-      .orderBy(asc(printJobs.createdAt));
+    conditions.push(eq(printJobs.status, filters.status as PrintJob["status"]));
   }
 
-  return db.select().from(printJobs).orderBy(asc(printJobs.createdAt));
+  if (filters.locationIds !== undefined) {
+    if (filters.locationIds.length === 0) return [];
+    conditions.push(inArray(kitchenStations.locationId, filters.locationIds));
+  }
+
+  // getTableColumns keeps the flat PrintJob[] shape even with the station join.
+  return db
+    .select(getTableColumns(printJobs))
+    .from(printJobs)
+    .innerJoin(kitchenStations, eq(printJobs.stationId, kitchenStations.id))
+    .where(conditions.length ? and(...conditions) : undefined)
+    .orderBy(asc(printJobs.createdAt));
 }
 
 // ---------------------------------------------------------------------------

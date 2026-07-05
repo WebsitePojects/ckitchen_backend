@@ -32,7 +32,8 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { locations, kitchenStations, printJobs } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { requireAgentToken, requireBootstrapToken } from "./agent-auth.js";
@@ -244,11 +245,17 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
   });
 
   // ── GET /print-jobs ────────────────────────────────────────────────────
-  router.get("/print-jobs", requireAuth, async (req, res) => {
+  // H3: outlet-scoped. ALL-scope sees every outlet's KOTs (optionally narrowed
+  // by X-Outlet-Id); an ASSIGNED user sees only jobs at outlets they belong to
+  // (join print_job → kitchen_station → location).
+  router.get("/print-jobs", requireAuth, resolveOutletContext, async (req, res) => {
     const { status } = req.query as Record<string, string | undefined>;
 
     try {
-      const jobs = await listPrintJobs(db, { status });
+      const jobs = await listPrintJobs(db, {
+        status,
+        locationIds: listScopeLocationIds(req.outletContext) ?? undefined,
+      });
       res.json(jobs);
     } catch (err) {
       handleServiceError(err, res);
@@ -260,10 +267,20 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
     "/print-jobs/:id/reprint",
     requireAuth,
     requireRole(...REPRINT_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const id = paramAsString(req.params.id);
 
       try {
+        // H3: block cross-outlet reprint — a physical print injected into another
+        // outlet's station. resolvePrintJobLocationId throws NOT_FOUND for a
+        // missing job (mapped to 404); an out-of-scope job is 403'd.
+        const jobLocationId = await resolvePrintJobLocationId(db, id);
+        if (!isOutletInScope(req.outletContext, jobLocationId)) {
+          sendError(res, 403, "FORBIDDEN", "Print job is outside your access scope.");
+          return;
+        }
+
         const newJob = await reprintJob(db, id);
         res.status(201).json(newJob);
 

@@ -27,7 +27,8 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { aggregatorEnum, brands, locations, orderStatusEnum, orders } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
@@ -166,7 +167,9 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   });
 
   // ── GET /orders ────────────────────────────────────────────────────────
-  router.get("/orders", requireAuth, async (req, res) => {
+  // H2: outlet-scoped. ALL-scope sees every outlet (optionally narrowed by
+  // X-Outlet-Id); an ASSIGNED user sees only orders at outlets they belong to.
+  router.get("/orders", requireAuth, resolveOutletContext, async (req, res) => {
     const { brand_id, aggregator, station_id, from, to } = req.query as Record<
       string,
       string | undefined
@@ -210,6 +213,7 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         status: statuses,
         from,
         to,
+        location_ids: listScopeLocationIds(req.outletContext) ?? undefined,
       });
       res.json(rows);
     } catch (err) {
@@ -218,10 +222,22 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   });
 
   // ── GET /orders/:id ────────────────────────────────────────────────────
-  router.get("/orders/:id", requireAuth, async (req, res) => {
+  // H2: 403 when the order's outlet is outside the caller's scope (consistent
+  // with inventory's membership 403). Order-not-found still returns 404.
+  router.get("/orders/:id", requireAuth, resolveOutletContext, async (req, res) => {
     const id = paramAsString(req.params.id);
 
     try {
+      const orderLocationId = await getLocationIdForOrder(db, id);
+      if (!orderLocationId) {
+        sendError(res, 404, "NOT_FOUND", "Order not found.");
+        return;
+      }
+      if (!isOutletInScope(req.outletContext, orderLocationId)) {
+        sendError(res, 403, "FORBIDDEN", "Order is outside your access scope.");
+        return;
+      }
+
       const detail = await getOrderDetail(db, id);
       if (!detail) {
         sendError(res, 404, "NOT_FOUND", "Order not found.");
@@ -242,10 +258,24 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     "/orders/:id/advance",
     requireAuth,
     requireRole(...ORDER_STAGE_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const id = paramAsString(req.params.id);
 
       try {
+        // H2: block cross-outlet advance BEFORE the service runs — advancing
+        // NEW→PREPARING deducts real stock, so an outside-scope caller must be
+        // stopped here, not after the deduction.
+        const orderLocationId = await getLocationIdForOrder(db, id);
+        if (!orderLocationId) {
+          sendError(res, 404, "NOT_FOUND", "Order not found.");
+          return;
+        }
+        if (!isOutletInScope(req.outletContext, orderLocationId)) {
+          sendError(res, 403, "FORBIDDEN", "Order is outside your access scope.");
+          return;
+        }
+
         // FIX A — pass the authenticated user id so consumption_log.logged_by is set
         const result = await advanceOrder(db, id, req.user?.id);
         res.json(result);
@@ -294,11 +324,24 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     "/orders/:id/cancel",
     requireAuth,
     requireRole(...ORDER_STAGE_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const id = paramAsString(req.params.id);
       const reason = typeof req.body?.reason === "string" ? req.body.reason : "";
 
       try {
+        // H2: block cross-outlet cancel (cancel-after-PREPARING posts compensating
+        // restock — a foreign caller must not move another outlet's stock).
+        const orderLocationId = await getLocationIdForOrder(db, id);
+        if (!orderLocationId) {
+          sendError(res, 404, "NOT_FOUND", "Order not found.");
+          return;
+        }
+        if (!isOutletInScope(req.outletContext, orderLocationId)) {
+          sendError(res, 403, "FORBIDDEN", "Order is outside your access scope.");
+          return;
+        }
+
         const result = await cancelOrder(db, id, reason);
         res.json(result);
 

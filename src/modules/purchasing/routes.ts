@@ -27,7 +27,8 @@ import {
   suppliers,
   warehouses,
 } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
 import { postLedger } from "../inventory/ledger.js";
@@ -323,7 +324,7 @@ export function createPurchasingRouter(db: DB): Router {
 
   // ── Receiving (posts stock ledger IN to MAIN) ───────────────────────────────
 
-  router.post("/purchase-orders/:id/receive", requireAuth, requireRole(...RECEIVE_ROLES), async (req, res) => {
+  router.post("/purchase-orders/:id/receive", requireAuth, requireRole(...RECEIVE_ROLES), resolveOutletContext, async (req, res) => {
     const id = paramAsString(req.params.id);
     const parsed = receiveSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -358,9 +359,22 @@ export function createPurchasingRouter(db: DB): Router {
       }
     }
 
-    const [mainWarehouse] = await db.select().from(warehouses).where(eq(warehouses.type, "MAIN"));
+    // H6: the purchase_order table has NO location column, so the target outlet is
+    // DERIVED from the receiving user's outlet scope (documented choice): an
+    // ASSIGNED warehouse user credits THEIR outlet's MAIN; an ALL-scope user uses
+    // X-Outlet-Id (or the single-outlet default). This closes the bug where receiving
+    // credited the FIRST MAIN warehouse globally regardless of who received where.
+    // resolveRequestLocationId applies the M1 membership rules (single-outlet
+    // fallback / 400 on ambiguity / 403 on non-member).
+    const locationId = await resolveRequestLocationId(db, req, res, undefined);
+    if (!locationId) return;
+
+    const [mainWarehouse] = await db
+      .select()
+      .from(warehouses)
+      .where(and(eq(warehouses.type, "MAIN"), eq(warehouses.locationId, locationId)));
     if (!mainWarehouse) {
-      sendError(res, 500, "NOT_FOUND", "MAIN warehouse not configured.");
+      sendError(res, 500, "NOT_FOUND", "MAIN warehouse not configured for this outlet.");
       return;
     }
 

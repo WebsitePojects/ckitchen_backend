@@ -583,11 +583,15 @@ export async function advanceOrder(
           // Tagged with orderId so cancelOrder can look up the exact amounts and
           // restock from this record (not from the current recipe, which may have
           // changed since the order was placed).
+          // L4c — also stamp the warehouse we deducted FROM, so cancelOrder restocks
+          // that exact warehouse instead of re-deriving via brand→location (which
+          // would credit the wrong outlet if the brand's home location later moved).
           await tx.insert(consumptionLogs).values({
             ingredientId: line.ingredientId,
             quantity: String(qtyToDeduct),
             loggedBy: userId ?? null,
             orderId,
+            warehouseId: kitchenWarehouse.id,
           });
 
           // ERP R1: post ORDER_DEDUCTION OUT ledger row (same tx, atomic)
@@ -716,38 +720,49 @@ export async function cancelOrder(
         .where(eq(consumptionLogs.orderId, orderId));
 
       if (logRows.length > 0) {
-        // Symmetric to advanceOrder: restock THIS ORDER'S outlet KITCHEN only,
-        // derived from the brand's home location. Restocking "the first KITCHEN
-        // warehouse" would credit outlet-1 for stock deducted from outlet-2.
-        const [orderBrand] = await tx
-          .select({ locationId: brands.locationId })
-          .from(brands)
-          .where(eq(brands.id, order.brandId));
-        if (!orderBrand) throw new Error("Order's brand not found.");
+        // L4c — restock the EXACT warehouse each deduction hit, read straight off
+        // the consumption_log row (advanceOrder now stamps warehouse_id). This is
+        // strictly more correct than re-deriving via brand→location and cheaper
+        // (no extra query). Legacy rows written before L4c have a null warehouse_id;
+        // for those we fall back to the order's own outlet KITCHEN warehouse.
+        let fallbackKitchenWarehouseId: string | null = null;
+        const resolveFallback = async (): Promise<string> => {
+          if (fallbackKitchenWarehouseId) return fallbackKitchenWarehouseId;
+          const [orderBrand] = await tx
+            .select({ locationId: brands.locationId })
+            .from(brands)
+            .where(eq(brands.id, order.brandId));
+          if (!orderBrand) throw new Error("Order's brand not found.");
+          const [kitchenWarehouse] = await tx
+            .select({ id: warehouses.id })
+            .from(warehouses)
+            .where(
+              and(
+                eq(warehouses.type, "KITCHEN"),
+                eq(warehouses.locationId, orderBrand.locationId),
+              ),
+            );
+          if (!kitchenWarehouse) {
+            throw new Error("KITCHEN warehouse not configured for this outlet.");
+          }
+          fallbackKitchenWarehouseId = kitchenWarehouse.id;
+          return kitchenWarehouse.id;
+        };
 
-        const [kitchenWarehouse] = await tx
-          .select()
-          .from(warehouses)
-          .where(
-            and(
-              eq(warehouses.type, "KITCHEN"),
-              eq(warehouses.locationId, orderBrand.locationId),
-            ),
-          );
-
-        if (!kitchenWarehouse) {
-          throw new Error("KITCHEN warehouse not configured for this outlet.");
-        }
-
-        // Aggregate per ingredient (a single ingredient may appear in multiple log rows
-        // if the order had multiple line items using the same ingredient)
-        const restockByIngredient = new Map<string, number>();
+        // Aggregate per (warehouse, ingredient) — a single ingredient may appear in
+        // multiple log rows, and (defensively) across warehouses.
+        const restockByWarehouseIngredient = new Map<string, number>();
         for (const row of logRows) {
-          const prev = restockByIngredient.get(row.ingredientId) ?? 0;
-          restockByIngredient.set(row.ingredientId, prev + Number(row.quantity));
+          const warehouseId = row.warehouseId ?? (await resolveFallback());
+          const key = `${warehouseId}|${row.ingredientId}`;
+          restockByWarehouseIngredient.set(
+            key,
+            (restockByWarehouseIngredient.get(key) ?? 0) + Number(row.quantity),
+          );
         }
 
-        for (const [ingredientId, qtyToRestore] of restockByIngredient.entries()) {
+        for (const [key, qtyToRestore] of restockByWarehouseIngredient.entries()) {
+          const [warehouseId, ingredientId] = key.split("|");
           await tx
             .update(inventoryStock)
             .set({
@@ -755,7 +770,7 @@ export async function cancelOrder(
             })
             .where(
               and(
-                eq(inventoryStock.warehouseId, kitchenWarehouse.id),
+                eq(inventoryStock.warehouseId, warehouseId),
                 eq(inventoryStock.ingredientId, ingredientId),
               ),
             );
@@ -766,7 +781,7 @@ export async function cancelOrder(
             sourceDocumentNo: orderId,
             sourceLineNo: ingredientId,
             ingredientId,
-            warehouseId: kitchenWarehouse.id,
+            warehouseId,
             movementType: "IN",
             quantity: qtyToRestore,
           });
@@ -805,10 +820,30 @@ export async function listOrders(
     status?: string | string[];
     from?: string;
     to?: string;
+    /**
+     * H2 tenancy: restrict to orders whose outlet (brand.location_id, W3b pattern)
+     * is in this set. `undefined` = no location filter (ALL-scope, all outlets);
+     * `[]` = caller has no outlets in scope → empty result.
+     */
+    location_ids?: string[];
   },
 ): Promise<(typeof orders.$inferSelect)[]> {
   // Build WHERE conditions on the orders table
   const conditions: ReturnType<typeof eq>[] = [];
+
+  // H2 — outlet scoping. Derive the order's outlet via order→brand.location_id and
+  // keep only orders at an in-scope outlet. Resolving brand ids first keeps the
+  // return shape a flat orders[] (no join reshaping).
+  if (filters.location_ids !== undefined) {
+    if (filters.location_ids.length === 0) return [];
+    const brandRows = await db
+      .select({ id: brands.id })
+      .from(brands)
+      .where(inArray(brands.locationId, filters.location_ids));
+    const brandIds = brandRows.map((b) => b.id);
+    if (brandIds.length === 0) return [];
+    conditions.push(inArray(orders.brandId, brandIds));
+  }
 
   if (filters.brand_id) conditions.push(eq(orders.brandId, filters.brand_id));
   if (filters.aggregator) {

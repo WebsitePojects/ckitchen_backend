@@ -51,6 +51,12 @@ describe("Multi-outlet inventory isolation", () => {
   let outletAId: string;
   let outletBId: string;
   let outletBItoId: string;
+  // M1: granting these users a SECOND outlet makes them multi-outlet, so an
+  // omitted outlet_id now 400s (ambiguous). Keep those 2-outlet tokens LOCAL to
+  // this block — the shared warehouseToken/kitchenToken stay single-outlet so the
+  // later single-outlet blocks (which omit outlet_id) keep resolving to the seed.
+  let warehouseTokenB: string;
+  let kitchenTokenB: string;
 
   beforeAll(async () => {
     const ingredientRes = await request(app)
@@ -94,14 +100,15 @@ describe("Multi-outlet inventory isolation", () => {
     await db.insert(userOutletAccess).values(
       scopedUsers.map((u) => ({ userId: u.id, locationId: outletBId })),
     );
-    warehouseToken = await login("warehouse@cloudkitchen.local", "password123");
-    kitchenToken = await login("kitchen_staff@cloudkitchen.local", "password123");
+    // Re-login to pick up the new outlet_ids — into BLOCK-LOCAL tokens (see note above).
+    warehouseTokenB = await login("warehouse@cloudkitchen.local", "password123");
+    kitchenTokenB = await login("kitchen_staff@cloudkitchen.local", "password123");
   });
 
   it("receives stock into a specific outlet MAIN without changing another outlet", async () => {
     await request(app)
       .post("/api/v1/inventory/receive")
-      .set("Authorization", `Bearer ${warehouseToken}`)
+      .set("Authorization", `Bearer ${warehouseTokenB}`)
       .send({
         outlet_id: outletAId,
         items: [{ ingredient_id: ingredientId, quantity: 10 }],
@@ -109,7 +116,7 @@ describe("Multi-outlet inventory isolation", () => {
 
     await request(app)
       .post("/api/v1/inventory/receive")
-      .set("Authorization", `Bearer ${warehouseToken}`)
+      .set("Authorization", `Bearer ${warehouseTokenB}`)
       .send({
         outlet_id: outletBId,
         items: [{ ingredient_id: ingredientId, quantity: 30 }],
@@ -132,7 +139,7 @@ describe("Multi-outlet inventory isolation", () => {
   it("creates and confirms an ITO inside one outlet without touching the other outlet", async () => {
     const itoRes = await request(app)
       .post("/api/v1/itos")
-      .set("Authorization", `Bearer ${kitchenToken}`)
+      .set("Authorization", `Bearer ${kitchenTokenB}`)
       .send({
         outlet_id: outletBId,
         from: "MAIN",
@@ -144,7 +151,7 @@ describe("Multi-outlet inventory isolation", () => {
 
     const confirmRes = await request(app)
       .post(`/api/v1/itos/${outletBItoId}/confirm`)
-      .set("Authorization", `Bearer ${warehouseToken}`);
+      .set("Authorization", `Bearer ${warehouseTokenB}`);
     expect(confirmRes.status).toBe(200);
 
     const outletAMain = await request(app)

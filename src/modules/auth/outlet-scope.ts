@@ -23,8 +23,41 @@ import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { locations } from "../../db/schema.js";
 import { sendError } from "../http-errors.js";
+import type { OutletContext } from "./middleware.js";
 
 const locationIdSchema = z.string().uuid();
+
+/**
+ * Row-level tenancy gate (D22) reused by every module that resolves a resource's
+ * own outlet (order→brand.location_id, print_job→station.location_id,
+ * ito→warehouse.location_id, …) and must decide whether the caller may see/act on
+ * it. ALL-scope sees every outlet; an ASSIGNED caller only outlets in `outletIds`.
+ * A missing context (should not happen after `resolveOutletContext`) fails CLOSED.
+ */
+export function isOutletInScope(
+  ctx: OutletContext | undefined,
+  locationId: string | null | undefined,
+): boolean {
+  if (!ctx || !locationId) return false;
+  if (ctx.scope === "ALL") return true;
+  return ctx.outletIds.includes(locationId);
+}
+
+/**
+ * The set of location ids a LIST endpoint should be narrowed to for this caller,
+ * or `null` meaning "no location filter" (ALL-scope with no X-Outlet-Id selection).
+ *   • ALL scope: `null` normally; `[selectedOutletId]` if an X-Outlet-Id filter is set.
+ *   • ASSIGNED : the caller's `outletIds`, intersected with X-Outlet-Id when present
+ *     (membership already enforced by resolveOutletContext, so the selection is safe).
+ */
+export function listScopeLocationIds(ctx: OutletContext | undefined): string[] | null {
+  if (!ctx) return []; // fail closed → empty result set
+  if (ctx.scope === "ALL") {
+    return ctx.selectedOutletId ? [ctx.selectedOutletId] : null;
+  }
+  if (ctx.selectedOutletId) return [ctx.selectedOutletId];
+  return ctx.outletIds;
+}
 
 /** undefined = not supplied, null = supplied but malformed, string = valid uuid. */
 function parseLocationIdParam(raw: unknown): string | undefined | null {
@@ -54,7 +87,28 @@ export async function resolveRequestLocationId(
 
   const ctx = req.outletContext;
   // Explicit request: an explicit body `location_id` wins, else the X-Outlet-Id selection.
-  const requested = parsedLocationId ?? ctx?.selectedOutletId;
+  let requested = parsedLocationId ?? ctx?.selectedOutletId;
+
+  // M1: an ASSIGNED user who names NO outlet must resolve to their OWN outlet —
+  // never the deployment's "first location row" (a membership bypass when that
+  // default is an outlet they don't belong to). One assigned outlet → use it;
+  // several → force an explicit choice; none → deny.
+  if (!requested && ctx && ctx.scope !== "ALL") {
+    if (ctx.outletIds.length === 1) {
+      requested = ctx.outletIds[0];
+    } else if (ctx.outletIds.length === 0) {
+      sendError(res, 403, "FORBIDDEN", "No outlet in your access scope.");
+      return null;
+    } else {
+      sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Multiple outlets in your access scope; specify one via the X-Outlet-Id header.",
+      );
+      return null;
+    }
+  }
 
   if (requested) {
     // An ASSIGNED user may only target outlets they are a member of.
@@ -73,7 +127,7 @@ export async function resolveRequestLocationId(
     return location.id;
   }
 
-  // No explicit outlet requested → the deployment's default (single) outlet.
+  // ALL-scope (or no ctx) with no explicit selection → deployment default outlet.
   const defaultLocationId = await getDefaultLocationId(db);
   if (!defaultLocationId) {
     sendError(res, 500, "NOT_FOUND", "No outlet is configured for this deployment.");

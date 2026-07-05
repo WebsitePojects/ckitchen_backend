@@ -23,7 +23,8 @@ import request from "supertest";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
-import { createSocketHub } from "../src/realtime/hub.js";
+import { randomUUID } from "node:crypto";
+import { createSocketHub, type RealtimeHub } from "../src/realtime/hub.js";
 import { loadConfig } from "../src/config.js";
 import { locations } from "../src/db/schema.js";
 
@@ -34,6 +35,7 @@ import { locations } from "../src/db/schema.js";
 let db: DB;
 let httpServer: HttpServer;
 let ioServer: IOServer;
+let hub: RealtimeHub;
 let clientSocket: Socket;
 let locationId: string;
 let adminToken: string;
@@ -85,8 +87,9 @@ beforeAll(async () => {
   // 3. Build http server + Socket.IO + hub + Express app all sharing the same server
   httpServer = createServer();
   ioServer = new IOServer(httpServer, { cors: { origin: "*" } });
-  // Hub verifies handshake JWTs against the same secret the app signs with.
-  const hub = createSocketHub(ioServer, loadConfig().jwtSecret);
+  // Hub verifies handshake JWTs against the same secret the app signs with,
+  // plus session revocation (H1) — so it needs the db handle.
+  hub = createSocketHub(ioServer, loadConfig().jwtSecret, db);
   const app = createApp(db, hub);
   // Attach Express as the HTTP request handler on the same server as Socket.IO
   httpServer.on("request", app);
@@ -322,5 +325,90 @@ describe("socket handshake auth — rejects unauthenticated / bad tokens", () =>
 
   it("rejects a socket with a garbage token", async () => {
     await expectRejected({ token: "not-a-real-jwt", locationId });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H1 — per-room join authorization + handshake session revocation
+// ---------------------------------------------------------------------------
+
+describe("socket join authorization (H1)", () => {
+  const url = () => `http://localhost:${(httpServer.address() as { port: number }).port}`;
+
+  async function connect(auth: Record<string, unknown>): Promise<Socket> {
+    const s = ioc(url(), { auth, transports: ["websocket"] });
+    await new Promise<void>((resolve, reject) => {
+      s.once("connect", resolve);
+      s.once("connect_error", reject);
+      setTimeout(() => reject(new Error("connect timed out")), 5000);
+    });
+    return s;
+  }
+
+  it("ASSIGNED socket cannot join a room outside its outlet_ids (rejected, no events)", async () => {
+    // warehouse@ = WAREHOUSE_OUTLET (ASSIGNED to the seeded outlet only).
+    const foreignRoom = randomUUID();
+    const s = await connect({ token: warehouseToken }); // no auto-join locationId
+
+    // The explicit join for a non-member outlet must be refused.
+    const rejected = waitForEvent<{ code: string; locationId: string }>(s, "join_rejected");
+    s.emit("join", foreignRoom);
+    const evt = await rejected;
+    expect(evt.code).toBe("FORBIDDEN");
+    expect(evt.locationId).toBe(foreignRoom);
+
+    // And it must NOT receive events broadcast to that foreign room.
+    let leaked = false;
+    s.once("order.created", () => {
+      leaked = true;
+    });
+    hub.emitToLocation(foreignRoom, "order.created", { order_id: "leak-check" });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(leaked).toBe(false);
+
+    s.disconnect();
+  });
+
+  it("ASSIGNED socket CAN join its own outlet room and receives its events", async () => {
+    const s = await connect({ token: warehouseToken, locationId }); // auto-join own outlet
+    let received = false;
+    s.once("stock.updated", () => {
+      received = true;
+    });
+    hub.emitToLocation(locationId, "stock.updated", { ingredientId: "ok" });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(received).toBe(true);
+    s.disconnect();
+  });
+
+  it("rejects a handshake whose session has been revoked (logout)", async () => {
+    // Fresh login → new session; logging out closes THAT session only.
+    const loginRes = await request(httpServer)
+      .post("/api/v1/auth/login")
+      .send({ email: "warehouse@cloudkitchen.local", password: "password123" });
+    const revokedToken = loginRes.body.token as string;
+
+    await request(httpServer)
+      .post("/api/v1/auth/logout")
+      .set("Authorization", `Bearer ${revokedToken}`);
+
+    await new Promise<void>((resolve, reject) => {
+      const s = ioc(url(), { auth: { token: revokedToken, locationId }, transports: ["websocket"] });
+      const timer = setTimeout(() => {
+        s.disconnect();
+        reject(new Error("expected connect_error but socket connected/hung"));
+      }, 3000);
+      s.once("connect", () => {
+        clearTimeout(timer);
+        s.disconnect();
+        reject(new Error("revoked token connected but should have been rejected"));
+      });
+      s.once("connect_error", (err) => {
+        clearTimeout(timer);
+        s.disconnect();
+        expect(err.message).toMatch(/UNAUTHORIZED/);
+        resolve();
+      });
+    });
   });
 });

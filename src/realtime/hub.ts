@@ -15,18 +15,30 @@
  * Auth: every socket MUST present a valid user JWT in `handshake.auth.token`
  * (the same token used for REST). Anonymous sockets are rejected at handshake —
  * this closes the hole where any client could join a location room and receive
- * live order/stock/print events. NOTE: per-room OUTLET authorization is not yet
- * enforced here because the JWT does not carry outlet claims yet (pending ADR
- * D22 `user_outlet_access` + outlet claims). Once it does, the `join` handler
- * must validate the requested locationId against the authenticated user's
- * allowed outlets. Tracked in docs/audits/audit-backend.md (CRITICAL #1/#3).
+ * live order/stock/print events.
+ *
+ * H1 (Fable review 2026-07-05) — the outlet claims that were "pending" now exist:
+ *   1. Handshake also enforces SESSION REVOCATION (mirrors REST requireAuth /
+ *      SF-4): a token whose `sid` points at a missing or logged-out session is
+ *      rejected, so a stolen token stops streaming events the moment its session
+ *      ends (not up to 12h later at token expiry).
+ *   2. Room joins (auto-join via handshake `auth.locationId` AND the dynamic
+ *      `join` event) are AUTHORIZED against the socket's own token: an ALL-scope
+ *      user may join any location room; an ASSIGNED user only rooms in its
+ *      `outlet_ids`. A disallowed join is refused (a `join_rejected` event is
+ *      emitted and the socket is NOT added to the room), so it never receives
+ *      another outlet's live order/stock/print events.
  *
  * Design principle (CK1-ARC-002 §6): services remain PURE and return domain
  * events; route handlers call the hub after the service call succeeds.  The hub
  * is injected so tests that call `createApp(db)` get a noop hub automatically.
  */
 import type { Server as IOServer } from "socket.io";
-import { verifyToken } from "../modules/auth/service.js";
+import { eq } from "drizzle-orm";
+import type { DB } from "../db/client.js";
+import { userSessions } from "../db/schema.js";
+import { verifyToken, type AuthTokenPayload } from "../modules/auth/service.js";
+import { outletScopeForRole } from "../modules/auth/roles.js";
 
 // ---------------------------------------------------------------------------
 // Interface
@@ -46,51 +58,98 @@ export interface RealtimeHub {
 // ---------------------------------------------------------------------------
 
 /**
+ * True if a socket's authenticated user may join `locationId`'s room: ALL-scope
+ * users may join any outlet; ASSIGNED users only rooms in their `outlet_ids`.
+ * Legacy tokens without an `outlet_scope` claim fall back to the role default.
+ */
+function canJoinLocation(user: AuthTokenPayload, locationId: string): boolean {
+  const scope = user.outlet_scope ?? outletScopeForRole(user.role);
+  if (scope === "ALL") return true;
+  const ids = Array.isArray(user.outlet_ids) ? user.outlet_ids : [];
+  return ids.includes(locationId);
+}
+
+/**
  * Builds a hub backed by a live Socket.IO `Server`.
  *
  * Side-effect: registers a handshake auth middleware and a `connection` handler
  * on the `io` instance that:
- *   0. Rejects any socket without a valid user JWT in `handshake.auth.token`.
+ *   0. Rejects any socket without a valid user JWT in `handshake.auth.token`, or
+ *      whose session has been revoked (logout / admin close) — H1.
  *   1. Auto-joins clients to their location room if they supplied
- *      `auth.locationId` in the Socket.IO handshake.
- *   2. Handles an explicit `join` event so clients can switch rooms dynamically.
+ *      `auth.locationId` AND are authorized for it (H1).
+ *   2. Handles an explicit `join` event, also membership-checked (H1).
  *
  * @param jwtSecret  Secret used to verify the handshake token (same as REST).
+ * @param db         DB handle for the handshake session-revocation check.
  * CORS / transport config is the caller's responsibility (see server.ts).
  */
-export function createSocketHub(io: IOServer, jwtSecret: string): RealtimeHub {
+export function createSocketHub(io: IOServer, jwtSecret: string, db: DB): RealtimeHub {
   // Handshake authentication — runs before `connection`. A socket that does not
-  // present a verifiable user JWT never reaches the connection handler, so it
-  // cannot join any room or receive any event.
+  // present a verifiable, non-revoked user JWT never reaches the connection
+  // handler, so it cannot join any room or receive any event.
   io.use((socket, next) => {
-    const token = socket.handshake.auth?.token as string | undefined;
-    if (!token) {
-      next(new Error("UNAUTHORIZED: missing auth token"));
-      return;
-    }
-    try {
-      socket.data.user = verifyToken(token, jwtSecret);
+    void (async () => {
+      const token = socket.handshake.auth?.token as string | undefined;
+      if (!token) {
+        next(new Error("UNAUTHORIZED: missing auth token"));
+        return;
+      }
+      let payload: AuthTokenPayload;
+      try {
+        payload = verifyToken(token, jwtSecret);
+      } catch {
+        next(new Error("UNAUTHORIZED: invalid auth token"));
+        return;
+      }
+
+      // H1 — session revocation, same rule as REST requireAuth (SF-4). A token
+      // whose `sid` row is missing or has `logoutAt` set is rejected. Any DB
+      // error fails CLOSED (reject), never crashes the handshake.
+      if (payload.sid) {
+        try {
+          const [session] = await db
+            .select({ logoutAt: userSessions.logoutAt })
+            .from(userSessions)
+            .where(eq(userSessions.id, payload.sid));
+          if (!session || session.logoutAt !== null) {
+            next(new Error("UNAUTHORIZED: session ended"));
+            return;
+          }
+        } catch {
+          next(new Error("UNAUTHORIZED: session check failed"));
+          return;
+        }
+      }
+
+      socket.data.user = payload;
       next();
-    } catch {
-      next(new Error("UNAUTHORIZED: invalid auth token"));
-    }
+    })();
   });
 
   io.on("connection", (socket) => {
-    // Auto-join via handshake auth (preferred — set before connect())
-    const authLocationId = socket.handshake.auth?.locationId as string | undefined;
-    if (authLocationId) {
-      void socket.join(authLocationId);
-    }
+    const user = socket.data.user as AuthTokenPayload | undefined;
 
-    // Dynamic join event (useful for clients that know the locationId at runtime)
-    // TODO(D22): validate `locationId` against socket.data.user's allowed outlets
-    // once the JWT carries outlet claims.
-    socket.on("join", (locationId: unknown) => {
-      if (typeof locationId === "string" && locationId.length > 0) {
-        void socket.join(locationId);
+    // Attempt to join `locationId` if the socket's user is authorized; otherwise
+    // refuse and tell the client (H1). Never silently join a foreign room.
+    const tryJoin = (locationId: unknown): void => {
+      if (typeof locationId !== "string" || locationId.length === 0) return;
+      if (!user || !canJoinLocation(user, locationId)) {
+        socket.emit("join_rejected", {
+          code: "FORBIDDEN",
+          locationId: typeof locationId === "string" ? locationId : null,
+          message: "Outlet not in your access scope.",
+        });
+        return;
       }
-    });
+      void socket.join(locationId);
+    };
+
+    // Auto-join via handshake auth (preferred — set before connect())
+    tryJoin(socket.handshake.auth?.locationId);
+
+    // Dynamic join event (clients that know/switch the locationId at runtime)
+    socket.on("join", (locationId: unknown) => tryJoin(locationId));
   });
 
   return {

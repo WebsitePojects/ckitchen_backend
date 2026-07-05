@@ -31,6 +31,15 @@ import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   const app = express();
 
+  // H5 (Fable review 2026-07-05): trust exactly ONE proxy hop. In prod the API sits
+  // behind Render/Nginx, so without this `req.ip` is the proxy's address and the login
+  // rate-limiter keys every user into a SINGLE shared bucket → one attacker (or a burst
+  // of legit logins) locks out the whole platform. `1` makes Express read the real
+  // client from the last X-Forwarded-For entry. NOT `true`: trusting the entire XFF
+  // chain lets a client spoof its IP and trips express-rate-limit's
+  // ERR_ERL_PERMISSIVE_TRUST_PROXY safety guard.
+  app.set("trust proxy", 1);
+
   // SF-3 (audit-backend.md HIGH "no helmet"): security headers. CSP is mostly
   // inert for a JSON-only API (no HTML/script is ever served), but img-src is
   // widened for res.cloudinary.com so any future HTML surface (docs, admin

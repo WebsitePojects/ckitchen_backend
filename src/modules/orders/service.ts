@@ -498,13 +498,31 @@ export async function advanceOrder(
     // Deduction runs here ONLY because the conditional update above succeeded —
     // guaranteeing exactly-once deduction even under concurrent advance calls.
     if (next === "PREPARING") {
-      // Locate the KITCHEN warehouse (single location prototype)
+      // Locate THIS ORDER'S KITCHEN warehouse. Cardinal rule: an outlet owns its
+      // own inventory — deduction must hit the KITCHEN warehouse of the order's
+      // own outlet, never "the first KITCHEN warehouse" globally (which would let
+      // an outlet-2 order deduct outlet-1 stock). The order's outlet is derived
+      // from its brand's home location (D30 transition: orders still key on
+      // brand.location_id; see 0015 migration header).
+      const [orderBrand] = await tx
+        .select({ locationId: brands.locationId })
+        .from(brands)
+        .where(eq(brands.id, order.brandId));
+      if (!orderBrand) throw new Error("Order's brand not found.");
+
       const [kitchenWarehouse] = await tx
         .select()
         .from(warehouses)
-        .where(eq(warehouses.type, "KITCHEN"));
+        .where(
+          and(
+            eq(warehouses.type, "KITCHEN"),
+            eq(warehouses.locationId, orderBrand.locationId),
+          ),
+        );
 
-      if (!kitchenWarehouse) throw new Error("KITCHEN warehouse not configured.");
+      if (!kitchenWarehouse) {
+        throw new Error("KITCHEN warehouse not configured for this outlet.");
+      }
 
       // Load all order items for this order
       const items = await tx
@@ -698,12 +716,28 @@ export async function cancelOrder(
         .where(eq(consumptionLogs.orderId, orderId));
 
       if (logRows.length > 0) {
+        // Symmetric to advanceOrder: restock THIS ORDER'S outlet KITCHEN only,
+        // derived from the brand's home location. Restocking "the first KITCHEN
+        // warehouse" would credit outlet-1 for stock deducted from outlet-2.
+        const [orderBrand] = await tx
+          .select({ locationId: brands.locationId })
+          .from(brands)
+          .where(eq(brands.id, order.brandId));
+        if (!orderBrand) throw new Error("Order's brand not found.");
+
         const [kitchenWarehouse] = await tx
           .select()
           .from(warehouses)
-          .where(eq(warehouses.type, "KITCHEN"));
+          .where(
+            and(
+              eq(warehouses.type, "KITCHEN"),
+              eq(warehouses.locationId, orderBrand.locationId),
+            ),
+          );
 
-        if (!kitchenWarehouse) throw new Error("KITCHEN warehouse not configured.");
+        if (!kitchenWarehouse) {
+          throw new Error("KITCHEN warehouse not configured for this outlet.");
+        }
 
         // Aggregate per ingredient (a single ingredient may appear in multiple log rows
         // if the order had multiple line items using the same ingredient)

@@ -139,6 +139,12 @@ export const aggregatorAccounts = pgTable(
     externalMerchantId: text("external_merchant_id").notNull(),
     credentialRef: text("credential_ref"),
     isActive: boolean("is_active").notNull().default(true),
+    /**
+     * W3 (D33 #10): aggregator commission, percent (0-100). NULL = not yet
+     * configured — the sales report treats NULL as 0 (gross == net) until the
+     * client supplies real per-listing rates (CLIENT_QUESTIONS Part 2).
+     */
+    commissionRate: numeric("commission_rate", { precision: 5, scale: 2 }),
   },
   (table) => [index("aggregator_account_brand_id_idx").on(table.brandId)],
 ).enableRLS();

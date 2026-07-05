@@ -1,14 +1,16 @@
 /**
- * Printing Router — CK1-API-003 §8
+ * Printing Router — CK1-API-003 §8 / SF-2 (audit-backend.md CRITICAL #2)
  *
  * Agent endpoints (X-Agent-Token, NOT user JWT):
- *   POST /agent/register                 — agent self-registration
- *   GET  /agent/print-jobs/pending       — pull pending jobs for ?location_id=<uuid>,
- *                                           oldest-first (§8.3 shape). Outlet-scoped:
- *                                           requires a print_agent already registered
- *                                           for that location (audit-db.md §3).
- *   POST /agent/print-jobs/:id/ack       — ack PRINTED | FAILED (§8.4)
- *   POST /agent/printers/status          — heartbeat, updates printer status
+ *   POST /agent/register                 — bootstrap-secret gated (requireBootstrapToken);
+ *                                           mints + returns a fresh per-agent token (once).
+ *   GET  /agent/print-jobs/pending        — per-agent-token gated (requireAgentToken);
+ *                                           location comes ONLY from req.agent.locationId,
+ *                                           oldest-first (§8.3 shape).
+ *   POST /agent/print-jobs/:id/ack        — ack PRINTED | FAILED (§8.4); 403 if the job's
+ *                                           station is outside req.agent.locationId.
+ *   POST /agent/printers/status           — heartbeat; 403 if any printer is outside
+ *                                           req.agent.locationId.
  *
  * User endpoints (JWT + RBAC, per §1 role matrix):
  *   GET  /print-jobs?status=...          — monitoring/reprint list
@@ -18,7 +20,8 @@
  *   Read (GET /print-jobs)    — any authenticated user
  *   Write (reprint)           — SUPER_ADMIN | KITCHEN_STAFF
  *
- * The agent endpoints use requireAgentToken exclusively — no user JWT accepted.
+ * Every agent endpoint uses ONE of requireBootstrapToken (register only) or
+ * requireAgentToken (everything else) — never a user JWT (agent-auth.ts).
  *
  * Task 8 — realtime emissions:
  *   print.status   → after agent ack (PRINTED | FAILED) and after reprint (new PENDING)
@@ -32,7 +35,7 @@ import { locations, kitchenStations, printJobs } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
-import { requireAgentToken } from "./agent-auth.js";
+import { requireAgentToken, requireBootstrapToken } from "./agent-auth.js";
 import {
   PrintNotFoundError,
   PrintValidationError,
@@ -41,7 +44,8 @@ import {
   listPrintJobs,
   registerAgent,
   reprintJob,
-  resolveAgentLocationId,
+  resolvePrintJobLocationId,
+  resolvePrinterLocationId,
   updatePrinterStatuses,
 } from "./service.js";
 
@@ -128,7 +132,11 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
   const router = Router();
 
   // ── POST /agent/register ───────────────────────────────────────────────
-  router.post("/agent/register", requireAgentToken, async (req, res) => {
+  // The ONE pre-identity agent endpoint (SF-2): gated by the shared bootstrap
+  // AGENT_TOKEN secret, NOT a per-agent token (the agent has none yet). Mints
+  // a fresh per-agent token and returns it RAW, once — the agent persists it
+  // and uses it (not AGENT_TOKEN) for every other agent endpoint below.
+  router.post("/agent/register", requireBootstrapToken, async (req, res) => {
     const parsed = registerAgentSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid agent registration payload.", parsed.error.issues);
@@ -144,26 +152,14 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
   });
 
   // ── GET /agent/print-jobs/pending ──────────────────────────────────────
-  // Outlet-scoped (audit-db.md §3): the agent must identify its own location
-  // via ?location_id=<uuid> (the same location_id it sent to /agent/register).
-  // The service verifies a print_agent row is actually registered for that
-  // location before returning anything — an agent cannot pull another
-  // outlet's queue by guessing a different location_id.
+  // SF-2: location is derived ONLY from the authenticated agent's own
+  // req.agent.locationId (set by requireAgentToken from the token_hash
+  // lookup) — never from a client-supplied query/body field. This closes the
+  // audit-db.md §3 hole where an agent could pull another outlet's queue by
+  // simply passing a different ?location_id=.
   router.get("/agent/print-jobs/pending", requireAgentToken, async (req, res) => {
-    const locationId = req.query.location_id;
-    if (typeof locationId !== "string" || locationId.length === 0) {
-      sendError(
-        res,
-        400,
-        "VALIDATION_ERROR",
-        "location_id query parameter is required (register the agent first via /agent/register).",
-      );
-      return;
-    }
-
     try {
-      const scopedLocationId = await resolveAgentLocationId(db, locationId);
-      const jobs = await listPendingJobs(db, scopedLocationId);
+      const jobs = await listPendingJobs(db, req.agent!.locationId);
       res.json(jobs);
     } catch (err) {
       handleServiceError(err, res);
@@ -181,6 +177,14 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
     }
 
     try {
+      // SF-2: 403 if this job's station belongs to a DIFFERENT location than
+      // the acking agent's own — an agent may only ack its own outlet's jobs.
+      const jobLocationId = await resolvePrintJobLocationId(db, id);
+      if (jobLocationId !== req.agent!.locationId) {
+        sendError(res, 403, "FORBIDDEN", "Print job belongs to a different location.");
+        return;
+      }
+
       const updated = await ackJob(db, id, parsed.data);
       res.json(updated);
 
@@ -210,19 +214,29 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
     }
 
     try {
+      // SF-2: verify EVERY printer in the batch belongs to the reporting
+      // agent's own location before applying ANY update — a printer with no
+      // resolvable station (unassigned/unknown) is treated as unverifiable
+      // and denied, not silently allowed.
+      for (const p of parsed.data.printers) {
+        const ownerLocationId = await resolvePrinterLocationId(db, p.printer_id);
+        if (ownerLocationId !== req.agent!.locationId) {
+          sendError(res, 403, "FORBIDDEN", `Printer ${p.printer_id} is not in your agent's location.`);
+          return;
+        }
+      }
+
       const result = await updatePrinterStatuses(db, parsed.data.printers);
       res.json(result);
 
       // Task 8: emit printer.status for each updated printer
-      const locationId = await getDefaultLocationId(db);
-      if (locationId) {
-        for (const p of parsed.data.printers) {
-          hub.emitToLocation(locationId, "printer.status", {
-            printer_id: p.printer_id,
-            status: p.status,
-            last_seen: p.last_seen,
-          });
-        }
+      const locationId = req.agent!.locationId;
+      for (const p of parsed.data.printers) {
+        hub.emitToLocation(locationId, "printer.status", {
+          printer_id: p.printer_id,
+          status: p.status,
+          last_seen: p.last_seen,
+        });
       }
     } catch (err) {
       handleServiceError(err, res);

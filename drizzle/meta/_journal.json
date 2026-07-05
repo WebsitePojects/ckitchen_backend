@@ -92,6 +92,13 @@
       "when": 1783100000000,
       "tag": "0012_roles_v2_and_user_outlet_access",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1783200000000,
+      "tag": "0013_print_agent_token_hash",
+      "breakpoints": true
     }
   ]
 }

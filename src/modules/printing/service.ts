@@ -15,7 +15,8 @@
  * so the route handler (and future Task 8 realtime hub) can emit `print.status`
  * without an extra DB round-trip.
  */
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { randomBytes } from "node:crypto";
+import { and, eq, asc, inArray } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
   kitchenStations,
@@ -27,7 +28,7 @@ import {
   type PrintJob,
   type NewPrintJob,
 } from "../../db/schema.js";
-import { loadConfig } from "../../config.js";
+import { hashAgentToken } from "./agent-auth.js";
 
 // ---------------------------------------------------------------------------
 // Custom error classes (mirrors orders/service.ts pattern)
@@ -82,22 +83,38 @@ export interface PrinterStatusUpdate {
   last_seen: string; // ISO-8601
 }
 
+export interface RegisterAgentResult {
+  ok: boolean;
+  agent_id: string;
+  agent_name: string;
+  location_id: string;
+  /** RAW token — shown ONCE, here, and never again (only its sha256 is persisted). */
+  token: string;
+}
+
 // ---------------------------------------------------------------------------
-// registerAgent — POST /agent/register
+// registerAgent — POST /agent/register  (SF-2: per-agent hashed token)
 // ---------------------------------------------------------------------------
 
 /**
- * Upsert a print_agent row for the given location.
- * The "upsert" is simplified: insert if no row exists for this token+location,
- * otherwise update name + last_seen. For the prototype a single global agent
- * is expected (one location).
+ * Mints a fresh per-agent token bound to one location and persists only its
+ * sha256 hash (never the raw value — see agent-auth.ts `hashAgentToken`).
+ *
+ * "Re-registration" behavior: upserts on (location_id, agent_name) — calling
+ * register again with the same name+location ROTATES that agent's token (the
+ * old one stops matching any `token_hash` immediately). This is the intended
+ * recovery path after this security change ships: a deployed .NET agent that
+ * only knows the old shared `AGENT_TOKEN` gets 401s from `pending`/`ack`/
+ * `printers/status` (their token was never hashed into any row) until it
+ * calls `/agent/register` again — still gated by the shared bootstrap secret
+ * — captures the NEW raw `token` from this response, and uses THAT for every
+ * subsequent request. A brand-new agent_name+location_id combination instead
+ * inserts a new row (new agent identity).
  */
 export async function registerAgent(
   db: DB,
   input: { agent_name: string; location_id: string },
-): Promise<{ ok: boolean; agent_name: string; location_id: string }> {
-  const { agentToken } = loadConfig();
-
+): Promise<RegisterAgentResult> {
   // Check location exists
   const [location] = await db
     .select()
@@ -108,76 +125,89 @@ export async function registerAgent(
     throw new PrintNotFoundError(`Location ${input.location_id} not found.`);
   }
 
-  // Upsert: look for existing agent row for this token + location
+  const rawToken = randomBytes(32).toString("hex"); // 256 bits, deterministically hashable
+  const tokenHash = hashAgentToken(rawToken);
+
+  // Upsert: look for an existing agent row for this name + location (rotates its token).
   const [existing] = await db
     .select()
     .from(printAgents)
     .where(
       and(
-        eq(printAgents.apiToken, agentToken),
+        eq(printAgents.name, input.agent_name),
         eq(printAgents.locationId, input.location_id),
       ),
     );
 
+  let agentId: string;
   if (existing) {
     await db
       .update(printAgents)
-      .set({ name: input.agent_name, lastSeen: new Date() })
+      .set({ tokenHash, lastSeen: new Date() })
       .where(eq(printAgents.id, existing.id));
+    agentId = existing.id;
   } else {
-    await db.insert(printAgents).values({
-      locationId: input.location_id,
-      apiToken: agentToken,
-      name: input.agent_name,
-      lastSeen: new Date(),
-    });
+    const [inserted] = await db
+      .insert(printAgents)
+      .values({
+        locationId: input.location_id,
+        tokenHash,
+        name: input.agent_name,
+        lastSeen: new Date(),
+      })
+      .returning({ id: printAgents.id });
+    agentId = inserted.id;
   }
 
-  return { ok: true, agent_name: input.agent_name, location_id: input.location_id };
+  return {
+    ok: true,
+    agent_id: agentId,
+    agent_name: input.agent_name,
+    location_id: input.location_id,
+    token: rawToken,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// resolveAgentLocationId — outlet-scoping helper for the print pull loop
+// Location-ownership resolvers — SF-2 cross-location authorization
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves which location a print agent is authorized to pull for.
- *
- * Tenancy note (audit-db.md §3, "Service-layer leak found while auditing"):
- * `print_agent` already carries `location_id` (migration 0003). The pull
- * endpoint must use it so an agent registered for outlet 2 can never see
- * outlet 1's KOTs, even though all agents currently share one global
- * `X-Agent-Token` secret (per-agent tokens are a follow-up, audit §8 builder
- * task 6). The caller supplies `location_id` (required query param — the
- * agent knows its own location from its `/agent/register` call, which
- * already takes `{ agent_name, location_id }` per CK1-API-003 §8.1); this
- * helper verifies a `print_agent` row is actually registered for that
- * location before the pull is allowed to proceed, so an unregistered/guessed
- * location_id cannot be used to read another outlet's queue.
+ * Resolves the location a print job belongs to via print_job -> kitchen_station
+ * (station_id is NOT NULL / FK-enforced, so a found job always has a station).
+ * Used by `ack` to 403 an agent acting on a job outside its own location —
+ * NOT the same as routes.ts's realtime-emit helper, which falls back to a
+ * "default location" for best-effort event routing; an authorization check
+ * must never use that fallback (it would incorrectly grant/deny access).
  */
-export async function resolveAgentLocationId(
-  db: DB,
-  locationId: string,
-): Promise<string> {
-  const [location] = await db
-    .select({ id: locations.id })
-    .from(locations)
-    .where(eq(locations.id, locationId));
-  if (!location) {
-    throw new PrintNotFoundError(`Location ${locationId} not found.`);
-  }
+export async function resolvePrintJobLocationId(db: DB, jobId: string): Promise<string> {
+  const [job] = await db.select({ stationId: printJobs.stationId }).from(printJobs).where(eq(printJobs.id, jobId));
+  if (!job) throw new PrintNotFoundError(`Print job ${jobId} not found.`);
 
-  const [agent] = await db
-    .select({ id: printAgents.id })
-    .from(printAgents)
-    .where(eq(printAgents.locationId, locationId));
-  if (!agent) {
-    throw new PrintValidationError(
-      `No print agent is registered for location ${locationId}. Call /agent/register first.`,
-    );
-  }
+  const [station] = await db
+    .select({ locationId: kitchenStations.locationId })
+    .from(kitchenStations)
+    .where(eq(kitchenStations.id, job.stationId));
+  if (!station) throw new PrintNotFoundError(`Print job ${jobId} not found.`);
 
-  return locationId;
+  return station.locationId;
+}
+
+/**
+ * Resolves the location a printer belongs to, via whichever kitchen_station
+ * has it as its default_printer_id. Returns null when no station references
+ * it (unassigned / unknown printer) — callers should treat that as "cannot
+ * verify this printer belongs to your location" and deny, not silently allow.
+ * (Edge case: if a printer were ever wired as the default for stations in TWO
+ * different locations, this returns the first match — not expected by the
+ * current data model, where a printer belongs to one station/location.)
+ */
+export async function resolvePrinterLocationId(db: DB, printerId: string): Promise<string | null> {
+  const [station] = await db
+    .select({ locationId: kitchenStations.locationId })
+    .from(kitchenStations)
+    .where(eq(kitchenStations.defaultPrinterId, printerId));
+  return station?.locationId ?? null;
 }
 
 // ---------------------------------------------------------------------------

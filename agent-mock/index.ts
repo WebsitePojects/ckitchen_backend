@@ -10,16 +10,22 @@
  *   - Each pending job: log KOT → POST /agent/print-jobs/{id}/ack  {status:"PRINTED"}
  *   - Every ~10 s   : POST /agent/printers/status         (heartbeat)
  *
+ * SF-2 (audit-backend.md CRITICAL #2) rollout note — TWO DIFFERENT tokens now:
+ *   1. BOOTSTRAP_AGENT_TOKEN (env `AGENT_TOKEN`) — the shared install-time
+ *      secret, used ONLY for the one `POST /agent/register` call.
+ *   2. The per-agent token returned RAW in that register response — captured
+ *      here and used for every OTHER agent call (pending/ack/heartbeat). It is
+ *      never persisted to disk in this mock (kept in memory only); the real
+ *      .NET agent should persist it (e.g. DPAPI-protected local file) so it
+ *      survives a restart without needing the bootstrap secret again — though
+ *      re-registering is always safe (it simply rotates the token).
+ *
  * Configuration (environment variables):
  *   BASE_URL     — API base URL (default: http://localhost:4000/api/v1)
- *   AGENT_TOKEN  — value for X-Agent-Token header        (default: test-agent-token)
- *   LOCATION_ID  — outlet this agent pulls jobs for (uuid, REQUIRED). The pull
- *                  endpoint is outlet-scoped (audit-db.md §3): the agent
- *                  registers for this location on startup, then every poll
- *                  declares it via ?location_id=, and the server verifies a
- *                  print_agent row is actually registered there before
- *                  returning any jobs — an agent can only ever see its own
- *                  outlet's queue.
+ *   AGENT_TOKEN  — bootstrap secret for /agent/register ONLY (default: test-agent-token)
+ *   LOCATION_ID  — outlet this agent registers for (uuid, REQUIRED). Every other
+ *                  agent endpoint derives its outlet scope from the per-agent
+ *                  token itself (server-side), not from anything this mock sends.
  *
  * Run:
  *   LOCATION_ID=<uuid> npx tsx agent-mock/index.ts
@@ -27,7 +33,7 @@
  */
 
 const BASE_URL = (process.env["BASE_URL"] ?? "http://localhost:4000/api/v1").replace(/\/$/, "");
-const AGENT_TOKEN = process.env["AGENT_TOKEN"] ?? "test-agent-token";
+const BOOTSTRAP_AGENT_TOKEN = process.env["AGENT_TOKEN"] ?? "test-agent-token";
 const LOCATION_ID = process.env["LOCATION_ID"];
 
 if (!LOCATION_ID) {
@@ -40,21 +46,33 @@ if (!LOCATION_ID) {
 const POLL_INTERVAL_MS = 1500;  // §8.1: every ~1.5 s
 const HEARTBEAT_INTERVAL_MS = 10_000; // §8.1: every ~10 s
 
+// Set once by register() at startup — the per-agent token minted for THIS
+// agent+location, used for every call except /agent/register itself.
+let agentToken: string | undefined;
+
 // ---------------------------------------------------------------------------
 // Minimal fetch helpers (Node 18+ built-in fetch)
 // ---------------------------------------------------------------------------
 
-function agentHeaders(): Record<string, string> {
+function agentHeaders(token: string): Record<string, string> {
   return {
     "Content-Type": "application/json",
-    "X-Agent-Token": AGENT_TOKEN,
+    "X-Agent-Token": token,
   };
 }
 
-async function getJson<T>(path: string): Promise<T> {
+/** Per-agent-token header for post-registration calls. Throws if called before register(). */
+function requireAgentHeaders(): Record<string, string> {
+  if (!agentToken) {
+    throw new Error("agent token not set — register() must succeed before polling/ack/heartbeat");
+  }
+  return agentHeaders(agentToken);
+}
+
+async function getJson<T>(path: string, headers: Record<string, string>): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "GET",
-    headers: agentHeaders(),
+    headers,
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -63,10 +81,10 @@ async function getJson<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
+async function postJson<T>(path: string, body: unknown, headers: Record<string, string>): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: "POST",
-    headers: agentHeaders(),
+    headers,
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -145,9 +163,7 @@ function printKot(job: PendingJob): void {
 async function pollPrintJobs(): Promise<void> {
   let jobs: PendingJob[];
   try {
-    jobs = await getJson<PendingJob[]>(
-      `/agent/print-jobs/pending?location_id=${encodeURIComponent(LOCATION_ID!)}`,
-    );
+    jobs = await getJson<PendingJob[]>("/agent/print-jobs/pending", requireAgentHeaders());
   } catch (err) {
     console.warn(`[agent] poll failed: ${(err as Error).message}`);
     return;
@@ -160,16 +176,17 @@ async function pollPrintJobs(): Promise<void> {
   for (const job of jobs) {
     try {
       printKot(job);
-      await postJson(`/agent/print-jobs/${job.id}/ack`, { status: "PRINTED" });
+      await postJson(`/agent/print-jobs/${job.id}/ack`, { status: "PRINTED" }, requireAgentHeaders());
       console.log(`[agent] ACK PRINTED  ${job.id.slice(0, 8)}…`);
     } catch (err) {
       const errMsg = (err as Error).message;
       console.error(`[agent] print failed for ${job.id.slice(0, 8)}…: ${errMsg}`);
       try {
-        await postJson(`/agent/print-jobs/${job.id}/ack`, {
-          status: "FAILED",
-          error: errMsg,
-        });
+        await postJson(
+          `/agent/print-jobs/${job.id}/ack`,
+          { status: "FAILED", error: errMsg },
+          requireAgentHeaders(),
+        );
         console.log(`[agent] ACK FAILED   ${job.id.slice(0, 8)}…`);
       } catch (ackErr) {
         console.error(`[agent] ACK failed too: ${(ackErr as Error).message}`);
@@ -184,11 +201,33 @@ async function pollPrintJobs(): Promise<void> {
 
 async function sendHeartbeat(): Promise<void> {
   try {
-    await postJson("/agent/printers/status", { printers: [] });
+    await postJson("/agent/printers/status", { printers: [] }, requireAgentHeaders());
     console.log(`[agent] heartbeat sent`);
   } catch (err) {
     console.warn(`[agent] heartbeat failed: ${(err as Error).message}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Register — POST /agent/register (bootstrap secret) → mints the per-agent token
+// ---------------------------------------------------------------------------
+
+interface RegisterResponse {
+  ok: boolean;
+  agent_id: string;
+  agent_name: string;
+  location_id: string;
+  token: string;
+}
+
+async function register(): Promise<void> {
+  const result = await postJson<RegisterResponse>(
+    "/agent/register",
+    { agent_name: "Mock Agent", location_id: LOCATION_ID },
+    agentHeaders(BOOTSTRAP_AGENT_TOKEN),
+  );
+  agentToken = result.token; // SF-2: from here on, use THIS, never the bootstrap secret
+  console.log(`[agent] registered as ${result.agent_id} for location ${result.location_id}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -202,10 +241,8 @@ async function main(): Promise<void> {
   console.log(`[agent] Poll every  : ${POLL_INTERVAL_MS} ms`);
   console.log(`[agent] Heartbeat   : every ${HEARTBEAT_INTERVAL_MS} ms`);
 
-  // Register before polling — the pull endpoint is outlet-scoped and 400s
-  // until a print_agent row exists for this location.
-  await postJson("/agent/register", { agent_name: "Mock Agent", location_id: LOCATION_ID });
-  console.log(`[agent] registered for location ${LOCATION_ID}`);
+  // Register before polling — mints the per-agent token every other call uses.
+  await register();
   console.log(`[agent] Press Ctrl+C to stop\n`);
 
   // Start polling

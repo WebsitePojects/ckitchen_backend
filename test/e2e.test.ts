@@ -37,6 +37,10 @@ let adminToken: string;
 let kitchenToken: string;
 let warehouseToken: string;
 let locationId: string; // seeded CK1 location — pilot agent is registered here
+// SF-2: per-agent token minted by /agent/register — used for every pending/ack/
+// heartbeat call below. The shared bootstrap secret ("test-agent-token") is
+// ONLY valid for the register call itself; see beforeAll.
+let agentToken: string;
 
 // Ids resolved from the pilot seed
 let brandIds: Record<string, string>;
@@ -51,12 +55,9 @@ function nextRef(prefix = "E2E"): string {
   return `${prefix}-${Date.now()}-${++_refSeq}`;
 }
 
-/** GET /agent/print-jobs/pending scoped to the pilot's single location (outlet-scoped pull). */
-function getPending(agentToken: string) {
-  return request(app)
-    .get("/api/v1/agent/print-jobs/pending")
-    .query({ location_id: locationId })
-    .set("X-Agent-Token", agentToken);
+/** GET /agent/print-jobs/pending using the pilot agent's own per-agent token (SF-2: location is derived from the token). */
+function getPending(token: string) {
+  return request(app).get("/api/v1/agent/print-jobs/pending").set("X-Agent-Token", token);
 }
 
 async function login(email: string, password: string): Promise<string> {
@@ -85,8 +86,9 @@ beforeAll(async () => {
   warehouseToken = await login("warehouse@cloudkitchen.local", "password123");
 
   // Resolve the pilot's single seeded location + register the mock print
-  // agent there (outlet-scoped pull requires a registered print_agent —
-  // see src/modules/printing/service.ts resolveAgentLocationId).
+  // agent there. SF-2: register is gated by the shared bootstrap secret and
+  // mints a per-agent token (returned once) — every OTHER agent call below
+  // uses THAT token; location is bound server-side, never sent by the client.
   const [location] = await db.select().from(locations);
   if (!location) throw new Error("No location found — pilot seed must run first.");
   locationId = location.id;
@@ -96,6 +98,8 @@ beforeAll(async () => {
     .set("X-Agent-Token", "test-agent-token")
     .send({ agent_name: "E2E Mock Agent", location_id: locationId });
   expect(registerRes.status, "agent register").toBe(200);
+  agentToken = registerRes.body.token as string;
+  expect(agentToken, "per-agent token in register response").toBeTruthy();
 }, 60_000); // generous timeout for in-memory Postgres migrations
 
 // ---------------------------------------------------------------------------
@@ -296,10 +300,8 @@ describe("Step (a): Ingest orders across 5 brands from FoodPanda + GrabFood", ()
 // ---------------------------------------------------------------------------
 
 describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () => {
-  const AGENT_TOKEN = "test-agent-token"; // matches config.ts test default
-
   it("GET /agent/print-jobs/pending returns at least 5 PENDING jobs", async () => {
-    const res = await getPending(AGENT_TOKEN);
+    const res = await getPending(agentToken);
 
     expect(res.status).toBe(200);
     const jobs = res.body as Array<{ id: string; payload: unknown }>;
@@ -310,7 +312,7 @@ describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () =>
     // Drain loop (mirrors agent-mock/index.ts logic)
     let rounds = 0;
     while (rounds < 10) {
-      const res = await getPending(AGENT_TOKEN);
+      const res = await getPending(agentToken);
 
       const jobs = res.body as Array<{ id: string }>;
       if (jobs.length === 0) break;
@@ -318,7 +320,7 @@ describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () =>
       for (const job of jobs) {
         const ack = await request(app)
           .post(`/api/v1/agent/print-jobs/${job.id}/ack`)
-          .set("X-Agent-Token", AGENT_TOKEN)
+          .set("X-Agent-Token", agentToken)
           .send({ status: "PRINTED" });
         expect(ack.status, `ack job ${job.id.slice(0, 8)}`).toBe(200);
         expect(ack.body.status).toBe("PRINTED");
@@ -327,7 +329,7 @@ describe("Step (b): Mock agent drains all pending print jobs → PRINTED", () =>
     }
 
     // Verify: no PENDING jobs remain
-    const finalRes = await getPending(AGENT_TOKEN);
+    const finalRes = await getPending(agentToken);
     expect(finalRes.body).toHaveLength(0);
   });
 
@@ -626,8 +628,6 @@ describe("Step (f): Analytics — per-brand ranking and peak-hour breakdown", ()
 // ---------------------------------------------------------------------------
 
 describe("Step (g): Failed print job reprinted via web app → new PENDING job", () => {
-  const AGENT_TOKEN = "test-agent-token";
-
   it("Ingests a fresh order, acks its print job as FAILED, then reprints → new PENDING job", async () => {
     // Ingest a new Sip & Co order
     const ingestRes = await request(app)
@@ -648,7 +648,7 @@ describe("Step (g): Failed print job reprinted via web app → new PENDING job",
     // Agent ACKs it as FAILED
     const failAck = await request(app)
       .post(`/api/v1/agent/print-jobs/${jobId}/ack`)
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", agentToken)
       .send({ status: "FAILED", error: "printer offline: 192.168.1.52:9100 timeout" });
     expect(failAck.status).toBe(200);
     expect(failAck.body.status).toBe("FAILED");
@@ -672,7 +672,7 @@ describe("Step (g): Failed print job reprinted via web app → new PENDING job",
     expect(reprintRes.body.status).toBe("PENDING");
 
     // Verify the new PENDING job is visible in the agent's poll
-    const pendingRes = await getPending(AGENT_TOKEN);
+    const pendingRes = await getPending(agentToken);
     expect(pendingRes.status).toBe(200);
     const pending = pendingRes.body as Array<{ id: string }>;
     expect(pending.some((j) => j.id === newJobId)).toBe(true);

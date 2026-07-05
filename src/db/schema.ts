@@ -566,11 +566,23 @@ export const printAgents = pgTable(
     locationId: uuid("location_id")
       .notNull()
       .references(() => locations.id),
-    apiToken: text("api_token").notNull(),
+    // Legacy shared-secret column (audit-backend.md CRITICAL #2: "one process-wide
+    // AGENT_TOKEN, stored plaintext per row"). Kept nullable during the SF-2
+    // transition — new registrations no longer populate it (a hashed per-agent
+    // token is issued instead; see tokenHash below). Not backfilled/dropped yet
+    // so any pre-SF-2 row (and its FK-safe history) survives the migration.
+    apiToken: text("api_token"),
+    // SF-2: sha256(rawToken) hex digest. Deterministic (unlike bcrypt) so a
+    // per-request lookup can index straight to the owning agent row — the raw
+    // token itself is never stored, only shown once in the register response.
+    tokenHash: text("token_hash"),
     name: text("name"),
     lastSeen: timestamp("last_seen", { withTimezone: true }),
   },
-  (table) => [index("print_agent_location_id_idx").on(table.locationId)],
+  (table) => [
+    index("print_agent_location_id_idx").on(table.locationId),
+    uniqueIndex("print_agent_token_hash_unique").on(table.tokenHash),
+  ],
 ).enableRLS();
 
 export type PrintAgent = typeof printAgents.$inferSelect;

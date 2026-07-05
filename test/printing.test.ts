@@ -1,12 +1,15 @@
 /**
  * Task 7 — Print Jobs Queue + Print Agent Protocol + Reprint (CK1-API-003 §8)
+ * SF-2 (audit-backend.md CRITICAL #2) — per-agent hashed tokens + location binding.
  *
  * Covers:
- *   Agent endpoints (X-Agent-Token):
- *     - POST /agent/register
- *     - GET  /agent/print-jobs/pending
- *     - POST /agent/print-jobs/:id/ack (PRINTED | FAILED)
- *     - POST /agent/printers/status (heartbeat)
+ *   Agent endpoints:
+ *     - POST /agent/register               — bootstrap AGENT_TOKEN gate; mints a
+ *                                             per-agent token (returned once, raw).
+ *     - GET  /agent/print-jobs/pending      — per-agent token; location derived
+ *                                             ONLY from the token's own binding.
+ *     - POST /agent/print-jobs/:id/ack      — per-agent token; 403 cross-location.
+ *     - POST /agent/printers/status         — per-agent token; 403 cross-location.
  *   User endpoints (JWT + RBAC):
  *     - GET  /print-jobs?status=...
  *     - POST /print-jobs/:id/reprint
@@ -16,7 +19,8 @@
  *
  * Cardinal Business Rule #7: No KOT silently lost.
  *   - Every job ends PRINTED or FAILED; reprint always creates a NEW PENDING job.
- *   - Agent uses X-Agent-Token (NOT a user JWT).
+ *   - Agent uses X-Agent-Token (NOT a user JWT) — bootstrap secret for register,
+ *     a per-agent hashed token for everything else.
  */
 import { beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
@@ -44,7 +48,12 @@ let db: DB;
 let adminToken: string;
 let kitchenToken: string;
 
-const AGENT_TOKEN = "test-agent-token"; // matches loadConfig() test default
+// Bootstrap secret — gates ONLY POST /agent/register (matches loadConfig() test default).
+const BOOTSTRAP_TOKEN = "test-agent-token";
+
+// Per-agent token minted by /agent/register for THIS file's agent — used for
+// every other agent call (pending/ack/printer-status). Never the bootstrap secret.
+let agentToken: string;
 
 // Fixture IDs set in beforeAll
 let grillStationId: string;
@@ -70,12 +79,14 @@ function nextRef(): string {
   return `PRINT-TEST-${Date.now()}-${++_refSeq}`;
 }
 
-/** GET /agent/print-jobs/pending scoped to this file's location. */
+/**
+ * GET /agent/print-jobs/pending using this file's per-agent token. SF-2: the
+ * endpoint no longer takes a location_id — location comes from the token's own
+ * binding — so no query param is sent here anymore (see the dedicated test
+ * below confirming a client-supplied location_id is simply ignored).
+ */
 function getPending() {
-  return request(app)
-    .get("/api/v1/agent/print-jobs/pending")
-    .query({ location_id: locationId })
-    .set("X-Agent-Token", AGENT_TOKEN);
+  return request(app).get("/api/v1/agent/print-jobs/pending").set("X-Agent-Token", agentToken);
 }
 
 // ---------------------------------------------------------------------------
@@ -98,12 +109,15 @@ beforeAll(async () => {
   grillStationId = grillStation.id;
   locationId = grillStation.locationId;
 
-  // ── Register the print agent for this location (outlet-scoped pull requires it) ──
+  // ── Register the print agent for this location (bootstrap-gated; mints the
+  // per-agent token every subsequent agent call in this file uses) ──────────
   const registerRes = await request(app)
     .post("/api/v1/agent/register")
-    .set("X-Agent-Token", AGENT_TOKEN)
+    .set("X-Agent-Token", BOOTSTRAP_TOKEN)
     .send({ agent_name: "Printing Test Agent", location_id: locationId });
   expect(registerRes.status).toBe(200);
+  expect(registerRes.body.token).toBeTruthy();
+  agentToken = registerRes.body.token as string;
 
   // ── Create a printer ────────────────────────────────────────────────────
   const printerRes = await request(app)
@@ -216,9 +230,7 @@ describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
   });
 
   it("returns 401 AGENT_TOKEN_INVALID when X-Agent-Token is missing", async () => {
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .query({ location_id: locationId });
+    const res = await request(app).get("/api/v1/agent/print-jobs/pending");
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
@@ -227,8 +239,18 @@ describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
   it("returns 401 AGENT_TOKEN_INVALID when X-Agent-Token is wrong", async () => {
     const res = await request(app)
       .get("/api/v1/agent/print-jobs/pending")
-      .query({ location_id: locationId })
       .set("X-Agent-Token", "wrong-token");
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
+  });
+
+  it("returns 401 AGENT_TOKEN_INVALID for the bootstrap secret itself (not a per-agent token)", async () => {
+    // SF-2: the shared AGENT_TOKEN only gates /agent/register now. It was never
+    // hashed into any print_agent row, so it must NOT work here.
+    const res = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .set("X-Agent-Token", BOOTSTRAP_TOKEN);
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
@@ -238,49 +260,48 @@ describe("GET /api/v1/agent/print-jobs/pending — agent endpoint", () => {
     // A valid user JWT in X-Agent-Token should be rejected, not accepted
     const res = await request(app)
       .get("/api/v1/agent/print-jobs/pending")
-      .query({ location_id: locationId })
       .set("X-Agent-Token", adminToken); // user JWT is NOT the agent token
 
     expect(res.status).toBe(401);
     expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
   });
 
-  it("returns 400 VALIDATION_ERROR when location_id query param is missing", async () => {
-    const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .set("X-Agent-Token", AGENT_TOKEN);
-
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe("VALIDATION_ERROR");
-  });
-
-  it("returns 404 NOT_FOUND when location_id does not exist", async () => {
+  it("ignores a client-supplied location_id query param — location comes ONLY from the token", async () => {
+    // SF-2 (audit-backend.md CRITICAL #2): the pre-SF-2 contract required a
+    // ?location_id= query param and only checked that SOME print_agent was
+    // registered there — any token-holder could pass a different outlet's id.
+    // Now the endpoint derives location exclusively from the authenticated
+    // agent's own binding, so a spoofed query param must be a complete no-op.
     const res = await request(app)
       .get("/api/v1/agent/print-jobs/pending")
       .query({ location_id: "00000000-0000-4000-a000-000000000001" })
-      .set("X-Agent-Token", AGENT_TOKEN);
+      .set("X-Agent-Token", agentToken);
 
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe("NOT_FOUND");
+    expect(res.status).toBe(200);
+    const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
+    expect(ids).toContain(pendingJobId); // still this agent's own (real) location's jobs
   });
 });
 
 // ---------------------------------------------------------------------------
-// OUTLET ISOLATION (audit-db.md §3 — "Service-layer leak found while
-// auditing": printing/service.ts pulled ALL PENDING jobs with no location
-// filter, so a second outlet's agent could print outlet 1's KOTs).
+// OUTLET ISOLATION (audit-db.md §3 + SF-2 audit-backend.md CRITICAL #2:
+// pre-SF-2, printing/service.ts pulled ALL PENDING jobs with no location
+// filter, and ack/printers/status did no location check at all — a token
+// holder for one outlet could ack or heartbeat-report on another outlet's
+// jobs/printers).
 //
-// Two locations, two agents (both share the same global X-Agent-Token in
-// this prototype, but each identifies its OWN location via ?location_id=):
-// jobs must route ONLY to the agent pulling for the matching location.
+// Two locations, two DISTINCT per-agent tokens (each minted by its own
+// /agent/register call, bound server-side to its own location_id): jobs and
+// printers must route/authorize ONLY for the matching agent's own location.
 // ---------------------------------------------------------------------------
 
-describe("Outlet isolation: print-job pull is scoped to the pulling agent's location", () => {
+describe("Outlet isolation: print-job pull/ack/heartbeat scoped to the agent's own location", () => {
   let secondLocationId: string;
   let secondStationId: string;
   let secondPrinterId: string;
   let outlet1OnlyJobId: string;
   let outlet2OnlyJobId: string;
+  let secondAgentToken: string; // per-agent token for the SECOND location's agent
 
   beforeAll(async () => {
     // ── Second physical outlet, created directly (no multi-location HTTP
@@ -305,14 +326,18 @@ describe("Outlet isolation: print-job pull is scoped to the pulling agent's loca
     secondPrinterId = secondPrinter.id;
 
     // Register a SECOND agent for the second location. Both agents share the
-    // same global AGENT_TOKEN in this prototype (single secret) — isolation
-    // comes from each pull declaring ITS OWN location_id, verified server-side
-    // against a registered print_agent row for that location.
+    // same BOOTSTRAP_TOKEN to register (that secret only proves "you're allowed
+    // to mint a token"), but each gets back a DISTINCT per-agent token bound to
+    // its own location_id — isolation comes from THAT binding, not from any
+    // client-supplied location value.
     const registerRes = await request(app)
       .post("/api/v1/agent/register")
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", BOOTSTRAP_TOKEN)
       .send({ agent_name: "Outlet 2 Agent", location_id: secondLocationId });
     expect(registerRes.status).toBe(200);
+    expect(registerRes.body.token).toBeTruthy();
+    secondAgentToken = registerRes.body.token as string;
+    expect(secondAgentToken).not.toBe(agentToken); // distinct per-agent tokens
 
     // ── An order/print_job scoped to OUTLET 1 (this file's existing brand + FOODPANDA account) ──
     const [account] = await db
@@ -390,8 +415,7 @@ describe("Outlet isolation: print-job pull is scoped to the pulling agent's loca
   it("outlet 2's agent pull includes outlet 2's job but NOT outlet 1's job", async () => {
     const res = await request(app)
       .get("/api/v1/agent/print-jobs/pending")
-      .query({ location_id: secondLocationId })
-      .set("X-Agent-Token", AGENT_TOKEN);
+      .set("X-Agent-Token", secondAgentToken);
 
     expect(res.status).toBe(200);
     const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
@@ -399,19 +423,54 @@ describe("Outlet isolation: print-job pull is scoped to the pulling agent's loca
     expect(ids).not.toContain(outlet1OnlyJobId);
   });
 
-  it("an agent cannot pull for a location that has no print_agent registered there", async () => {
-    const [unregisteredLocation] = await db
-      .insert(locations)
-      .values({ code: "CK3-UNREGISTERED", name: "Unregistered Outlet" })
-      .returning();
-
+  // ── Cross-location ack: 403, not just "not visible in pending" ───────────
+  it("outlet 2's agent cannot ack outlet 1's job → 403 FORBIDDEN", async () => {
     const res = await request(app)
-      .get("/api/v1/agent/print-jobs/pending")
-      .query({ location_id: unregisteredLocation.id })
-      .set("X-Agent-Token", AGENT_TOKEN);
+      .post(`/api/v1/agent/print-jobs/${outlet1OnlyJobId}/ack`)
+      .set("X-Agent-Token", secondAgentToken)
+      .send({ status: "PRINTED" });
 
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("FORBIDDEN");
+  });
+
+  it("outlet 1's agent cannot ack outlet 2's job → 403 FORBIDDEN", async () => {
+    const res = await request(app)
+      .post(`/api/v1/agent/print-jobs/${outlet2OnlyJobId}/ack`)
+      .set("X-Agent-Token", agentToken)
+      .send({ status: "PRINTED" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("FORBIDDEN");
+  });
+
+  it("outlet 1's job is untouched by the rejected cross-location ack (still PENDING)", async () => {
+    const res = await getPending();
+    const ids = (res.body as Array<{ id: string }>).map((j) => j.id);
+    expect(ids).toContain(outlet1OnlyJobId);
+  });
+
+  // ── Cross-location printer heartbeat: 403 ────────────────────────────────
+  it("outlet 2's agent cannot report status for outlet 1's printer → 403 FORBIDDEN", async () => {
+    const res = await request(app)
+      .post("/api/v1/agent/printers/status")
+      .set("X-Agent-Token", secondAgentToken)
+      .send({ printers: [{ printer_id: printerId, status: "ONLINE", last_seen: new Date().toISOString() }] });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("FORBIDDEN");
+  });
+
+  it("outlet 1's agent cannot report status for outlet 2's printer → 403 FORBIDDEN", async () => {
+    const res = await request(app)
+      .post("/api/v1/agent/printers/status")
+      .set("X-Agent-Token", agentToken)
+      .send({
+        printers: [{ printer_id: secondPrinterId, status: "ONLINE", last_seen: new Date().toISOString() }],
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("FORBIDDEN");
   });
 });
 
@@ -420,7 +479,7 @@ describe("Outlet isolation: print-job pull is scoped to the pulling agent's loca
 // ---------------------------------------------------------------------------
 
 describe("POST /api/v1/agent/register — agent registration", () => {
-  it("registers an agent with a valid token → 200 with confirmation", async () => {
+  it("registers an agent with a valid token → 200 with confirmation + a fresh raw token", async () => {
     // Resolve the location id from the DB
     const { locations } = await import("../src/db/schema.js");
     const [loc] = await db.select().from(locations);
@@ -428,16 +487,67 @@ describe("POST /api/v1/agent/register — agent registration", () => {
 
     const res = await request(app)
       .post("/api/v1/agent/register")
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", BOOTSTRAP_TOKEN)
       .send({ agent_name: "Test Agent", location_id: loc.id });
 
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
+    expect(res.body.agent_id).toBeTruthy();
+    expect(res.body.location_id).toBe(loc.id);
+    // SF-2: raw per-agent token returned once — high-entropy, not the bootstrap secret.
+    expect(typeof res.body.token).toBe("string");
+    expect(res.body.token.length).toBeGreaterThanOrEqual(32);
+    expect(res.body.token).not.toBe(BOOTSTRAP_TOKEN);
+  });
+
+  it("re-registering the same agent_name+location rotates its token (old token stops working)", async () => {
+    const { locations } = await import("../src/db/schema.js");
+    const [loc] = await db.select().from(locations);
+
+    const first = await request(app)
+      .post("/api/v1/agent/register")
+      .set("X-Agent-Token", BOOTSTRAP_TOKEN)
+      .send({ agent_name: "Rotation Test Agent", location_id: loc.id });
+    expect(first.status).toBe(200);
+    const firstToken = first.body.token as string;
+
+    const second = await request(app)
+      .post("/api/v1/agent/register")
+      .set("X-Agent-Token", BOOTSTRAP_TOKEN)
+      .send({ agent_name: "Rotation Test Agent", location_id: loc.id });
+    expect(second.status).toBe(200);
+    const secondToken = second.body.token as string;
+
+    expect(secondToken).not.toBe(firstToken);
+    expect(second.body.agent_id).toBe(first.body.agent_id); // same agent row, rotated token
+
+    // Old token no longer authenticates anything.
+    const staleRes = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .set("X-Agent-Token", firstToken);
+    expect(staleRes.status).toBe(401);
+    expect(staleRes.body.error.code).toBe("AGENT_TOKEN_INVALID");
+
+    // New token works.
+    const freshRes = await request(app)
+      .get("/api/v1/agent/print-jobs/pending")
+      .set("X-Agent-Token", secondToken);
+    expect(freshRes.status).toBe(200);
   });
 
   it("returns 401 when agent token is missing on register", async () => {
     const res = await request(app)
       .post("/api/v1/agent/register")
+      .send({ agent_name: "No Token", location_id: "00000000-0000-4000-a000-000000000001" });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe("AGENT_TOKEN_INVALID");
+  });
+
+  it("returns 401 when agent token is wrong on register (bootstrap secret required)", async () => {
+    const res = await request(app)
+      .post("/api/v1/agent/register")
+      .set("X-Agent-Token", "wrong-bootstrap-token")
       .send({ agent_name: "No Token", location_id: "00000000-0000-4000-a000-000000000001" });
 
     expect(res.status).toBe(401);
@@ -471,7 +581,7 @@ describe("POST /api/v1/agent/print-jobs/:id/ack — PRINTED", () => {
   it("ack PRINTED → job status becomes PRINTED and has printed_at", async () => {
     const res = await request(app)
       .post(`/api/v1/agent/print-jobs/${ackJobId}/ack`)
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", agentToken)
       .send({ status: "PRINTED" });
 
     expect(res.status).toBe(200);
@@ -523,7 +633,7 @@ describe("POST /api/v1/agent/print-jobs/:id/ack — FAILED", () => {
   it("ack FAILED with error → job status FAILED and error stored", async () => {
     const res = await request(app)
       .post(`/api/v1/agent/print-jobs/${failJobId}/ack`)
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", agentToken)
       .send({ status: "FAILED", error: "printer offline: 192.168.1.50:9100 timeout" });
 
     expect(res.status).toBe(200);
@@ -567,7 +677,7 @@ describe("POST /api/v1/print-jobs/:id/reprint — reprint FAILED job", () => {
     // Fail the job via agent ack
     await request(app)
       .post(`/api/v1/agent/print-jobs/${failedJobId}/ack`)
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", agentToken)
       .send({ status: "FAILED", error: "offline" });
   });
 
@@ -700,7 +810,7 @@ describe("POST /api/v1/agent/printers/status — heartbeat", () => {
 
     const res = await request(app)
       .post("/api/v1/agent/printers/status")
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", agentToken)
       .send({
         printers: [{ printer_id: printerId, status: "ONLINE", last_seen: now }],
       });
@@ -734,7 +844,7 @@ describe("POST /api/v1/agent/printers/status — heartbeat", () => {
   it("handles empty printers array gracefully", async () => {
     const res = await request(app)
       .post("/api/v1/agent/printers/status")
-      .set("X-Agent-Token", AGENT_TOKEN)
+      .set("X-Agent-Token", agentToken)
       .send({ printers: [] });
 
     expect(res.status).toBe(200);

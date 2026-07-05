@@ -13,9 +13,11 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
 import type { Express } from "express";
+import { inArray } from "drizzle-orm";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
+import { userOutletAccess, users } from "../src/db/schema.js";
 
 let app: Express;
 let db: DB;
@@ -72,6 +74,28 @@ describe("Multi-outlet inventory isolation", () => {
       .set("Authorization", `Bearer ${adminToken}`)
       .send({ code: "ISO2", name: "Isolation Outlet" });
     outletBId = outletBRes.body.id as string;
+
+    // Tenancy (D22/SF-5): the seed grants the scoped operational users
+    // (warehouse@ = WAREHOUSE_OUTLET, kitchen_staff@ = KITCHEN_CREW) access to
+    // the seeded outlet only. This test creates a SECOND outlet at runtime and
+    // has those users operate on it via `outlet_id`, so they must be granted
+    // access to it — otherwise resolveLocationId 403s a non-member. This is
+    // pure setup for the new access model; no assertion is changed. Their tokens
+    // were minted before this grant, so re-login to pick up the new outlet_ids.
+    const scopedUsers = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(
+        inArray(users.email, [
+          "warehouse@cloudkitchen.local",
+          "kitchen_staff@cloudkitchen.local",
+        ]),
+      );
+    await db.insert(userOutletAccess).values(
+      scopedUsers.map((u) => ({ userId: u.id, locationId: outletBId })),
+    );
+    warehouseToken = await login("warehouse@cloudkitchen.local", "password123");
+    kitchenToken = await login("kitchen_staff@cloudkitchen.local", "password123");
   });
 
   it("receives stock into a specific outlet MAIN without changing another outlet", async () => {

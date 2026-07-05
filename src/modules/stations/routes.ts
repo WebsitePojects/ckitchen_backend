@@ -2,8 +2,9 @@ import { Router } from "express";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { kitchenStations, locations, printerConnectionEnum, printers } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { kitchenStations, printerConnectionEnum, printers } from "../../db/schema.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { sendError } from "../http-errors.js";
 
 const WRITE_ROLES = ["OWNER"] as const;
@@ -11,6 +12,9 @@ const WRITE_ROLES = ["OWNER"] as const;
 const createStationSchema = z.object({
   name: z.string().min(1),
   default_printer_id: z.string().uuid().optional(),
+  // Outlet targeting (D22): ALL-scope users may name any outlet; ASSIGNED users
+  // are membership-checked. Omitted → the deployment's default (first) outlet.
+  location_id: z.string().uuid().optional(),
 });
 
 const createPrinterSchema = z.object({
@@ -30,12 +34,6 @@ const updatePrinterSchema = z
     message: "At least one field is required.",
   });
 
-/** Resolves the single seeded location for the prototype (many-brands-one-location). */
-async function resolveLocationId(db: DB): Promise<string | null> {
-  const [location] = await db.select().from(locations).limit(1);
-  return location?.id ?? null;
-}
-
 export function createStationsRouter(db: DB): Router {
   const router = Router();
 
@@ -54,7 +52,7 @@ export function createStationsRouter(db: DB): Router {
     res.json(result);
   });
 
-  router.post("/stations", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+  router.post("/stations", requireAuth, requireRole(...WRITE_ROLES), resolveOutletContext, async (req, res) => {
     const parsed = createStationSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid station payload.", parsed.error.issues);
@@ -72,11 +70,8 @@ export function createStationsRouter(db: DB): Router {
       }
     }
 
-    const locationId = await resolveLocationId(db);
-    if (!locationId) {
-      sendError(res, 500, "NOT_FOUND", "No location is configured for this deployment.");
-      return;
-    }
+    const locationId = await resolveRequestLocationId(db, req, res, parsed.data.location_id);
+    if (!locationId) return;
 
     const [station] = await db
       .insert(kitchenStations)

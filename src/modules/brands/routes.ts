@@ -6,19 +6,30 @@ import {
   aggregatorAccounts,
   aggregatorEnum,
   brandActivityLog,
+  brandOutlet,
   brands,
   locations,
 } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 
 const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
+/** Deploying a brand to an outlet / deactivating it is an OWNER (HQ) action. */
+const DEPLOY_ROLES = ["OWNER"] as const;
 
 const createBrandSchema = z.object({
   name: z.string().min(1),
   color: z.string().min(1),
   logo_url: z.string().optional(),
   sales_perf_id: z.string().optional(),
+  // Outlet targeting (D22): ALL-scope users may name any outlet; ASSIGNED users
+  // are membership-checked. Omitted → the deployment's default (first) outlet.
+  location_id: z.string().uuid().optional(),
+});
+
+const deployOutletSchema = z.object({
+  location_id: z.string().uuid(),
 });
 
 const updateBrandSchema = z
@@ -45,12 +56,6 @@ function toPublicAccount(account: typeof aggregatorAccounts.$inferSelect) {
   return publicAccount;
 }
 
-/** Resolves the single seeded location for the prototype (many-brands-one-location). */
-async function resolveLocationId(db: DB): Promise<string | null> {
-  const [location] = await db.select().from(locations).limit(1);
-  return location?.id ?? null;
-}
-
 export function createBrandsRouter(db: DB): Router {
   const router = Router();
 
@@ -68,29 +73,37 @@ export function createBrandsRouter(db: DB): Router {
     res.json(rows);
   });
 
-  router.post("/brands", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+  router.post("/brands", requireAuth, requireRole(...WRITE_ROLES), resolveOutletContext, async (req, res) => {
     const parsed = createBrandSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid brand payload.", parsed.error.issues);
       return;
     }
 
-    const locationId = await resolveLocationId(db);
-    if (!locationId) {
-      sendError(res, 500, "NOT_FOUND", "No location is configured for this deployment.");
-      return;
-    }
+    const locationId = await resolveRequestLocationId(db, req, res, parsed.data.location_id);
+    if (!locationId) return;
 
-    const [brand] = await db
-      .insert(brands)
-      .values({
-        locationId,
-        name: parsed.data.name,
-        color: parsed.data.color,
-        logoUrl: parsed.data.logo_url,
-        salesPerfId: parsed.data.sales_perf_id ?? parsed.data.name.toLowerCase().replace(/\s+/g, "-"),
-      })
-      .returning();
+    // Create the brand + its home deployment (brand_outlet) atomically so the
+    // D30 many-to-many stays consistent for new brands from the moment of birth.
+    let brand!: typeof brands.$inferSelect;
+    await db.transaction(async (tx) => {
+      [brand] = await tx
+        .insert(brands)
+        .values({
+          locationId,
+          name: parsed.data.name,
+          color: parsed.data.color,
+          logoUrl: parsed.data.logo_url,
+          salesPerfId:
+            parsed.data.sales_perf_id ?? parsed.data.name.toLowerCase().replace(/\s+/g, "-"),
+        })
+        .returning();
+
+      await tx
+        .insert(brandOutlet)
+        .values({ brandId: brand.id, locationId, isActive: true })
+        .onConflictDoNothing();
+    });
 
     res.status(201).json(brand);
   });
@@ -248,6 +261,142 @@ export function createBrandsRouter(db: DB): Router {
 
     res.json({ ok: true });
   });
+
+  // -------------------------------------------------------------------------
+  // brand_outlet deployments (D30 many-to-many)
+  // -------------------------------------------------------------------------
+
+  // GET /brands/:id/outlets — outlets this brand is deployed to (active + inactive).
+  // Readable by any authenticated user who can read brands.
+  router.get("/brands/:id/outlets", requireAuth, async (req, res) => {
+    const id = paramAsString(req.params.id);
+    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+    if (!brand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const rows = await db
+      .select({
+        brandId: brandOutlet.brandId,
+        locationId: brandOutlet.locationId,
+        isActive: brandOutlet.isActive,
+        createdAt: brandOutlet.createdAt,
+        code: locations.code,
+        name: locations.name,
+      })
+      .from(brandOutlet)
+      .innerJoin(locations, eq(brandOutlet.locationId, locations.id))
+      .where(eq(brandOutlet.brandId, id))
+      .orderBy(asc(brandOutlet.createdAt));
+
+    res.json(rows);
+  });
+
+  // POST /brands/:id/outlets — deploy a brand to an outlet (OWNER + legacy alias).
+  // Idempotent: re-deploying an active outlet is a no-op; a previously deactivated
+  // deployment is reactivated (is_active=true) rather than duplicated.
+  router.post(
+    "/brands/:id/outlets",
+    requireAuth,
+    requireRole(...DEPLOY_ROLES),
+    resolveOutletContext,
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+      if (!brand) {
+        sendError(res, 404, "NOT_FOUND", "Brand not found.");
+        return;
+      }
+
+      const parsed = deployOutletSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "A 'location_id' (UUID) is required.", parsed.error.issues);
+        return;
+      }
+      const locationId = parsed.data.location_id;
+
+      const [location] = await db.select().from(locations).where(eq(locations.id, locationId));
+      if (!location) {
+        sendError(res, 404, "NOT_FOUND", "Outlet not found.");
+        return;
+      }
+
+      // Membership: ASSIGNED users may only deploy to outlets they belong to.
+      const ctx = req.outletContext;
+      if (ctx && ctx.scope !== "ALL" && !ctx.outletIds.includes(locationId)) {
+        sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+        return;
+      }
+
+      const [existing] = await db
+        .select()
+        .from(brandOutlet)
+        .where(and(eq(brandOutlet.brandId, id), eq(brandOutlet.locationId, locationId)));
+
+      if (existing) {
+        if (existing.isActive) {
+          res.status(200).json(existing); // already deployed — idempotent
+          return;
+        }
+        const [reactivated] = await db
+          .update(brandOutlet)
+          .set({ isActive: true })
+          .where(and(eq(brandOutlet.brandId, id), eq(brandOutlet.locationId, locationId)))
+          .returning();
+        res.status(200).json(reactivated);
+        return;
+      }
+
+      const [created] = await db
+        .insert(brandOutlet)
+        .values({ brandId: id, locationId, isActive: true })
+        .returning();
+      res.status(201).json(created);
+    },
+  );
+
+  // DELETE /brands/:id/outlets/:locationId — deactivate a deployment (soft; keeps
+  // the row + history). OWNER + legacy alias; ASSIGNED membership-checked.
+  router.delete(
+    "/brands/:id/outlets/:locationId",
+    requireAuth,
+    requireRole(...DEPLOY_ROLES),
+    resolveOutletContext,
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const locationId = paramAsString(req.params.locationId);
+
+      const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+      if (!brand) {
+        sendError(res, 404, "NOT_FOUND", "Brand not found.");
+        return;
+      }
+
+      const ctx = req.outletContext;
+      if (ctx && ctx.scope !== "ALL" && !ctx.outletIds.includes(locationId)) {
+        sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+        return;
+      }
+
+      const [existing] = await db
+        .select()
+        .from(brandOutlet)
+        .where(and(eq(brandOutlet.brandId, id), eq(brandOutlet.locationId, locationId)));
+      if (!existing) {
+        sendError(res, 404, "NOT_FOUND", "Brand is not deployed to that outlet.");
+        return;
+      }
+
+      const [deactivated] = await db
+        .update(brandOutlet)
+        .set({ isActive: false })
+        .where(and(eq(brandOutlet.brandId, id), eq(brandOutlet.locationId, locationId)))
+        .returning();
+
+      res.json({ ok: true, deployment: deactivated });
+    },
+  );
 
   return router;
 }

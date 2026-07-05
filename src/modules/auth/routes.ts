@@ -6,7 +6,7 @@ import { users, userSessions, userOutletAccess } from "../../db/schema.js";
 import { loadConfig } from "../../config.js";
 import { signToken, verifyPassword, fakeVerifyPassword } from "./service.js";
 import { requireAuth } from "./middleware.js";
-import { outletScopeForRole } from "./roles.js";
+import { normalizeRole, outletScopeForRole } from "./roles.js";
 import { audit } from "../ems/audit.js";
 
 function sendError(
@@ -68,6 +68,16 @@ export function createAuthRouter(db: DB): Router {
     const valid = await verifyPassword(password, user.passwordHash);
     if (!valid) {
       sendError(res, 401, "AUTH_REQUIRED", "Invalid email or password.");
+      return;
+    }
+
+    // M5: RIDER was retired (D29) and normalizes to no access. Block it at login
+    // rather than minting a token that would be denied on every requireAuth route
+    // anyway — a clear, honest signal. Any future retired/unknown role (normalizeRole
+    // → null) is blocked the same way. Checked AFTER password verification so this
+    // is not a role-enumeration oracle.
+    if (normalizeRole(user.role) === null) {
+      sendError(res, 403, "ROLE_RETIRED", "This account's role has been retired. Contact an administrator.");
       return;
     }
 

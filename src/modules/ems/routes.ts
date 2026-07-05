@@ -320,6 +320,14 @@ export function createEmsRouter(db: DB): Router {
   router.get("/ems/attendance/dtr", requireAuth, async (req, res) => {
     const { employee_id, from, to } = req.query as Record<string, string | undefined>;
 
+    // M4: same gate as the sibling GET /ems/attendance — the unfiltered DTR
+    // exposes every employee's punches (incl. photo URLs), so listing ALL is
+    // OWNER-only; anyone authed may still pull a specific employee_id.
+    if (!employee_id && normalizeRole(req.user!.role) !== "OWNER") {
+      sendError(res, 403, "FORBIDDEN", "Only an OWNER may list all DTR entries. Filter by employee_id.");
+      return;
+    }
+
     const conditions: ReturnType<typeof eq>[] = [];
     if (employee_id) conditions.push(eq(attendanceRecords.employeeId, employee_id));
     if (from) conditions.push(gte(attendanceRecords.capturedAt, new Date(`${from}T00:00:00.000Z`)));

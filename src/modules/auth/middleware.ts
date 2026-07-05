@@ -32,6 +32,9 @@ declare module "express-serve-static-core" {
   }
 }
 
+/** RFC-4122 UUID shape check for the X-Outlet-Id header (L2). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function sendError(
   res: Response,
   status: number,
@@ -143,6 +146,14 @@ export function resolveOutletContext(req: Request, res: Response, next: NextFunc
   const outletIds = user.outletIds ?? [];
   const raw = req.header("X-Outlet-Id");
   const selectedOutletId = typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+
+  // L2: validate the header shape here so a malformed value returns 400 instead of
+  // reaching a downstream `::uuid` cast (which surfaced as a raw 500 for ALL-scope
+  // users, whose value skips the membership check below).
+  if (selectedOutletId && !UUID_RE.test(selectedOutletId)) {
+    sendError(res, 400, "VALIDATION_ERROR", "X-Outlet-Id must be a valid UUID.");
+    return;
+  }
 
   if (selectedOutletId && scope !== "ALL" && !outletIds.includes(selectedOutletId)) {
     sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");

@@ -619,6 +619,12 @@ export const printAgents = pgTable(
   (table) => [
     index("print_agent_location_id_idx").on(table.locationId),
     uniqueIndex("print_agent_token_hash_unique").on(table.tokenHash),
+    // L4a: one agent identity per (name, location). Closes the registerAgent
+    // select-then-insert race — a concurrent double-register now hits a DB
+    // unique violation instead of silently creating a duplicate agent row.
+    // (name is nullable; Postgres treats NULLs as distinct, so legacy null-name
+    // rows are unaffected.)
+    uniqueIndex("print_agent_name_location_unique").on(table.name, table.locationId),
   ],
 ).enableRLS();
 

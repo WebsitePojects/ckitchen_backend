@@ -9,13 +9,16 @@
  *   5. Register the Express app as the HTTP request handler.
  *   6. Listen once on the configured port.
  *
- * CORS: all origins allowed for the prototype so the dev frontend (Vite on a
- * different port) can connect without extra config.  Restrict in production.
+ * CORS (SF-3, audit-backend.md HIGH "wildcard CORS"): Socket.IO shares the
+ * SAME allowlist predicate as the REST API (src/cors.ts) — previously this
+ * was a bare "*", meaning any origin's browser JS could open a socket and
+ * join a location room to receive live order/stock/print events.
  */
 import { createServer } from "node:http";
 import { Server as IOServer } from "socket.io";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
 import { createDb } from "./db/client.js";
 import { createSocketHub } from "./realtime/hub.js";
 
@@ -26,9 +29,10 @@ const { db } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUr
 const httpServer = createServer();
 
 // 2. Socket.IO server attached to the same port as Express
+const isOriginAllowed = createOriginAllowlist(config.corsOrigins);
 const io = new IOServer(httpServer, {
   cors: {
-    origin: "*",
+    origin: corsOriginCallback(isOriginAllowed),
     methods: ["GET", "POST"],
   },
 });

@@ -1,4 +1,5 @@
 import { Router } from "express";
+import rateLimit from "express-rate-limit";
 import { eq } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { users, userSessions, userOutletAccess } from "../../db/schema.js";
@@ -26,7 +27,29 @@ function toPublicUser(user: typeof users.$inferSelect) {
 export function createAuthRouter(db: DB): Router {
   const router = Router();
 
-  router.post("/auth/login", async (req, res) => {
+  // SF-3 (audit-backend.md HIGH "unthrottled login"): bcrypt is intentionally
+  // slow, which is exactly what makes an unthrottled login endpoint a DoS/
+  // credential-stuffing vector. Limits are env-tunable (LOGIN_RATE_LIMIT_MAX /
+  // LOGIN_RATE_LIMIT_WINDOW_MS); config.ts defaults to a very high ceiling
+  // under NODE_ENV=test so the existing test suite's repeated login calls
+  // never trip it, and to 10/15min in real dev/prod.
+  const { loginRateLimit } = loadConfig();
+  const loginLimiter = rateLimit({
+    windowMs: loginRateLimit.windowMs,
+    limit: loginRateLimit.max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (_req, res) => {
+      sendError(
+        res,
+        429,
+        "RATE_LIMITED",
+        "Too many login attempts. Please try again later.",
+      );
+    },
+  });
+
+  router.post("/auth/login", loginLimiter, async (req, res) => {
     const { email, password } = req.body ?? {};
     if (typeof email !== "string" || typeof password !== "string") {
       sendError(res, 400, "VALIDATION_ERROR", "email and password are required.");

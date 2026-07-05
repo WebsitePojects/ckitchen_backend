@@ -1,6 +1,9 @@
 import express, { type Express } from "express";
 import cors from "cors";
+import helmet from "helmet";
 import type { DB } from "./db/client.js";
+import { loadConfig } from "./config.js";
+import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
 import { createNoopHub, type RealtimeHub } from "./realtime/hub.js";
 import { healthRouter } from "./routes/health.js";
 import { createAuthRouter } from "./modules/auth/routes.js";
@@ -26,9 +29,36 @@ import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
  */
 export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   const app = express();
-  // Allow the hosted frontend (different origin in production) to call the REST API.
-  // Bearer-token auth (no cookies), so a wildcard origin is safe; restrict via CORS_ORIGIN if desired.
-  app.use(cors({ origin: process.env.CORS_ORIGIN ?? "*" }));
+
+  // SF-3 (audit-backend.md HIGH "no helmet"): security headers. CSP is mostly
+  // inert for a JSON-only API (no HTML/script is ever served), but img-src is
+  // widened for res.cloudinary.com so any future HTML surface (docs, admin
+  // pages) that embeds a Cloudinary photo isn't broken by the default policy.
+  // crossOriginResourcePolicy is relaxed to "cross-origin": the default
+  // "same-origin" blocks the separate Vercel frontend from reading fetch/XHR
+  // responses cross-origin in browsers that enforce CORP on all fetches, not
+  // just no-cors subresource loads — that would break every API call from
+  // the deployed frontend.
+  app.use(
+    helmet({
+      contentSecurityPolicy: {
+        directives: {
+          ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+          "img-src": ["'self'", "data:", "https://res.cloudinary.com"],
+        },
+      },
+      crossOriginResourcePolicy: { policy: "cross-origin" },
+    }),
+  );
+
+  // SF-3 (audit-backend.md HIGH "wildcard CORS"): allowlist instead of "*".
+  // Bearer-token auth (no cookies) made a wildcard low-risk for reads, but an
+  // explicit allowlist is the correct default regardless; see src/cors.ts for
+  // the full policy (env override, Vercel prod + preview, local dev origins).
+  const { corsOrigins } = loadConfig();
+  const isOriginAllowed = createOriginAllowlist(corsOrigins);
+  app.use(cors({ origin: corsOriginCallback(isOriginAllowed) }));
+
   app.use(express.json({ limit: "12mb" })); // base64 attendance photos (≤8 MB) must reach the handler, not be 413'd by the parser
   app.set("db", db);
 

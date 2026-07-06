@@ -18,6 +18,8 @@ import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
 import { generateOrderInput } from "../src/modules/orders/simulator.js";
+import { hashPassword } from "../src/modules/auth/service.js";
+import { userOutletAccess, users } from "../src/db/schema.js";
 
 let app: Express;
 let db: DB;
@@ -530,6 +532,303 @@ describe("GET /api/v1/orders — unified feed and filters", () => {
   it("returns 401 for unauthenticated GET /orders", async () => {
     const res = await request(app).get("/api/v1/orders");
     expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders?detail=1 — bulk-hydrated detail mode (KDS N+1 fix)
+//
+// The frontend Kitchen Display / Dashboard used to call GET /orders for a
+// summary list, then GET /orders/:id ONCE PER ORDER to hydrate items +
+// print_jobs (ckitchen_frontend src/hooks/useKitchenOrders.ts). ?detail=1
+// (alias ?include=items) returns the SAME per-order items[]/print_jobs[]
+// shape in ONE call, bulk-fetched server-side (listOrdersWithDetail).
+// ---------------------------------------------------------------------------
+
+describe("GET /api/v1/orders?detail=1 — bulk detail mode", () => {
+  let multiItemOrderId: string;
+  let singleItemOrderId: string;
+  const DETAIL_REF_1 = `FP-DETAIL-${Date.now()}-1`;
+  const DETAIL_REF_2 = `FP-DETAIL-${Date.now()}-2`;
+
+  beforeAll(async () => {
+    // Two stations (Grill + Beverage) → 2 order_items + 2 print_jobs.
+    const res1 = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: DETAIL_REF_1,
+        customer_name: "Detail Mode Test",
+        items: [
+          { menu_item_id: grillItemId, qty: 2, notes: "extra spicy" },
+          { menu_item_id: bevItemId, qty: 1 },
+        ],
+      });
+    expect(res1.status).toBe(201);
+    multiItemOrderId = res1.body.order_id as string;
+
+    // A second, unrelated order — only 1 item/1 print job — to prove per-order
+    // assembly doesn't leak items across orders in the bulk fetch.
+    const res2 = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: DETAIL_REF_2,
+        items: [{ menu_item_id: bevItemId, qty: 3 }],
+      });
+    expect(res2.status).toBe(201);
+    singleItemOrderId = res2.body.order_id as string;
+  });
+
+  it("summary mode (no detail param) is byte-identical to the pre-existing contract — no items/print_jobs keys", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ status: "NEW" });
+
+    expect(res.status).toBe(200);
+    const found = (res.body as Array<Record<string, unknown>>).find(
+      (o) => o.id === multiItemOrderId,
+    );
+    expect(found).toBeTruthy();
+    expect(Object.prototype.hasOwnProperty.call(found, "items")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(found, "print_jobs")).toBe(false);
+  });
+
+  it("?detail=1 returns each order WITH items[] and print_jobs[] matching GET /orders/:id for the same order", async () => {
+    const listRes = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ status: "NEW", detail: "1" });
+    expect(listRes.status).toBe(200);
+
+    const detailRes = await request(app)
+      .get(`/api/v1/orders/${multiItemOrderId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(detailRes.status).toBe(200);
+
+    const listed = (
+      listRes.body as Array<{
+        id: string;
+        items: Array<{ id: string }>;
+        print_jobs: Array<{ id: string }>;
+      }>
+    ).find((o) => o.id === multiItemOrderId);
+    expect(listed).toBeTruthy();
+
+    const sortIds = (arr: Array<{ id: string }>) => arr.map((x) => x.id).sort();
+    expect(sortIds(listed!.items)).toEqual(sortIds(detailRes.body.items));
+    expect(sortIds(listed!.print_jobs)).toEqual(sortIds(detailRes.body.print_jobs));
+    expect(listed!.items).toEqual(detailRes.body.items);
+    expect(listed!.print_jobs).toEqual(detailRes.body.print_jobs);
+  });
+
+  it("an order with multiple items across multiple stations assembles with NO cartesian duplication", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ status: "NEW", detail: "1" });
+
+    const found = (
+      res.body as Array<{ id: string; items: unknown[]; print_jobs: unknown[] }>
+    ).find((o) => o.id === multiItemOrderId)!;
+
+    // 2 distinct order_items (grill qty=2 + beverage qty=1) and 2 distinct
+    // print_jobs (Grill station + Beverage station) — a naive SQL JOIN across
+    // order_item x print_job would fan out to 4 rows; the bulk fetch must not.
+    expect(found.items).toHaveLength(2);
+    expect(found.print_jobs).toHaveLength(2);
+  });
+
+  it("a second order in the SAME detail=1 response gets its own items only (no cross-order leakage)", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ status: "NEW", detail: "1" });
+
+    const rows = res.body as Array<{
+      id: string;
+      items: Array<{ menuItemId: string; qty: number }>;
+      print_jobs: unknown[];
+    }>;
+    const multi = rows.find((o) => o.id === multiItemOrderId)!;
+    const single = rows.find((o) => o.id === singleItemOrderId)!;
+
+    expect(multi.items).toHaveLength(2);
+    expect(single.items).toHaveLength(1);
+    expect(single.items[0].menuItemId).toBe(bevItemId);
+    expect(single.items[0].qty).toBe(3);
+    expect(single.print_jobs).toHaveLength(1);
+  });
+
+  it("?include=items behaves the same as ?detail=1 (alias)", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ status: "NEW", include: "items" });
+
+    expect(res.status).toBe(200);
+    const found = (res.body as Array<{ id: string; items: unknown[] }>).find(
+      (o) => o.id === multiItemOrderId,
+    );
+    expect(found).toBeTruthy();
+    expect(found!.items).toHaveLength(2);
+  });
+
+  it("?detail=0 is treated as summary mode (no items key)", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ status: "NEW", detail: "0" });
+
+    expect(res.status).toBe(200);
+    const found = (res.body as Array<Record<string, unknown>>).find(
+      (o) => o.id === multiItemOrderId,
+    );
+    expect(found).toBeTruthy();
+    expect(Object.prototype.hasOwnProperty.call(found, "items")).toBe(false);
+  });
+
+  it("empty result set with detail=1 (no matching orders) returns []", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ brand_id: "00000000-0000-4000-a000-000000000099", detail: "1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders?detail=1 — H2 outlet scoping (ASSIGNED user must not see
+// another outlet's orders, detailed or not)
+// ---------------------------------------------------------------------------
+
+describe("GET /api/v1/orders?detail=1 — respects outlet scope (H2)", () => {
+  let scopedOutletId: string;
+  let scopedToken: string;
+  let scopedBrandId: string;
+  let scopedItemId: string;
+
+  beforeAll(async () => {
+    // A brand-new outlet, distinct from the deployment default outlet that
+    // brandId/grillItemId (file-level fixtures) live in.
+    const outletRes = await request(app)
+      .post("/api/v1/outlets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: "ORD-DETAIL-SCOPE", name: "Detail Scope Outlet", address: "Elsewhere" });
+    expect(outletRes.status).toBe(201);
+    scopedOutletId = outletRes.body.id as string;
+
+    // An ASSIGNED (single-outlet) KITCHEN_CREW user, member of ONLY scopedOutletId.
+    const email = `detail-scope-${Date.now()}@cloudkitchen.local`;
+    const [u] = await db
+      .insert(users)
+      .values({
+        name: "Detail Scope Crew",
+        email,
+        passwordHash: await hashPassword("password123"),
+        role: "KITCHEN_CREW",
+      })
+      .returning();
+    await db.insert(userOutletAccess).values({ userId: u.id, locationId: scopedOutletId });
+    const loginRes = await request(app)
+      .post("/api/v1/auth/login")
+      .send({ email, password: "password123" });
+    scopedToken = loginRes.body.token as string;
+    expect(scopedToken).toBeTruthy();
+
+    // Brand + station + menu item at the NEW outlet.
+    const brandRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Detail Scope Brand", color: "#abcdef", location_id: scopedOutletId });
+    scopedBrandId = brandRes.body.id as string;
+
+    await request(app)
+      .post(`/api/v1/brands/${scopedBrandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "GRABFOOD", external_merchant_id: "GF-DETAIL-SCOPE", credential_ref: "ref-detail-scope" });
+
+    const stationRes = await request(app)
+      .post("/api/v1/stations")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .set("X-Outlet-Id", scopedOutletId)
+      .send({ name: "Detail Scope Station" });
+    const scopedStationId = stationRes.body.id as string;
+
+    const menuRes = await request(app)
+      .post(`/api/v1/brands/${scopedBrandId}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Detail Scope Dish", price: "77", station_id: scopedStationId });
+    scopedItemId = menuRes.body.id as string;
+  });
+
+  it("ASSIGNED user's ?detail=1 list excludes another outlet's detailed order, and hydrates its own", async () => {
+    // Order at the default/other outlet (NOT in the scoped user's access).
+    const otherOutletOrder = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: nextRef(),
+        items: [{ menu_item_id: grillItemId, qty: 1 }],
+      });
+    expect(otherOutletOrder.status).toBe(201);
+    const otherOrderId = otherOutletOrder.body.order_id as string;
+
+    // Order at the scoped user's own outlet.
+    const ownOrder = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: scopedBrandId,
+        aggregator: "GRABFOOD",
+        external_ref: nextRef(),
+        items: [{ menu_item_id: scopedItemId, qty: 1 }],
+      });
+    expect(ownOrder.status).toBe(201);
+    const ownOrderId = ownOrder.body.order_id as string;
+
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${scopedToken}`)
+      .query({ detail: "1" });
+
+    expect(res.status).toBe(200);
+    const rows = res.body as Array<{
+      id: string;
+      items: Array<{ menuItemId: string }>;
+      print_jobs: unknown[];
+    }>;
+    const ids = rows.map((o) => o.id);
+    expect(ids).toContain(ownOrderId);
+    expect(ids).not.toContain(otherOrderId);
+
+    const ownRow = rows.find((o) => o.id === ownOrderId)!;
+    expect(ownRow.items.length).toBeGreaterThan(0);
+    expect(ownRow.items[0].menuItemId).toBe(scopedItemId);
+    expect(ownRow.print_jobs.length).toBeGreaterThan(0);
+  });
+
+  it("ALL-scope admin's ?detail=1 list still sees both outlets' orders, each correctly hydrated", async () => {
+    const res = await request(app)
+      .get("/api/v1/orders")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ detail: "1", brand_id: scopedBrandId });
+
+    expect(res.status).toBe(200);
+    const rows = res.body as Array<{ id: string; items: unknown[] }>;
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(Array.isArray(row.items)).toBe(true);
+    }
   });
 });
 

@@ -17,13 +17,33 @@
 import { createServer } from "node:http";
 import { Server as IOServer } from "socket.io";
 import { createApp } from "./app.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, isPostgresUrl } from "./config.js";
 import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
 import { createDb } from "./db/client.js";
+import { runMigrations } from "./db/migrate.js";
 import { createSocketHub } from "./realtime/hub.js";
 
 const config = loadConfig();
 const { db } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUrl });
+
+// DB target banner — make it impossible to miss WHICH database this process talks to.
+// A silent, uncommented cloud DATABASE_URL in .env once caused local "dev" runs to mutate
+// shared Supabase data; this line surfaces that every startup. Host only, never credentials.
+if (isPostgresUrl(config.databaseUrl)) {
+  let host = "unknown";
+  try {
+    host = new URL(config.databaseUrl).host; // host:port only — no user/password
+  } catch {
+    /* leave "unknown" */
+  }
+  console.warn(`DB: REMOTE Postgres (${host}) — WARNING: writes affect SHARED data. Migrations are NOT auto-run here (use \`npm run migrate\` deliberately).`);
+} else {
+  // Local PGlite: auto-apply migrations so the dev DB never silently drifts out of schema
+  // (a stale local DB otherwise 500s every login with "relation ... does not exist").
+  // Guarded to the PGlite path ONLY — a remote/cloud DB is never auto-migrated.
+  await runMigrations(db);
+  console.log(`DB: PGlite (local: ${config.dbPath ?? "in-memory"}) — migrations applied`);
+}
 
 // 1. Bare HTTP server (no request handler — Express is added below)
 const httpServer = createServer();

@@ -889,6 +889,64 @@ export async function listOrders(
 }
 
 // ---------------------------------------------------------------------------
+// listOrdersWithDetail — GET /orders?detail=1
+//
+// Perf fix (N+1 KDS fetch): the frontend used to call GET /orders for a
+// summary list, then GET /orders/:id ONCE PER ORDER to hydrate items +
+// print_jobs for the kitchen display (see ckitchen_frontend
+// src/hooks/useKitchenOrders.ts). That is dozens of extra round-trips on a
+// busy board, each paying Supabase latency.
+//
+// Fix: reuse listOrders() for filtering/outlet-scoping (unchanged, one query
+// plus whatever extra lookups the filters already need — station_id /
+// location_ids), then fetch ALL items and ALL print_jobs for the resulting
+// order set in exactly two bulk queries (`WHERE order_id IN (...)`), and
+// assemble the per-order item/print_jobs arrays in memory. Total query count
+// is O(1) in the number of orders returned — NOT one extra query per order.
+// ---------------------------------------------------------------------------
+
+export interface OrderWithDetail {
+  order: typeof orders.$inferSelect;
+  items: (typeof orderItems.$inferSelect)[];
+  print_jobs: (typeof printJobs.$inferSelect)[];
+}
+
+export async function listOrdersWithDetail(
+  db: DB,
+  filters: Parameters<typeof listOrders>[1],
+): Promise<OrderWithDetail[]> {
+  const rows = await listOrders(db, filters);
+  if (rows.length === 0) return [];
+
+  const orderIds = rows.map((o) => o.id);
+
+  // Bulk fetch #1: every order_item for every order in the result set.
+  const items = await db.select().from(orderItems).where(inArray(orderItems.orderId, orderIds));
+  // Bulk fetch #2: every print_job for every order in the result set.
+  const jobs = await db.select().from(printJobs).where(inArray(printJobs.orderId, orderIds));
+
+  const itemsByOrder = new Map<string, (typeof orderItems.$inferSelect)[]>();
+  for (const item of items) {
+    const arr = itemsByOrder.get(item.orderId);
+    if (arr) arr.push(item);
+    else itemsByOrder.set(item.orderId, [item]);
+  }
+
+  const jobsByOrder = new Map<string, (typeof printJobs.$inferSelect)[]>();
+  for (const job of jobs) {
+    const arr = jobsByOrder.get(job.orderId);
+    if (arr) arr.push(job);
+    else jobsByOrder.set(job.orderId, [job]);
+  }
+
+  return rows.map((order) => ({
+    order,
+    items: itemsByOrder.get(order.id) ?? [],
+    print_jobs: jobsByOrder.get(order.id) ?? [],
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // getOrderDetail — GET /orders/:id
 // Returns order + its items + its print jobs
 // ---------------------------------------------------------------------------

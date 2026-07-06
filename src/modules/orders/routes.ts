@@ -4,7 +4,11 @@
  * Endpoints:
  *   POST /ingest/order               — create / idempotent replay
  *   GET  /orders                     — unified feed (filters: brand_id, aggregator,
- *                                      station_id, status, from, to)
+ *                                      station_id, status, from, to; opt-in
+ *                                      ?detail=1 / ?include=items bulk-hydrates
+ *                                      items[]+print_jobs[] per order — see
+ *                                      listOrdersWithDetail in service.ts, the
+ *                                      server-side fix for the KDS N+1 fetch)
  *   GET  /orders/:id                 — detail with items + print-job status
  *   POST /orders/:id/advance         — advance stage; triggers deduction on NEW→PREPARING
  *   POST /orders/:id/cancel          — cancel; compensating restock if at/after PREPARING
@@ -41,6 +45,7 @@ import {
   getOrderDetail,
   ingestOrder,
   listOrders,
+  listOrdersWithDetail,
   type IngestOrderInput,
 } from "./service.js";
 import { startSimulator, stopSimulator } from "./simulator.js";
@@ -169,11 +174,26 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   // ── GET /orders ────────────────────────────────────────────────────────
   // H2: outlet-scoped. ALL-scope sees every outlet (optionally narrowed by
   // X-Outlet-Id); an ASSIGNED user sees only orders at outlets they belong to.
+  //
+  // Perf fix — N+1 KDS fetch: `?detail=1` (alias `?include=items`) opt-in
+  // returns each order with the SAME items[]/print_jobs[] shape as
+  // GET /orders/:id, bulk-fetched (see listOrdersWithDetail — O(1) extra
+  // queries, not one per order). Omitted → response is byte-identical to the
+  // pre-existing summary contract (no `items`/`print_jobs` keys at all).
   router.get("/orders", requireAuth, resolveOutletContext, async (req, res) => {
     const { brand_id, aggregator, station_id, from, to } = req.query as Record<
       string,
       string | undefined
     >;
+
+    const detailRaw = req.query.detail;
+    const includeRaw = req.query.include;
+    const detailRequested =
+      (detailRaw !== undefined && String(detailRaw) !== "0" && String(detailRaw) !== "false") ||
+      String(includeRaw ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .includes("items");
 
     // status accepts a single value, a comma-separated list, or repeated params
     // (?status=NEW&status=PREPARING) — the KDS needs several active stages at once.
@@ -205,16 +225,34 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
+    const listFilters = {
+      brand_id,
+      aggregator,
+      station_id,
+      status: statuses,
+      from,
+      to,
+      location_ids: listScopeLocationIds(req.outletContext) ?? undefined,
+    };
+
     try {
-      const rows = await listOrders(db, {
-        brand_id,
-        aggregator,
-        station_id,
-        status: statuses,
-        from,
-        to,
-        location_ids: listScopeLocationIds(req.outletContext) ?? undefined,
-      });
+      if (detailRequested) {
+        // Same outlet-scope filter as summary mode (listFilters.location_ids) —
+        // listOrdersWithDetail delegates the WHERE/scoping to listOrders()
+        // internally, so an ASSIGNED user's detailed list is still bounded to
+        // their outlets exactly like the summary list.
+        const detailed = await listOrdersWithDetail(db, listFilters);
+        res.json(
+          detailed.map((d) => ({
+            ...d.order,
+            items: d.items,
+            print_jobs: d.print_jobs,
+          })),
+        );
+        return;
+      }
+
+      const rows = await listOrders(db, listFilters);
       res.json(rows);
     } catch (err) {
       handleServiceError(err, res);

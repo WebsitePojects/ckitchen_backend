@@ -15,6 +15,13 @@ export interface AuthenticatedUser {
   outletScope: OutletScope;
   /** Outlet ids this user may act in (JWT `outlet_ids` claim; [] if unscoped/legacy). */
   outletIds: string[];
+  /**
+   * Display name from the JWT `name` claim, for audit actor attribution
+   * (never from client body fields — anti-spoof). Null on tokens minted
+   * before this claim existed; callers should fall back to null rather
+   * than guessing a name.
+   */
+  name: string | null;
 }
 
 /** Resolved outlet context for a request (set by {@link resolveOutletContext}). */
@@ -94,6 +101,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       sessionId: payload.sid,
       outletScope: payload.outlet_scope ?? outletScopeForRole(payload.role),
       outletIds: Array.isArray(payload.outlet_ids) ? payload.outlet_ids : [],
+      name: typeof payload.name === "string" && payload.name.length > 0 ? payload.name : null,
     };
     next();
   } catch {

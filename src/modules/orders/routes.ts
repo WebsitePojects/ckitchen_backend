@@ -14,11 +14,15 @@
  *   POST /orders/:id/cancel          — cancel; compensating restock if at/after PREPARING
  *   POST /simulator/start            — start order simulator (SUPER_ADMIN)
  *   POST /simulator/stop             — stop simulator   (SUPER_ADMIN)
+ *   GET  /simulator/status           — current simulator state (any authenticated
+ *                                      user; lets the frontend restore "running"
+ *                                      after a page navigation/reload)
  *
  * RBAC:
- *   ingest / read       — any authenticated user
- *   advance / cancel    — SUPER_ADMIN | KITCHEN_STAFF
- *   simulator start/stop— SUPER_ADMIN only
+ *   ingest / read        — any authenticated user
+ *   advance / cancel     — SUPER_ADMIN | KITCHEN_STAFF
+ *   simulator start/stop — SUPER_ADMIN only
+ *   simulator status     — any authenticated user (read-only, no state change)
  *
  * Task 8 — realtime emissions:
  *   order.created  → after successful ingest (not on DUPLICATE_ORDER)
@@ -48,7 +52,7 @@ import {
   listOrdersWithDetail,
   type IngestOrderInput,
 } from "./service.js";
-import { startSimulator, stopSimulator } from "./simulator.js";
+import { getSimulatorStatus, startSimulator, stopSimulator } from "./simulator.js";
 
 // ---------------------------------------------------------------------------
 // RBAC role sets
@@ -151,6 +155,21 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       }
 
       res.status(201).json(result);
+
+      // EMS: audit order.create (non-blocking). Actor is a real authenticated
+      // user hitting this HTTP endpoint (requireAuth guarantees req.user is
+      // set) — distinct from simulator-generated orders, which call
+      // ingestOrder() directly and are attributed to "System" in simulator.ts.
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        actorName: req.user?.name ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "order.create",
+        description: `ingested order ${result.order_id} for brand ${parsed.data.brand_id} via ${parsed.data.aggregator}`,
+        entityType: "order",
+        entityId: result.order_id,
+        metadata: { aggregator: parsed.data.aggregator, external_ref: parsed.data.external_ref },
+      });
 
       // Task 8: emit order.created after successful HTTP response is sent
       // Use brand_id from the validated input to resolve the location room.
@@ -321,6 +340,7 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         // EMS: audit order.advance (non-blocking — swallows errors internally)
         void audit(db, {
           actorUserId: req.user?.id ?? null,
+          actorName: req.user?.name ?? null,
           sessionId: req.user?.sessionId ?? null,
           action: "order.advance",
           description: `marked order ${id} as ${result.status}`,
@@ -386,6 +406,7 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         // EMS: audit order.cancel WITH reason (non-blocking)
         void audit(db, {
           actorUserId: req.user?.id ?? null,
+          actorName: req.user?.name ?? null,
           sessionId: req.user?.sessionId ?? null,
           action: "order.cancel",
           description: `cancelled order ${id}: ${reason.trim()}`,
@@ -429,6 +450,13 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   router.post("/simulator/stop", requireAuth, requireRole(...SIMULATOR_ROLES), (_req, res) => {
     stopSimulator();
     res.json({ ok: true });
+  });
+
+  // ── GET /simulator/status ──────────────────────────────────────────────
+  // Read-only; any authenticated user (not gated by SIMULATOR_ROLES) so the
+  // frontend can restore "simulator running" state after a page navigation.
+  router.get("/simulator/status", requireAuth, (_req, res) => {
+    res.json(getSimulatorStatus());
   });
 
   return router;

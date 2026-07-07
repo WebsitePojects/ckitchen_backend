@@ -110,6 +110,7 @@ export function createMasterRouter(db: DB): Router {
 
       void audit(db, {
         actorUserId: req.user!.id,
+        actorName: req.user!.name ?? null,
         sessionId: req.user!.sessionId ?? null,
         action: `${entityType}.create`,
         description: `Created ${entityType} ${code} — ${parsed.data.name}`,
@@ -144,6 +145,7 @@ export function createMasterRouter(db: DB): Router {
 
       void audit(db, {
         actorUserId: req.user!.id,
+        actorName: req.user!.name ?? null,
         sessionId: req.user!.sessionId ?? null,
         action: `${entityType}.update`,
         description: `Updated ${entityType} ${existing.code}`,
@@ -204,6 +206,7 @@ export function createMasterRouter(db: DB): Router {
 
     void audit(db, {
       actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: "department_access.upsert",
       description: `Set ${d.department} access on ${d.warehouse_type} warehouse`,

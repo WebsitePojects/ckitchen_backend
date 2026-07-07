@@ -14,6 +14,14 @@ export interface AuthTokenPayload {
   outlet_scope?: OutletScope;
   /** Tenancy (D22): outlet ids the user may act in (from user_outlet_access). */
   outlet_ids?: string[];
+  /**
+   * Display name at sign-in time. Carried on the token so every downstream
+   * `audit(...)` call can attribute a human-readable actor without an extra
+   * DB round-trip (see docs/audit/audit-event-types.md). Optional so tokens
+   * minted before this claim existed still verify; those requests fall back
+   * to a null actorName rather than crashing.
+   */
+  name?: string;
 }
 
 /** Options for {@link signToken}: session id + tenancy claims (D22). */
@@ -46,12 +54,15 @@ export async function fakeVerifyPassword(plain: string): Promise<void> {
 
 /**
  * Signs a JWT carrying the user id (`sub`), role, optional session id (`sid`),
- * and the tenancy claims `outlet_scope`/`outlet_ids` (D22). When scope/ids are
- * not supplied, scope defaults to the role's default (HQ→ALL, else ASSIGNED)
- * and ids default to empty, so callers that don't care still mint a valid token.
+ * the tenancy claims `outlet_scope`/`outlet_ids` (D22), and — when the caller
+ * has it on hand — the user's display `name` (audit actor attribution). When
+ * scope/ids are not supplied, scope defaults to the role's default (HQ→ALL,
+ * else ASSIGNED) and ids default to empty, so callers that don't care still
+ * mint a valid token. `name` is optional on the input type too (existing
+ * direct callers that only have {id, role}, e.g. tests, keep compiling).
  */
 export function signToken(
-  user: Pick<User, "id" | "role">,
+  user: Pick<User, "id" | "role"> & Partial<Pick<User, "name">>,
   jwtSecret: string,
   opts: SignTokenOptions = {},
 ): string {
@@ -64,6 +75,7 @@ export function signToken(
     outlet_ids: outletIds,
   };
   if (opts.sessionId) payload.sid = opts.sessionId;
+  if (user.name) payload.name = user.name;
   return jwt.sign(payload, jwtSecret, { algorithm: "HS256", expiresIn: "12h" });
 }
 

@@ -143,6 +143,7 @@ export function createAuthRouter(db: DB): Router {
       // Audit the logout (non-blocking)
       void audit(db, {
         actorUserId: req.user!.id,
+        actorName: req.user!.name ?? null,
         sessionId: sid,
         action: "auth.logout",
         description: "User logged out",

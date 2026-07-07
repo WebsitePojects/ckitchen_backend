@@ -10,6 +10,7 @@
 import type { DB } from "../../db/client.js";
 import { aggregatorAccounts, menuItems } from "../../db/schema.js";
 import { eq, inArray } from "drizzle-orm";
+import { audit } from "../ems/audit.js";
 import { ingestOrder, type IngestOrderInput } from "./service.js";
 
 // ---------------------------------------------------------------------------
@@ -59,9 +60,33 @@ export function generateOrderInput(data: SimulatorBrandData): IngestOrderInput {
 
 let simulatorTimer: ReturnType<typeof setInterval> | null = null;
 
+/**
+ * Last-known start parameters, kept alongside the timer so a page reload (or a
+ * second admin tab) can restore "simulator running" state via GET
+ * /simulator/status instead of guessing from silence. Cleared (brandIds=[],
+ * ratePerMin=null) on stop.
+ */
+let simulatorBrandIds: string[] = [];
+let simulatorRatePerMin: number | null = null;
+
 /** True if the simulator is currently running. */
 export function isSimulatorRunning(): boolean {
   return simulatorTimer !== null;
+}
+
+export interface SimulatorStatus {
+  running: boolean;
+  brand_ids: string[];
+  rate_per_min: number | null;
+}
+
+/** Current simulator state, for GET /simulator/status (any authenticated user). */
+export function getSimulatorStatus(): SimulatorStatus {
+  return {
+    running: simulatorTimer !== null,
+    brand_ids: simulatorBrandIds,
+    rate_per_min: simulatorRatePerMin,
+  };
 }
 
 /**
@@ -75,6 +100,9 @@ export function isSimulatorRunning(): boolean {
 export function startSimulator(db: DB, brandIds: string[], ratePerMin: number): void {
   // Clear any existing timer
   stopSimulator();
+
+  simulatorBrandIds = brandIds;
+  simulatorRatePerMin = ratePerMin;
 
   const intervalMs = Math.max(1000, Math.round(60_000 / ratePerMin));
 
@@ -126,7 +154,24 @@ export function startSimulator(db: DB, brandIds: string[], ratePerMin: number): 
         menuItemIds: brandMenuItems,
       });
 
-      await ingestOrder(db, orderInput);
+      const result = await ingestOrder(db, orderInput);
+
+      // Actor attribution: simulator-generated orders have no live request/user
+      // behind them, so they are attributed to "System" (never left blank, never
+      // spoofable — see docs/audit/audit-event-types.md). Skip the (practically
+      // unreachable, since external_ref is timestamp+random) DUPLICATE_ORDER case
+      // to mirror the real ingest route, which also only audits genuine creates.
+      if (result.code !== "DUPLICATE_ORDER") {
+        void audit(db, {
+          actorUserId: null,
+          actorName: "System",
+          action: "order.create",
+          description: `Order simulator generated order ${result.order_id} for brand ${brandId} via ${aggregator}`,
+          entityType: "order",
+          entityId: result.order_id,
+          metadata: { source: "simulator", aggregator, brand_id: brandId },
+        });
+      }
     } catch {
       // Simulator errors are non-fatal; log but keep the timer running
       // (A proper production implementation would log to observability tooling)
@@ -140,4 +185,6 @@ export function stopSimulator(): void {
     clearInterval(simulatorTimer);
     simulatorTimer = null;
   }
+  simulatorBrandIds = [];
+  simulatorRatePerMin = null;
 }

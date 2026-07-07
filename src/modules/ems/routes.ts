@@ -272,6 +272,7 @@ export function createEmsRouter(db: DB): Router {
 
     void audit(db, {
       actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: type === "TIME_IN" ? "attendance.time_in" : "attendance.time_out",
       description: `${type} for ${emp.fullName} (${emp.employeeNo})`,

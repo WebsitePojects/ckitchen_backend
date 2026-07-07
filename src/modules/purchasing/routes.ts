@@ -133,6 +133,7 @@ export function createPurchasingRouter(db: DB): Router {
 
     void audit(db, {
       actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: "purchase_request.create",
       description: `Created ${prNo} (${parsed.data.department})`,
@@ -194,6 +195,7 @@ export function createPurchasingRouter(db: DB): Router {
         .returning();
       void audit(db, {
         actorUserId: req.user!.id,
+        actorName: req.user!.name ?? null,
         sessionId: req.user!.sessionId ?? null,
         action: `purchase_request.${action}`,
         description: `${pr.prNo}: ${from} → ${to}`,
@@ -264,6 +266,7 @@ export function createPurchasingRouter(db: DB): Router {
 
     void audit(db, {
       actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: "purchase_order.create",
       description: `Created ${poNo} for ${supplier.name}`,
@@ -313,6 +316,7 @@ export function createPurchasingRouter(db: DB): Router {
       .returning();
     void audit(db, {
       actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: "purchase_order.send",
       description: `${po.poNo}: DRAFT → SENT`,
@@ -443,6 +447,7 @@ export function createPurchasingRouter(db: DB): Router {
 
     void audit(db, {
       actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: "purchase_order.receive",
       description: `Received against ${po.poNo} → ${rrNo}`,

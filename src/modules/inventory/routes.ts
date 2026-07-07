@@ -385,6 +385,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       // EMS: audit inventory.receive (non-blocking)
       void audit(db, {
         actorUserId: req.user?.id ?? null,
+        actorName: req.user?.name ?? null,
         sessionId: req.user?.sessionId ?? null,
         action: "inventory.receive",
         description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse`,
@@ -713,6 +714,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       // EMS: audit ito.confirm (non-blocking)
       void audit(db, {
         actorUserId: req.user?.id ?? null,
+        actorName: req.user?.name ?? null,
         sessionId: req.user?.sessionId ?? null,
         action: "ito.confirm",
         description: `confirmed ITO ${id}`,

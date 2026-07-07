@@ -51,6 +51,11 @@ export const printJobStatusEnum = pgEnum("print_job_status", ["PENDING", "PRINTE
 
 export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE"]);
 
+/** W5 (admin backend): account status. BLOCKED users are refused login (checked
+ * AFTER password verification — not an enumeration oracle) and have their live
+ * sessions revoked immediately via userSessions.logoutAt. */
+export const userStatusEnum = pgEnum("user_status", ["ACTIVE", "BLOCKED"]);
+
 export const warehouseTypeEnum = pgEnum("warehouse_type", ["MAIN", "KITCHEN"]);
 
 // Roles v2 (D24/D29): the enum keeps BOTH the original v1 values (as accepted
@@ -377,6 +382,7 @@ export const users = pgTable("user", {
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
   role: roleEnum("role").notNull(),
+  status: userStatusEnum("status").notNull().default("ACTIVE"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }).enableRLS();
@@ -1034,3 +1040,28 @@ export const receivingReportLines = pgTable(
   ],
 ).enableRLS();
 export type ReceivingReportLine = typeof receivingReportLines.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// W5: role_page_access  (admin-editable role -> page visibility matrix)
+//
+// Persists the same page-key set as the frontend's PAGE_ROLES map
+// (ckitchen_frontend/src/auth/access.ts), so an OWNER can edit access without a
+// code deploy. Frontend enforcement of this table is a separate workstream —
+// this migration only adds the data + API layer. One row per (role, pageKey);
+// every combination is seeded so GET /admin/rbac always returns a dense grid.
+// ---------------------------------------------------------------------------
+
+export const rolePageAccess = pgTable(
+  "role_page_access",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    role: roleEnum("role").notNull(),
+    pageKey: text("page_key").notNull(),
+    allowed: boolean("allowed").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex("role_page_access_role_page_unique").on(table.role, table.pageKey)],
+).enableRLS();
+
+export type RolePageAccess = typeof rolePageAccess.$inferSelect;
+export type NewRolePageAccess = typeof rolePageAccess.$inferInsert;

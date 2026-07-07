@@ -81,6 +81,17 @@ export function createAuthRouter(db: DB): Router {
       return;
     }
 
+    // W5: a BLOCKED account is refused login. Checked AFTER password verification
+    // (mirrors the retired-role check above) so it is not an account-enumeration
+    // oracle — an attacker cannot distinguish a blocked account from a wrong
+    // password. Blocking also revokes live sessions (admin block endpoint), so an
+    // already-authenticated blocked user is cut off immediately by requireAuth's
+    // revocation check; this closes the door on any fresh login too.
+    if (user.status === "BLOCKED") {
+      sendError(res, 403, "ACCOUNT_BLOCKED", "This account has been blocked. Contact an administrator.");
+      return;
+    }
+
     // Create a user_session row to track this login
     const ip = (req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0]?.trim()
       ?? req.socket?.remoteAddress

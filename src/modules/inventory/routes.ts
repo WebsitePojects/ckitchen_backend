@@ -19,7 +19,7 @@
  *   stock.updated → after /inventory/receive (MAIN) and /itos/:id/confirm (KITCHEN)
  */
 import { Router, type Request, type Response } from "express";
-import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -30,6 +30,9 @@ import {
   itoStatusEnum,
   itos,
   locations,
+  orders,
+  receivingReportLines,
+  receivingReports,
   stockLedgerEntries,
   stockReservations,
   supplierItems,
@@ -42,6 +45,7 @@ import { isOutletInScope } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
+import { docNo } from "../purchasing/doc-no.js";
 import { postLedger } from "./ledger.js";
 
 // ---------------------------------------------------------------------------
@@ -88,10 +92,18 @@ const linkSupplierSchema = z.object({
 const receiveItemSchema = z.object({
   ingredient_id: z.string().uuid(),
   quantity: z.union([z.string().min(1), z.number()]),
+  // 0024: actual unit price paid on this delivery line (gprci RR standard).
+  unit_cost: z.number().min(0).optional(),
 });
 
+// 0024: a direct receive is a PROPER Receiving Report (po_id NULL). All new
+// fields are optional so legacy minimal bodies keep working unchanged.
 const receiveSchema = z.object({
   outlet_id: z.string().uuid().optional(),
+  supplier_id: z.string().uuid().optional(),
+  /** Supplier's DR / invoice number. */
+  reference: z.string().max(64).optional(),
+  notes: z.string().max(500).optional(),
   items: z.array(receiveItemSchema).min(1),
 });
 
@@ -705,13 +717,49 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         }
       }
 
-      // Upsert each item into MAIN inventory_stock (add to existing qty if row present).
-      // Also post a RECEIVE ledger row inside the same transaction (ERP R1).
-      // Generate a receive document ref: RECV-<timestamp>-<mainWarehouseId-prefix>
-      const receiveDocNo = `RECV-${Date.now()}-${mainWarehouse.id.slice(0, 8)}`;
+      // 0024: validate the supplier (when given) before touching stock.
+      if (parsed.data.supplier_id) {
+        const [supplier] = await db
+          .select({ id: suppliers.id })
+          .from(suppliers)
+          .where(eq(suppliers.id, parsed.data.supplier_id));
+        if (!supplier) {
+          sendError(res, 404, "NOT_FOUND", `Supplier ${parsed.data.supplier_id} not found.`);
+          return;
+        }
+      }
+
+      // 0024 (gprci RR standard): a direct receive produces a PROPER Receiving
+      // Report — same `RR-…` series as the PO-receive path, po_id NULL. Stock
+      // upserts, the RR + its lines, RECEIVE ledger rows, and the supplier_item
+      // cost upsert all commit in ONE transaction. sourceDocumentNo = rrNo,
+      // matching exactly what POST /purchase-orders/:id/receive stamps, so the
+      // ledger's RR enrichment (GET /stock-ledger source_ref) covers both paths.
+      const rrNo = docNo("RR");
+      let rr!: typeof receivingReports.$inferSelect;
 
       await db.transaction(async (tx) => {
+        [rr] = await tx
+          .insert(receivingReports)
+          .values({
+            rrNo,
+            poId: null, // direct receipt — no purchase order behind it
+            supplierId: parsed.data.supplier_id ?? null,
+            reference: parsed.data.reference ?? null,
+            warehouseId: mainWarehouse.id,
+            receivedByUserId: req.user!.id,
+            notes: parsed.data.notes ?? null,
+          })
+          .returning();
+
         for (const item of parsed.data.items) {
+          await tx.insert(receivingReportLines).values({
+            rrId: rr.id,
+            poLineId: null, // direct-receipt line — no purchase_order_line
+            ingredientId: item.ingredient_id,
+            qtyReceived: String(item.quantity),
+          });
+
           await tx
             .insert(inventoryStock)
             .values({
@@ -730,18 +778,40 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
           // ERP R1: post RECEIVE IN ledger row (idempotent on unique key)
           await postLedger(tx, {
             sourceModule: "RECEIVE",
-            sourceDocumentNo: receiveDocNo,
+            sourceDocumentNo: rrNo,
             sourceLineNo: item.ingredient_id,
             ingredientId: item.ingredient_id,
             warehouseId: mainWarehouse.id,
             movementType: "IN",
             quantity: item.quantity,
+            unitCost: item.unit_cost,
             encoderUserId: req.user?.id ?? null,
           });
+
+          // Costs track reality (same rule as the PO-receive path): receiving
+          // from a supplier is evidence of affiliation, and the price actually
+          // paid is the freshest cost signal — upsert supplier_item.last_unit_cost.
+          // Only when a cost was actually given: upserting without one would
+          // clobber a real last_unit_cost with 0. supplier_sku is left alone
+          // (null on first insert, untouched on update).
+          if (parsed.data.supplier_id && item.unit_cost != null) {
+            await tx
+              .insert(supplierItems)
+              .values({
+                supplierId: parsed.data.supplier_id,
+                ingredientId: item.ingredient_id,
+                lastUnitCost: String(item.unit_cost),
+              })
+              .onConflictDoUpdate({
+                target: [supplierItems.supplierId, supplierItems.ingredientId],
+                set: { lastUnitCost: String(item.unit_cost) },
+              });
+          }
         }
       });
 
-      res.status(201).json({ ok: true });
+      // Every existing field kept; `rr` is additive (0024).
+      res.status(201).json({ ok: true, rr: { id: rr.id, rrNo: rr.rrNo } });
 
       // EMS: audit inventory.receive (non-blocking)
       void audit(db, {
@@ -749,9 +819,10 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         actorName: req.user?.name ?? null,
         sessionId: req.user?.sessionId ?? null,
         action: "inventory.receive",
-        description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse`,
-        entityType: "warehouse",
-        metadata: { items: parsed.data.items },
+        description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse → ${rrNo}`,
+        entityType: "receiving_report",
+        entityId: rr.id,
+        metadata: { items: parsed.data.items, rr_no: rrNo },
       });
 
       // Task 8: emit stock.updated for each received ingredient (MAIN warehouse)
@@ -1130,8 +1201,21 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   //   from           — ISO timestamp lower bound on posted_at (inclusive)
   //   to             — ISO timestamp upper bound on posted_at (inclusive)
   //   limit          — max rows (default 100)
+  //   q              — case-insensitive search across ingredient name,
+  //                    source_ref, and source_document_no (client review
+  //                    2026-07-08: "search the ledger by order code")
   //
-  // Returns rows newest-first.
+  // Returns rows newest-first. Each row is the raw ledger row PLUS
+  // `source_ref: string | null` — the human-readable document reference:
+  //   ORDER_DEDUCTION / RESTOCK → the order's copyable order_code
+  //                               (fallback: its external_ref)
+  //   RECEIVE                   → the receiving report's rr_no (both the
+  //                               PO-receive and direct-receive paths stamp
+  //                               sourceDocumentNo = rr_no; legacy RECV-…
+  //                               rows resolve to null)
+  //   ADJUSTMENT / ITO          → null (the raw doc id column remains)
+  // Lookups are BATCHED: ids are collected per module and resolved with one
+  // query each — never per-row (no N+1).
   // -------------------------------------------------------------------------
   router.get("/stock-ledger", requireAuth, async (req, res) => {
     const {
@@ -1141,6 +1225,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       from: fromParam,
       to: toParam,
       limit: limitParam,
+      q: qParam,
     } = req.query as Record<string, string | undefined>;
 
     const conditions: ReturnType<typeof eq>[] = [];
@@ -1167,6 +1252,13 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
     }
 
     const limit = Math.min(Number(limitParam ?? 100), 500);
+    const q = qParam?.trim().toLowerCase() || undefined;
+
+    // q filters AFTER enrichment (source_ref lives app-side, not in SQL), so
+    // when searching we widen the scan window to the endpoint's 500-row cap and
+    // slice back down to `limit` after filtering. Existing filters/pagination
+    // behavior without q is byte-for-byte unchanged.
+    const scanLimit = q ? 500 : limit;
 
     const rows =
       conditions.length > 0
@@ -1175,14 +1267,99 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
             .from(stockLedgerEntries)
             .where(and(...(conditions as Parameters<typeof and>)))
             .orderBy(desc(stockLedgerEntries.postedAt))
-            .limit(limit)
+            .limit(scanLimit)
         : await db
             .select()
             .from(stockLedgerEntries)
             .orderBy(desc(stockLedgerEntries.postedAt))
-            .limit(limit);
+            .limit(scanLimit);
 
-    res.json(rows);
+    // ── source_ref enrichment (batched, one lookup query per module) ────────
+    const UUID_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    // ORDER_DEDUCTION / RESTOCK stamp sourceDocumentNo = the order's uuid.
+    const orderDocIds = [
+      ...new Set(
+        rows
+          .filter(
+            (r) =>
+              (r.sourceModule === "ORDER_DEDUCTION" || r.sourceModule === "RESTOCK") &&
+              UUID_RE.test(r.sourceDocumentNo),
+          )
+          .map((r) => r.sourceDocumentNo),
+      ),
+    ];
+    const orderRefByDoc = new Map<string, string | null>();
+    if (orderDocIds.length > 0) {
+      const orderRows = await db
+        .select({ id: orders.id, order_code: orders.order_code, externalRef: orders.externalRef })
+        .from(orders)
+        .where(inArray(orders.id, orderDocIds));
+      for (const o of orderRows) {
+        orderRefByDoc.set(o.id, o.order_code ?? o.externalRef ?? null);
+      }
+    }
+
+    // RECEIVE stamps sourceDocumentNo = rr_no (PO + direct paths). Older data
+    // may carry the RR's uuid instead — match both in ONE query. Legacy
+    // RECV-… doc refs match neither and stay null.
+    const receiveDocNos = [
+      ...new Set(rows.filter((r) => r.sourceModule === "RECEIVE").map((r) => r.sourceDocumentNo)),
+    ];
+    const rrRefByDoc = new Map<string, string>();
+    if (receiveDocNos.length > 0) {
+      const receiveDocUuids = receiveDocNos.filter((d) => UUID_RE.test(d));
+      const rrRows = await db
+        .select({ id: receivingReports.id, rrNo: receivingReports.rrNo })
+        .from(receivingReports)
+        .where(
+          receiveDocUuids.length > 0
+            ? or(
+                inArray(receivingReports.rrNo, receiveDocNos),
+                inArray(receivingReports.id, receiveDocUuids),
+              )
+            : inArray(receivingReports.rrNo, receiveDocNos),
+        );
+      for (const r of rrRows) {
+        rrRefByDoc.set(r.rrNo, r.rrNo);
+        rrRefByDoc.set(r.id, r.rrNo);
+      }
+    }
+
+    // Ingredient names — needed only to serve q searches; ONE batched query.
+    const nameByIngredient = new Map<string, string>();
+    if (q && rows.length > 0) {
+      const ingredientIds = [...new Set(rows.map((r) => r.ingredientId))];
+      const ingRows = await db
+        .select({ id: ingredients.id, name: ingredients.name })
+        .from(ingredients)
+        .where(inArray(ingredients.id, ingredientIds));
+      for (const i of ingRows) nameByIngredient.set(i.id, i.name);
+    }
+
+    let enriched = rows.map((row) => {
+      let sourceRef: string | null = null;
+      if (row.sourceModule === "ORDER_DEDUCTION" || row.sourceModule === "RESTOCK") {
+        sourceRef = orderRefByDoc.get(row.sourceDocumentNo) ?? null;
+      } else if (row.sourceModule === "RECEIVE") {
+        sourceRef = rrRefByDoc.get(row.sourceDocumentNo) ?? null;
+      }
+      // ADJUSTMENT / ITO: null on purpose — the raw doc id column remains.
+      return { ...row, source_ref: sourceRef };
+    });
+
+    if (q) {
+      enriched = enriched
+        .filter((row) =>
+          [nameByIngredient.get(row.ingredientId), row.source_ref, row.sourceDocumentNo].some(
+            (v) => v != null && v.toLowerCase().includes(q),
+          ),
+        )
+        .slice(0, limit);
+    }
+
+    res.json(enriched);
   });
 
   return router;

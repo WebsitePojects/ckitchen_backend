@@ -373,3 +373,89 @@ describe("GET /api/v1/ems/attendance/dtr", () => {
     expect(pair.minutes).toBeNull();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/ems/attendance/dtr — 24h forfeit rule + status field
+// (client review 2026-07-08)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("DTR status: COMPLETE / OPEN / FORFEITED (24h rule)", () => {
+  const photo = {
+    photoUrl: "https://res.cloudinary.com/test/image/upload/ck1/attendance/status.jpg",
+    photoPublicId: "ck1/attendance/status",
+  };
+
+  async function makeEmployee(no: string, name: string): Promise<string> {
+    const [emp] = await db
+      .insert(employees)
+      .values({ employeeNo: no, fullName: name, department: "ADMIN", status: "ACTIVE" })
+      .returning();
+    return emp!.id;
+  }
+
+  async function dtrFor(employeeId: string) {
+    const res = await request(app)
+      .get(`/api/v1/ems/attendance/dtr?employee_id=${employeeId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    return res.body as Array<{ status: string; time_out: string | null; minutes: number | null }>;
+  }
+
+  it("an unpaired TIME_IN older than 24h → FORFEITED, minutes stays null (no synthesized TIME_OUT)", async () => {
+    const empId = await makeEmployee("EMP-STAT-FORFEIT", "Forfeit Status Employee");
+    await db.insert(attendanceRecords).values({
+      employeeId: empId,
+      type: "TIME_IN",
+      ...photo,
+      capturedAt: new Date(Date.now() - 25 * 60 * 60 * 1000), // 25h ago
+      recordedByUserId: adminUserId,
+    });
+
+    const entries = await dtrFor(empId);
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.status).toBe("FORFEITED");
+    expect(entries[0]!.time_out).toBeNull(); // never synthesized
+    expect(entries[0]!.minutes).toBeNull(); // no credited time
+  });
+
+  it("a fresh unpaired TIME_IN (<24h) → OPEN", async () => {
+    const empId = await makeEmployee("EMP-STAT-OPEN", "Open Status Employee");
+    await db.insert(attendanceRecords).values({
+      employeeId: empId,
+      type: "TIME_IN",
+      ...photo,
+      capturedAt: new Date(Date.now() - 60 * 60 * 1000), // 1h ago
+      recordedByUserId: adminUserId,
+    });
+
+    const entries = await dtrFor(empId);
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.status).toBe("OPEN");
+    expect(entries[0]!.minutes).toBeNull();
+  });
+
+  it("a paired TIME_IN + TIME_OUT → COMPLETE (even on a long-past day)", async () => {
+    const empId = await makeEmployee("EMP-STAT-DONE", "Complete Status Employee");
+    await db.insert(attendanceRecords).values([
+      {
+        employeeId: empId,
+        type: "TIME_IN",
+        ...photo,
+        capturedAt: new Date("2026-05-05T08:00:00Z"),
+        recordedByUserId: adminUserId,
+      },
+      {
+        employeeId: empId,
+        type: "TIME_OUT",
+        ...photo,
+        capturedAt: new Date("2026-05-05T09:00:00Z"),
+        recordedByUserId: adminUserId,
+      },
+    ]);
+
+    const entries = await dtrFor(empId);
+    expect(entries.length).toBe(1);
+    expect(entries[0]!.status).toBe("COMPLETE");
+    expect(entries[0]!.minutes).toBe(60);
+  });
+});

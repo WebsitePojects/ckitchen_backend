@@ -4,6 +4,8 @@
  * Endpoints:
  *   GET  /employees                          — list (filter status/department)
  *   POST /employees                          — create (SUPER_ADMIN)
+ *   PATCH /employees/:id                     — partial update (SUPER_ADMIN)
+ *   GET  /employees/:id/profile              — Employee 360 month calendar + stats
  *   GET  /audit                              — audit trail (SUPER_ADMIN/BRAND_MANAGER)
  *   GET  /ems/analytics/employee/:userId     — per-staff analytics (self or admin)
  *
@@ -29,11 +31,63 @@ import {
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { normalizeRole } from "../auth/roles.js";
 import { sendError } from "../http-errors.js";
-import { recordAttendancePunch } from "./attendance-shared.js";
+import { pairDtrEntries, recordAttendancePunch, type DtrEntry } from "./attendance-shared.js";
 
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+// ── Work-days schedule (Employee 360) ──────────────────────────────────────
+// Canonical Mon→Sun token order. `work_days` is stored as a CSV of these; the
+// API always exposes it as a sanitized string[] (workDays).
+const WORK_DAY_TOKENS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] as const;
+type WorkDayToken = (typeof WORK_DAY_TOKENS)[number];
+const DEFAULT_WORK_DAYS: readonly WorkDayToken[] = ["MON", "TUE", "WED", "THU", "FRI"];
+const WORK_DAY_ORDER: Record<string, number> = Object.fromEntries(
+  WORK_DAY_TOKENS.map((t, i) => [t, i]),
+);
+/** RFC-4122 UUID shape check (for :id route params — a malformed id is a 404). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Parse a stored `work_days` CSV into a sanitized, canonically-ordered token
+ * array. Unknown/garbage tokens are dropped; a row that ends up empty (garbage
+ * or blank) falls back to the default 5-day work week.
+ */
+function parseWorkDays(csv: string | null | undefined): WorkDayToken[] {
+  const set = new Set<WorkDayToken>();
+  for (const raw of (csv ?? "").split(",")) {
+    const tok = raw.trim().toUpperCase();
+    if ((WORK_DAY_TOKENS as readonly string[]).includes(tok)) set.add(tok as WorkDayToken);
+  }
+  const tokens = [...set].sort((a, b) => WORK_DAY_ORDER[a]! - WORK_DAY_ORDER[b]!);
+  return tokens.length ? tokens : [...DEFAULT_WORK_DAYS];
+}
+
+/** Dedupe + canonically order a validated token array into the CSV we store. */
+function canonicalWorkDaysCsv(days: readonly WorkDayToken[]): string {
+  return [...new Set(days)].sort((a, b) => WORK_DAY_ORDER[a]! - WORK_DAY_ORDER[b]!).join(",");
+}
+
+/** Normalize a date-ish value (Date | 'YYYY-MM-DD…' | null) to 'YYYY-MM-DD' | null. */
+function toDateString(v: unknown): string | null {
+  if (v == null) return null;
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  const s = String(v);
+  return s.length >= 10 ? s.slice(0, 10) : s;
+}
+
+/** Public JSON shape for an employee row: workDays as string[], hiredAt as date. */
+function serializeEmployee(row: typeof employees.$inferSelect) {
+  return {
+    ...row,
+    workDays: parseWorkDays(row.workDays),
+    hiredAt: toDateString(row.hiredAt),
+  };
+}
+
+const workDaysInput = z.array(z.enum(WORK_DAY_TOKENS)).min(1);
+const hiredAtInput = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "hired_at must be YYYY-MM-DD").nullable();
 
 const createEmployeeSchema = z.object({
   user_id: z.string().uuid().optional(),
@@ -43,6 +97,21 @@ const createEmployeeSchema = z.object({
   position: z.string().optional(),
   photo_url: z.string().url().optional(),
   status: z.enum(employeeStatusEnum.enumValues).optional(),
+  work_days: workDaysInput.optional(),
+  hired_at: hiredAtInput.optional(),
+});
+
+// PATCH: every field optional (partial update). Unknown keys from old clients are
+// stripped by zod (default z.object behavior) so they can never break the update.
+const updateEmployeeSchema = z.object({
+  employee_no: z.string().min(1).optional(),
+  full_name: z.string().min(1).optional(),
+  department: z.enum(departmentEnum.enumValues).optional(),
+  position: z.string().nullable().optional(),
+  photo_url: z.string().url().nullable().optional(),
+  status: z.enum(employeeStatusEnum.enumValues).optional(),
+  work_days: workDaysInput.optional(),
+  hired_at: hiredAtInput.optional(),
 });
 
 const createAttendanceSchema = z.object({
@@ -81,7 +150,7 @@ export function createEmsRouter(db: DB): Router {
       ? await db.select().from(employees).where(and(...conditions))
       : await db.select().from(employees);
 
-    res.json(rows);
+    res.json(rows.map(serializeEmployee));
   });
 
   // ── POST /employees ───────────────────────────────────────────────────────
@@ -111,10 +180,51 @@ export function createEmsRouter(db: DB): Router {
         position: parsed.data.position ?? null,
         photoUrl: parsed.data.photo_url ?? null,
         status: parsed.data.status ?? "ACTIVE",
+        // Omit work_days when not supplied so the DB column default (the 5-day
+        // week) applies; store the canonical CSV when supplied.
+        ...(parsed.data.work_days ? { workDays: canonicalWorkDaysCsv(parsed.data.work_days) } : {}),
+        hiredAt: parsed.data.hired_at ?? null,
       })
       .returning();
 
-    res.status(201).json(employee);
+    res.status(201).json(serializeEmployee(employee!));
+  });
+
+  // ── PATCH /employees/:id ──────────────────────────────────────────────────
+  // Partial update; same OWNER gating as create. Only supplied fields change.
+  // (The EMS module does not audit employee writes — create doesn't either — so
+  // this stays consistent and writes no audit row.)
+  router.patch("/employees/:id", requireAuth, requireRole("OWNER"), async (req, res) => {
+    const id = req.params.id as string;
+    if (!UUID_RE.test(id)) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+      return;
+    }
+
+    const parsed = updateEmployeeSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
+      return;
+    }
+
+    const [existing] = await db.select({ id: employees.id }).from(employees).where(eq(employees.id, id));
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+      return;
+    }
+
+    const updates: Partial<typeof employees.$inferInsert> = { updatedAt: new Date() };
+    if (parsed.data.employee_no !== undefined) updates.employeeNo = parsed.data.employee_no;
+    if (parsed.data.full_name !== undefined) updates.fullName = parsed.data.full_name;
+    if (parsed.data.department !== undefined) updates.department = parsed.data.department;
+    if (parsed.data.position !== undefined) updates.position = parsed.data.position;
+    if (parsed.data.photo_url !== undefined) updates.photoUrl = parsed.data.photo_url;
+    if (parsed.data.status !== undefined) updates.status = parsed.data.status;
+    if (parsed.data.work_days !== undefined) updates.workDays = canonicalWorkDaysCsv(parsed.data.work_days);
+    if (parsed.data.hired_at !== undefined) updates.hiredAt = parsed.data.hired_at;
+
+    const [updated] = await db.update(employees).set(updates).where(eq(employees.id, id)).returning();
+    res.json(serializeEmployee(updated!));
   });
 
   // ── GET /audit ────────────────────────────────────────────────────────────
@@ -345,6 +455,17 @@ export function createEmsRouter(db: DB): Router {
   // Daily Time Record: one entry per (employee, UTC date) — earliest TIME_IN
   // paired with the latest TIME_OUT that day; worked minutes between them.
   // An unpaired TIME_IN yields time_out=null and minutes=null.
+  //
+  // 24-hour FORFEIT rule (client review 2026-07-08): every entry carries an
+  // additive `status` field —
+  //   COMPLETE  — paired TIME_IN + TIME_OUT
+  //   OPEN      — unpaired TIME_IN less than 24h old (shift may still close)
+  //   FORFEITED — unpaired TIME_IN older than 24h from "now": no time-out is
+  //               ever credited (worked minutes stays null) and the system
+  //               NEVER synthesizes a TIME_OUT — HR corrects the record
+  //               manually. The employee's NEXT-day TIME_IN is already
+  //               permitted because the punch gate and self/today are
+  //               day-scoped, so a forfeited yesterday never blocks today.
   router.get("/ems/attendance/dtr", requireAuth, async (req, res) => {
     const { employee_id, from, to } = req.query as Record<string, string | undefined>;
 
@@ -365,44 +486,164 @@ export function createEmsRouter(db: DB): Router {
       ? await db.select().from(attendanceRecords).where(and(...conditions)).orderBy(asc(attendanceRecords.capturedAt))
       : await db.select().from(attendanceRecords).orderBy(asc(attendanceRecords.capturedAt));
 
-    interface DtrEntry {
-      date: string;
-      employee_id: string;
-      time_in: string | null;
-      time_out: string | null;
-      photo_in: string | null;
-      photo_out: string | null;
-      minutes: number | null;
-    }
-    const byKey = new Map<string, DtrEntry>();
-    for (const r of rows) {
-      const iso = new Date(r.capturedAt).toISOString();
-      const date = iso.slice(0, 10);
-      const key = `${r.employeeId}|${date}`;
-      let entry = byKey.get(key);
-      if (!entry) {
-        entry = { date, employee_id: r.employeeId, time_in: null, time_out: null, photo_in: null, photo_out: null, minutes: null };
-        byKey.set(key, entry);
-      }
-      if (r.type === "TIME_IN") {
-        if (!entry.time_in) {
-          entry.time_in = iso;
-          entry.photo_in = r.photoUrl;
-        }
-      } else {
-        entry.time_out = iso; // latest TIME_OUT wins (rows asc by time)
-        entry.photo_out = r.photoUrl;
-      }
-    }
-    for (const entry of byKey.values()) {
-      if (entry.time_in && entry.time_out) {
-        entry.minutes = Math.round(
-          (new Date(entry.time_out).getTime() - new Date(entry.time_in).getTime()) / 60000,
-        );
-      }
+    // Pairing lives in attendance-shared.ts so the profile endpoint pairs
+    // identically (see pairDtrEntries). Rows are asc by capturedAt as required.
+    res.json(pairDtrEntries(rows));
+  });
+
+  // ── GET /employees/:id/profile ────────────────────────────────────────────
+  // Employee 360: a dense per-day attendance calendar for one month plus month
+  // stats. Same auth gating as GET /employees (requireAuth only). UTC days —
+  // consistent with the punch gate / self-today (Manila-day is a documented
+  // follow-up). Pairing is shared with the DTR route (pairDtrEntries), so a
+  // PRESENT day here is exactly a COMPLETE DTR entry.
+  router.get("/employees/:id/profile", requireAuth, async (req, res) => {
+    const id = req.params.id as string;
+    if (!UUID_RE.test(id)) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+      return;
     }
 
-    res.json(Array.from(byKey.values()));
+    const now = new Date();
+    const monthParam = req.query.month as string | undefined;
+    const month =
+      monthParam ??
+      `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+    const m = /^(\d{4})-(\d{2})$/.exec(month);
+    const monthNum = m ? Number(m[2]) : 0;
+    if (!m || monthNum < 1 || monthNum > 12) {
+      sendError(res, 400, "VALIDATION_ERROR", "month must be in YYYY-MM format (month 01-12).");
+      return;
+    }
+    const year = Number(m[1]);
+    const monthIndex = monthNum - 1;
+
+    const [emp] = await db.select().from(employees).where(eq(employees.id, id));
+    if (!emp) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+      return;
+    }
+
+    const daysInMonth = new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
+    const monthStart = new Date(Date.UTC(year, monthIndex, 1, 0, 0, 0, 0));
+    const monthEnd = new Date(Date.UTC(year, monthIndex, daysInMonth, 23, 59, 59, 999));
+
+    // ONE query for the month's punches, asc so pairDtrEntries can pair in memory.
+    const punches = await db
+      .select()
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.employeeId, id),
+          gte(attendanceRecords.capturedAt, monthStart),
+          lte(attendanceRecords.capturedAt, monthEnd),
+        ),
+      )
+      .orderBy(asc(attendanceRecords.capturedAt));
+
+    const nowMs = now.getTime();
+    const entryByDate = new Map<string, DtrEntry>();
+    for (const e of pairDtrEntries(punches, nowMs)) entryByDate.set(e.date, e);
+
+    const workDays = parseWorkDays(emp.workDays);
+    const workDaySet = new Set(workDays);
+    const DOW = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"] as const;
+    const todayStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-${String(now.getUTCDate()).padStart(2, "0")}`;
+    // Pre-hire scheduled days are NOT absences. Fall back to created_at's date
+    // when hired_at is unknown.
+    const hireStr = toDateString(emp.hiredAt) ?? toDateString(emp.createdAt) ?? "0000-01-01";
+
+    type DayStatus = "PRESENT" | "ABSENT" | "REST" | "FUTURE" | "FORFEITED" | "OPEN";
+    interface ProfileDay {
+      date: string;
+      scheduled: boolean;
+      status: DayStatus;
+      time_in: { at: string; photo_url: string } | null;
+      time_out: { at: string; photo_url: string } | null;
+      worked_minutes: number | null;
+    }
+
+    const days: ProfileDay[] = [];
+    let scheduled_days = 0;
+    let present_days = 0;
+    let absent_days = 0;
+    let rest_days = 0;
+    let forfeited = 0;
+    let open = 0;
+    let total_worked_minutes = 0;
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = `${year}-${String(monthNum).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const dow = new Date(Date.UTC(year, monthIndex, d)).getUTCDay();
+      const scheduled = workDaySet.has(DOW[dow] as WorkDayToken);
+      const entry = entryByDate.get(dateStr) ?? null;
+
+      let status: DayStatus;
+      let worked_minutes: number | null = null;
+      let time_in: ProfileDay["time_in"] = null;
+      let time_out: ProfileDay["time_out"] = null;
+
+      if (dateStr > todayStr) {
+        status = "FUTURE";
+      } else if (entry) {
+        // A punch exists this day.
+        time_in = entry.time_in ? { at: entry.time_in, photo_url: entry.photo_in ?? "" } : null;
+        time_out = entry.time_out ? { at: entry.time_out, photo_url: entry.photo_out ?? "" } : null;
+        if (entry.status === "COMPLETE") {
+          status = "PRESENT";
+          worked_minutes = entry.minutes;
+        } else if (entry.status === "FORFEITED") {
+          status = "FORFEITED";
+        } else {
+          status = "OPEN";
+        }
+      } else if (!scheduled) {
+        status = "REST";
+      } else if (dateStr >= hireStr && dateStr < todayStr) {
+        status = "ABSENT";
+      } else {
+        // Pre-hire scheduled day (or today, not yet over) — not an absence.
+        status = "REST";
+      }
+
+      // scheduled_days: scheduled, non-FUTURE, from the hire date on.
+      if (scheduled && dateStr >= hireStr && dateStr <= todayStr) scheduled_days++;
+      if (status === "PRESENT") present_days++;
+      else if (status === "ABSENT") absent_days++;
+      else if (status === "REST") rest_days++;
+      else if (status === "FORFEITED") forfeited++;
+      else if (status === "OPEN") open++;
+      if (worked_minutes != null) total_worked_minutes += worked_minutes;
+
+      days.push({ date: dateStr, scheduled, status, time_in, time_out, worked_minutes });
+    }
+
+    res.json({
+      employee: {
+        id: emp.id,
+        employeeNo: emp.employeeNo,
+        fullName: emp.fullName,
+        department: emp.department,
+        position: emp.position,
+        photoUrl: emp.photoUrl,
+        status: emp.status,
+        workDays,
+        hiredAt: toDateString(emp.hiredAt),
+        userId: emp.userId,
+        createdAt: emp.createdAt,
+      },
+      month,
+      stats: {
+        scheduled_days,
+        present_days,
+        absent_days,
+        rest_days,
+        forfeited,
+        open,
+        total_worked_minutes,
+      },
+      days,
+    });
   });
 
   return router;

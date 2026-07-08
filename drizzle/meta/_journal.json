@@ -169,6 +169,20 @@
       "when": 1784200000000,
       "tag": "0023_attendance_recorded_by_nullable",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1784300000000,
+      "tag": "0024_direct_receive_rr",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1784400000000,
+      "tag": "0025_employee_work_days_hired_at",
+      "breakpoints": true
     }
   ]
 }

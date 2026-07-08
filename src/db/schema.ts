@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  date,
   index,
   integer,
   jsonb,
@@ -865,6 +866,16 @@ export const employees = pgTable(
     position: text("position"),
     photoUrl: text("photo_url"),
     status: employeeStatusEnum("status").notNull().default("ACTIVE"),
+    /**
+     * Weekly work schedule (Employee 360, migration 0025). CSV of day tokens drawn
+     * from MON,TUE,WED,THU,FRI,SAT,SUN in canonical Mon→Sun order. Default = the
+     * standard 5-day work week. The profile endpoint parses this into workDays:
+     * string[] and uses it to classify each calendar day: a no-show on a SCHEDULED
+     * day (from hire date on) is an ABSENCE; an unscheduled day is a REST day.
+     */
+    workDays: text("work_days").notNull().default("MON,TUE,WED,THU,FRI"),
+    /** Hire date — calendar day, no time (migration 0025). NULL = unknown. */
+    hiredAt: date("hired_at"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1132,7 +1143,19 @@ export const receivingReports = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     rrNo: text("rr_no").notNull().unique(),
-    poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
+    /**
+     * NULLABLE (0024): NULL = a DIRECT receipt (POST /inventory/receive, no
+     * purchase order) — gprci standard: every stock entry into MAIN still gets
+     * a proper RR document even without a PO behind it.
+     */
+    poId: uuid("po_id").references(() => purchaseOrders.id),
+    /**
+     * Who delivered a DIRECT receipt (0024). PO-based receipts leave this NULL
+     * and carry the supplier via the purchase order instead.
+     */
+    supplierId: uuid("supplier_id").references(() => suppliers.id),
+    /** Supplier's DR / invoice number for a direct receipt (0024). */
+    reference: text("reference"),
     warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
     receivedByUserId: uuid("received_by_user_id").notNull().references(() => users.id),
     notes: text("notes"),
@@ -1141,6 +1164,7 @@ export const receivingReports = pgTable(
   (table) => [
     index("rr_po_id_idx").on(table.poId),
     index("rr_warehouse_id_idx").on(table.warehouseId),
+    index("rr_supplier_id_idx").on(table.supplierId),
   ],
 ).enableRLS();
 export type ReceivingReport = typeof receivingReports.$inferSelect;
@@ -1150,7 +1174,8 @@ export const receivingReportLines = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     rrId: uuid("rr_id").notNull().references(() => receivingReports.id),
-    poLineId: uuid("po_line_id").notNull().references(() => purchaseOrderLines.id),
+    /** NULLABLE (0024): NULL = a direct-receipt line (no purchase_order_line). */
+    poLineId: uuid("po_line_id").references(() => purchaseOrderLines.id),
     ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
     qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull(),
   },

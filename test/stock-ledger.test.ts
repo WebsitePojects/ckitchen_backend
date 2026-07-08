@@ -518,3 +518,143 @@ describe("Ledger: GET /stock-ledger auth guard", () => {
     expect(res.body.error?.code).toBe("AUTH_REQUIRED");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8. source_ref enrichment + q search (client review 2026-07-08)
+// ---------------------------------------------------------------------------
+
+describe("Ledger enrichment: source_ref + q search", () => {
+  let searchIngredientId: string;
+  let orderId: string;
+  let orderCode: string;
+  let rrNo: string;
+
+  beforeAll(async () => {
+    const ingRes = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "LedgerSearchSalmon", unit: "g", unit_cost: "5.00", low_stock_threshold: "100" });
+    expect(ingRes.status).toBe(201);
+    searchIngredientId = ingRes.body.id as string;
+
+    // Direct receive — 0024 returns the RR; its rr_no is what RECEIVE ledger
+    // rows now stamp as sourceDocumentNo (and resolve as source_ref).
+    const recvRes = await request(app)
+      .post("/api/v1/inventory/receive")
+      .set("Authorization", `Bearer ${warehouseToken}`)
+      .send({ items: [{ ingredient_id: searchIngredientId, quantity: 5000 }] });
+    expect(recvRes.status).toBe(201);
+    rrNo = recvRes.body.rr.rrNo as string;
+
+    const itoRes = await request(app)
+      .post("/api/v1/itos")
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .send({ from: "MAIN", to: "KITCHEN", items: [{ ingredient_id: searchIngredientId, quantity: 3000 }] });
+    expect(itoRes.status).toBe(201);
+    await request(app)
+      .post(`/api/v1/itos/${itoRes.body.id}/confirm`)
+      .set("Authorization", `Bearer ${warehouseToken}`);
+
+    const bRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "LedgerSearchBrand", color: "#123123" });
+    const brandId = bRes.body.id as string;
+    await request(app)
+      .post(`/api/v1/brands/${brandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "FOODPANDA", external_merchant_id: "lsb001", credential_ref: "cred-lsb001" });
+    const miRes = await request(app)
+      .post(`/api/v1/brands/${brandId}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Salmon Search Dish", price: "349.00", station_id: grillStationId });
+    const menuItemId = miRes.body.id as string;
+    await request(app)
+      .put(`/api/v1/menu/${menuItemId}/recipe`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ lines: [{ ingredient_id: searchIngredientId, portion_qty: 250, unit: "g" }] });
+
+    const orderRes = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "FOODPANDA",
+        external_ref: "ledger-search-001",
+        items: [{ menu_item_id: menuItemId, qty: 1 }],
+      });
+    expect(orderRes.status).toBe(201);
+    orderId = orderRes.body.order_id as string;
+    orderCode = orderRes.body.order_code as string;
+    expect(orderCode).toBeTruthy();
+
+    const advRes = await request(app)
+      .post(`/api/v1/orders/${orderId}/advance`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(advRes.status).toBe(200);
+    expect(advRes.body.status).toBe("PREPARING");
+  });
+
+  it("an order-sourced row carries the order's code as source_ref", async () => {
+    const res = await request(app)
+      .get(`/api/v1/stock-ledger?ingredient_id=${searchIngredientId}&source_module=ORDER_DEDUCTION`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const row = (res.body as Array<{ sourceDocumentNo: string; source_ref: string | null }>).find(
+      (r) => r.sourceDocumentNo === orderId,
+    );
+    expect(row).toBeTruthy();
+    expect(row!.source_ref).toBe(orderCode);
+  });
+
+  it("a RECEIVE row resolves source_ref to the RR number", async () => {
+    const res = await request(app)
+      .get(`/api/v1/stock-ledger?ingredient_id=${searchIngredientId}&source_module=RECEIVE`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const row = (res.body as Array<{ sourceDocumentNo: string; source_ref: string | null }>).find(
+      (r) => r.sourceDocumentNo === rrNo,
+    );
+    expect(row).toBeTruthy();
+    expect(row!.source_ref).toBe(rrNo);
+  });
+
+  it("ITO rows keep source_ref null (raw doc id column remains)", async () => {
+    const res = await request(app)
+      .get(`/api/v1/stock-ledger?ingredient_id=${searchIngredientId}&source_module=ITO`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const rows = res.body as Array<{ source_ref: string | null }>;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.source_ref === null)).toBe(true);
+  });
+
+  it("q= by order code finds the deduction row (case-insensitive)", async () => {
+    const res = await request(app)
+      .get(`/api/v1/stock-ledger?q=${encodeURIComponent(orderCode.toLowerCase())}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.length).toBeGreaterThan(0);
+    expect(
+      (res.body as Array<{ source_ref: string | null }>).some((r) => r.source_ref === orderCode),
+    ).toBe(true);
+  });
+
+  it("q= by ingredient name matches only that ingredient's rows", async () => {
+    const res = await request(app)
+      .get("/api/v1/stock-ledger?q=ledgersearchsalmon")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const rows = res.body as Array<{ ingredientId: string }>;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.ingredientId === searchIngredientId)).toBe(true);
+  });
+
+  it("q miss returns an empty array", async () => {
+    const res = await request(app)
+      .get("/api/v1/stock-ledger?q=zzz-no-such-ref-999")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([]);
+  });
+});

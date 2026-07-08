@@ -161,13 +161,21 @@ describe("POST /api/v1/ems/attendance — SELF_ONLY guard", () => {
   });
 
   it("OWNER keeps the kiosk override — may punch any employee", async () => {
+    // Fresh employee: the punch gate (2026-07-08) would 409 ALREADY_TIMED_IN
+    // for kitchenEmp, who already timed in earlier in this suite. The override
+    // is about WHO the OWNER may punch, not about skipping the gate.
+    const [emp] = await db
+      .insert(employees)
+      .values({ employeeNo: "EMP-OVERRIDE", fullName: "Override Target", department: "ADMIN", status: "ACTIVE" })
+      .returning();
+
     const res = await request(app)
       .post("/api/v1/ems/attendance")
       .set("Authorization", `Bearer ${adminToken}`)
-      .send({ employee_id: kitchenEmpId, type: "TIME_IN", photo: PHOTO });
+      .send({ employee_id: emp!.id, type: "TIME_IN", photo: PHOTO });
 
     expect(res.status).toBe(201);
-    expect(res.body.employeeId).toBe(kitchenEmpId);
+    expect(res.body.employeeId).toBe(emp!.id);
   });
 });
 
@@ -193,6 +201,26 @@ describe("GET /api/v1/public/attendance/employees", () => {
       expect(row).not.toHaveProperty("userId");
       expect(row).not.toHaveProperty("user_id");
     }
+  });
+
+  it("rows carry today's clock state — clocked_in / clocked_out / last_type", async () => {
+    const res = await request(app).get("/api/v1/public/attendance/employees");
+    expect(res.status).toBe(200);
+
+    for (const row of res.body as Array<Record<string, unknown>>) {
+      expect(typeof row.clocked_in).toBe("boolean");
+      expect(typeof row.clocked_out).toBe("boolean");
+      expect([null, "TIME_IN", "TIME_OUT"]).toContain(row.last_type);
+    }
+
+    // kitchenEmp punched TIME_IN then TIME_OUT earlier in this suite.
+    const kitchenRow = (res.body as Array<{ id: string; clocked_in: boolean; clocked_out: boolean; last_type: string | null }>).find(
+      (r) => r.id === kitchenEmpId,
+    );
+    expect(kitchenRow).toBeTruthy();
+    expect(kitchenRow!.clocked_in).toBe(true);
+    expect(kitchenRow!.clocked_out).toBe(true);
+    expect(kitchenRow!.last_type).toBe("TIME_OUT");
   });
 });
 
@@ -222,12 +250,19 @@ describe("POST /api/v1/public/attendance", () => {
   });
 
   it("201 and writes a 'Public'-actor audit row with source=public_kiosk", async () => {
+    // Fresh employee — kitchenEmp already timed in+out today, so the punch
+    // gate (2026-07-08) would 409 a further TIME_IN for them.
+    const [kioskEmp] = await db
+      .insert(employees)
+      .values({ employeeNo: "EMP-KIOSK-PUB", fullName: "Kiosk Public Employee", department: "ADMIN", status: "ACTIVE" })
+      .returning();
+
     const res = await request(app)
       .post("/api/v1/public/attendance")
-      .send({ employee_id: kitchenEmpId, type: "TIME_IN", photo: PHOTO, note: "kiosk punch" });
+      .send({ employee_id: kioskEmp!.id, type: "TIME_IN", photo: PHOTO, note: "kiosk punch" });
 
     expect(res.status).toBe(201);
-    expect(res.body.employeeId).toBe(kitchenEmpId);
+    expect(res.body.employeeId).toBe(kioskEmp!.id);
     expect(res.body.recordedByUserId).toBeNull();
     expect(res.body.sessionId).toBeNull();
 
@@ -251,5 +286,84 @@ describe("POST /api/v1/public/attendance", () => {
       .send({ employee_id: "00000000-0000-0000-0000-000000000000", type: "TIME_IN", photo: PHOTO });
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe("NOT_FOUND");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Punch gate — server-enforced double-punch protection (client review
+// 2026-07-08). Lives in the shared core (attendance-shared.ts) so BOTH the
+// authed route (incl. the OWNER override) and the public kiosk are gated.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Punch gate: 409 ALREADY_TIMED_IN / NOT_TIMED_IN / ALREADY_TIMED_OUT", () => {
+  async function makeEmployee(no: string): Promise<string> {
+    const [emp] = await db
+      .insert(employees)
+      .values({ employeeNo: no, fullName: `Gate ${no}`, department: "ADMIN", status: "ACTIVE" })
+      .returning();
+    return emp!.id;
+  }
+
+  function authedPunch(employeeId: string, type: string) {
+    return request(app)
+      .post("/api/v1/ems/attendance")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ employee_id: employeeId, type, photo: PHOTO });
+  }
+
+  it("409 NOT_TIMED_IN when timing out before timing in", async () => {
+    const empId = await makeEmployee("EMP-GATE-1");
+    const res = await authedPunch(empId, "TIME_OUT");
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("NOT_TIMED_IN");
+  });
+
+  it("409 ALREADY_TIMED_IN on a second TIME_IN the same day — even for OWNER", async () => {
+    const empId = await makeEmployee("EMP-GATE-2");
+    const first = await authedPunch(empId, "TIME_IN");
+    expect(first.status).toBe(201);
+
+    const second = await authedPunch(empId, "TIME_IN"); // adminToken = OWNER
+    expect(second.status).toBe(409);
+    expect(second.body.error.code).toBe("ALREADY_TIMED_IN");
+  });
+
+  it("409 ALREADY_TIMED_OUT on a second TIME_OUT the same day", async () => {
+    const empId = await makeEmployee("EMP-GATE-3");
+    expect((await authedPunch(empId, "TIME_IN")).status).toBe(201);
+    expect((await authedPunch(empId, "TIME_OUT")).status).toBe(201);
+
+    const again = await authedPunch(empId, "TIME_OUT");
+    expect(again.status).toBe(409);
+    expect(again.body.error.code).toBe("ALREADY_TIMED_OUT");
+  });
+
+  it("the public kiosk is gated identically", async () => {
+    const empId = await makeEmployee("EMP-GATE-4");
+    const in1 = await request(app)
+      .post("/api/v1/public/attendance")
+      .send({ employee_id: empId, type: "TIME_IN", photo: PHOTO });
+    expect(in1.status).toBe(201);
+
+    const in2 = await request(app)
+      .post("/api/v1/public/attendance")
+      .send({ employee_id: empId, type: "TIME_IN", photo: PHOTO });
+    expect(in2.status).toBe(409);
+    expect(in2.body.error.code).toBe("ALREADY_TIMED_IN");
+  });
+
+  it("yesterday's unclosed TIME_IN does NOT block today's TIME_IN (day-scoped)", async () => {
+    const empId = await makeEmployee("EMP-GATE-5");
+    // Simulate an unclosed shift ~25h ago — always on a previous UTC day.
+    await db.insert(attendanceRecords).values({
+      employeeId: empId,
+      type: "TIME_IN",
+      photoUrl: "https://res.cloudinary.com/test/image/upload/ck1/attendance/old.jpg",
+      photoPublicId: "ck1/attendance/old",
+      capturedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
+
+    const res = await authedPunch(empId, "TIME_IN");
+    expect(res.status).toBe(201);
   });
 });

@@ -4,6 +4,7 @@ import type { Express } from "express";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
+import { orders } from "../src/db/schema.js";
 
 let app: Express;
 let db: DB;
@@ -229,6 +230,76 @@ describe("Brand activity log (MOTM 2026-07-01)", () => {
       .set("Authorization", `Bearer ${adminToken}`);
     expect(res.status).toBe(200);
     expect(res.body.events).toHaveLength(0);
+  });
+});
+
+describe("Brand activity — ?detail=daily&month= (client review 2026-07-08)", () => {
+  let brandId: string;
+
+  beforeAll(async () => {
+    const createRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Daily Activity Brand", color: "#224466" });
+    brandId = createRes.body.id;
+
+    const accRes = await request(app)
+      .post(`/api/v1/brands/${brandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "FOODPANDA", external_merchant_id: "FP-DAILY", credential_ref: "daily-ref" });
+    const accountId = accRes.body.id as string;
+
+    // Seed orders DIRECTLY so placed_at lands on exact UTC days of 2026-03.
+    await db.insert(orders).values([
+      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-1", total: "100.50", status: "COMPLETED", placedAt: new Date("2026-03-05T10:00:00Z") },
+      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-2", total: "49.50", status: "NEW", placedAt: new Date("2026-03-05T22:30:00Z") },
+      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-3", total: "999.00", status: "CANCELLED", cancelReason: "test", placedAt: new Date("2026-03-05T12:00:00Z") },
+      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-4", total: "25.00", status: "COMPLETED", placedAt: new Date("2026-03-31T23:59:00Z") },
+    ]);
+  });
+
+  it("returns { changes, daily } with dense zero-filled day buckets; cancelled excluded", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity?detail=daily&month=2026-03`)
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.changes)).toBe(true);
+    expect(Array.isArray(res.body.daily)).toBe(true);
+    expect(res.body.daily).toHaveLength(31); // dense — every day of March
+
+    const day5 = res.body.daily[4];
+    expect(day5.date).toBe("2026-03-05");
+    expect(day5.orders).toBe(2); // the CANCELLED order is excluded
+    expect(day5.revenue).toBe(150); // 100.50 + 49.50 — not the cancelled 999
+
+    expect(res.body.daily[30]).toEqual({ date: "2026-03-31", orders: 1, revenue: 25 });
+    expect(res.body.daily[0]).toEqual({ date: "2026-03-01", orders: 0, revenue: 0 });
+  });
+
+  it("default (no detail param) shape is unchanged — { events }, no daily/changes", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.events)).toBe(true);
+    expect(res.body.daily).toBeUndefined();
+    expect(res.body.changes).toBeUndefined();
+  });
+
+  it("400 when detail=daily lacks a valid month=YYYY-MM", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity?detail=daily`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("400 for an unknown detail value", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/activity?detail=hourly&month=2026-03`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(400);
   });
 });
 

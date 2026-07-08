@@ -15,10 +15,10 @@
  */
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
-import { eq } from "drizzle-orm";
+import { and, eq, gte, lte, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { attendanceTypeEnum, employees } from "../../db/schema.js";
+import { attendanceRecords, attendanceTypeEnum, employees } from "../../db/schema.js";
 import { sendError } from "../http-errors.js";
 import { recordAttendancePunch } from "./attendance-shared.js";
 
@@ -53,6 +53,13 @@ export function createPublicAttendanceRouter(db: DB): Router {
 
   // ── GET /public/attendance/employees ──────────────────────────────────────
   // ACTIVE employees only, MINIMAL fields (PII discipline: no photo, no user id).
+  //
+  // Client review 2026-07-08: each row also carries today's clock state —
+  // `clocked_in` / `clocked_out` / `last_type` — so the kiosk can grey out the
+  // buttons the punch gate (attendance-shared.ts) would 409 anyway. Derived
+  // with ONE grouped aggregate query over today's punches (UTC day window,
+  // same as self/today) — never per-employee lookups. Punch types are not
+  // PII; photos and user ids stay excluded.
   router.get("/attendance/employees", kioskLimiter, async (_req, res) => {
     if (isDisabled()) {
       sendError(res, 404, "NOT_FOUND", "Public attendance is disabled.");
@@ -67,7 +74,33 @@ export function createPublicAttendanceRouter(db: DB): Router {
       })
       .from(employees)
       .where(eq(employees.status, "ACTIVE"));
-    res.json(rows);
+
+    const now = new Date();
+    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+    const stateRows = await db
+      .select({
+        employeeId: attendanceRecords.employeeId,
+        clockedIn: sql<boolean>`bool_or(${attendanceRecords.type} = 'TIME_IN')`,
+        clockedOut: sql<boolean>`bool_or(${attendanceRecords.type} = 'TIME_OUT')`,
+        lastType: sql<string>`(array_agg(${attendanceRecords.type} ORDER BY ${attendanceRecords.capturedAt} DESC))[1]`,
+      })
+      .from(attendanceRecords)
+      .where(and(gte(attendanceRecords.capturedAt, startOfDay), lte(attendanceRecords.capturedAt, endOfDay)))
+      .groupBy(attendanceRecords.employeeId);
+    const stateByEmployee = new Map(stateRows.map((r) => [r.employeeId, r]));
+
+    res.json(
+      rows.map((row) => {
+        const state = stateByEmployee.get(row.id);
+        return {
+          ...row,
+          clocked_in: state?.clockedIn ?? false,
+          clocked_out: state?.clockedOut ?? false,
+          last_type: state?.lastType ?? null,
+        };
+      }),
+    );
   });
 
   // ── POST /public/attendance ───────────────────────────────────────────────

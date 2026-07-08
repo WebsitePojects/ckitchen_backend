@@ -34,6 +34,7 @@ import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
 import { postLedger } from "../inventory/ledger.js";
+import { docNo } from "./doc-no.js";
 import {
   BUDGET_ENFORCEMENT,
   computeCommitted,
@@ -48,10 +49,6 @@ const APPROVER_ROLES = ["OWNER"] as const;
 const PO_ROLES = ["OWNER", "PURCHASING"] as const;
 const RECEIVE_ROLES = ["OWNER", "WAREHOUSE_OUTLET"] as const;
 const BUDGET_ROLES = ["OWNER", "ACCOUNTING"] as const;
-
-function docNo(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e4).toString().padStart(4, "0")}`;
-}
 
 const prCreateSchema = z.object({
   department: z.enum(departmentEnum.enumValues),
@@ -626,9 +623,33 @@ export function createPurchasingRouter(db: DB): Router {
     res.status(201).json(rr);
   });
 
+  // 0024: enrich each RR with its supplier (direct receipts carry supplier_id
+  // on the RR itself; PO receipts carry it via the purchase order — COALESCE
+  // picks whichever exists) and the PO number. po/poNo null = a DIRECT receipt
+  // (frontend shows "Direct"). Read-only, additive — every existing RR field
+  // is returned unchanged.
   router.get("/receiving-reports", requireAuth, async (_req, res) => {
-    const rows = await db.select().from(receivingReports);
-    res.json(rows);
+    const rows = await db
+      .select({
+        rr: receivingReports,
+        poNo: purchaseOrders.poNo,
+        supplierId: suppliers.id,
+        supplierCode: suppliers.code,
+        supplierName: suppliers.name,
+      })
+      .from(receivingReports)
+      .leftJoin(purchaseOrders, eq(receivingReports.poId, purchaseOrders.id))
+      .leftJoin(
+        suppliers,
+        eq(suppliers.id, sql`COALESCE(${receivingReports.supplierId}, ${purchaseOrders.supplierId})`),
+      );
+    res.json(
+      rows.map(({ rr, poNo, supplierId, supplierCode, supplierName }) => ({
+        ...rr,
+        poNo: poNo ?? null,
+        supplier: supplierId ? { id: supplierId, code: supplierCode, name: supplierName } : null,
+      })),
+    );
   });
 
   router.get("/receiving-reports/:id", requireAuth, async (req, res) => {

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, asc, eq, gte, lte } from "drizzle-orm";
+import { and, asc, eq, gte, lt, lte, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -9,6 +9,7 @@ import {
   brandOutlet,
   brands,
   locations,
+  orders,
 } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
@@ -154,12 +155,92 @@ export function createBrandsRouter(db: DB): Router {
   // -------------------------------------------------------------------------
   // GET /brands/:id/activity?from=&to= — active/inactive history (MOTM)
   // Defaults to the current calendar month; returns events chronologically.
+  //
+  // Opt-in detail mode (client review 2026-07-08 — "activity per month is not
+  // showing the simulated runs"): ?detail=daily&month=YYYY-MM changes the
+  // response to
+  //   { changes: [...activity-log rows for that month...],
+  //     daily:   [{ date: "YYYY-MM-DD", orders: number, revenue: number }] }
+  // where `daily` densely covers EVERY day of the month (zeros included),
+  // orders = COUNT of the brand's orders placed that day with status !=
+  // CANCELLED and revenue = SUM(total) over the same set — ONE GROUP BY query.
+  // Day buckets are UTC; Manila-day (UTC+8) buckets are a documented follow-up
+  // (same caveat as /ems/attendance/self/today).
+  // The default (no detail param) shape { events } is unchanged.
   // -------------------------------------------------------------------------
   router.get("/brands/:id/activity", requireAuth, async (req, res) => {
     const id = paramAsString(req.params.id);
     const [brand] = await db.select().from(brands).where(eq(brands.id, id));
     if (!brand) {
       sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const detail = typeof req.query.detail === "string" ? req.query.detail : undefined;
+    if (detail !== undefined && detail !== "daily") {
+      sendError(res, 400, "VALIDATION_ERROR", "detail must be 'daily' when provided.");
+      return;
+    }
+
+    if (detail === "daily") {
+      const monthParam = typeof req.query.month === "string" ? req.query.month : undefined;
+      const match = monthParam?.match(/^(\d{4})-(\d{2})$/);
+      const year = match ? Number(match[1]) : NaN;
+      const month = match ? Number(match[2]) : NaN;
+      if (!match || month < 1 || month > 12) {
+        sendError(res, 400, "VALIDATION_ERROR", "detail=daily requires month=YYYY-MM.");
+        return;
+      }
+
+      const monthStart = new Date(Date.UTC(year, month - 1, 1));
+      const nextMonthStart = new Date(Date.UTC(year, month, 1));
+      const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+
+      // The month's activity-log rows (same row shape as the default `events`).
+      const changes = await db
+        .select()
+        .from(brandActivityLog)
+        .where(
+          and(
+            eq(brandActivityLog.brandId, id),
+            gte(brandActivityLog.changedAt, monthStart),
+            lt(brandActivityLog.changedAt, nextMonthStart),
+          ),
+        )
+        .orderBy(asc(brandActivityLog.changedAt));
+
+      // ONE grouped query: per-UTC-day order count + revenue, CANCELLED excluded.
+      const dayExpr = sql<string>`to_char(${orders.placedAt} AT TIME ZONE 'UTC', 'YYYY-MM-DD')`;
+      const orderRows = await db
+        .select({
+          date: dayExpr,
+          orders: sql<string>`COUNT(*)`,
+          revenue: sql<string>`COALESCE(SUM(${orders.total}), 0)`,
+        })
+        .from(orders)
+        .where(
+          and(
+            eq(orders.brandId, id),
+            gte(orders.placedAt, monthStart),
+            lt(orders.placedAt, nextMonthStart),
+            ne(orders.status, "CANCELLED"),
+          ),
+        )
+        .groupBy(dayExpr);
+      const byDate = new Map(orderRows.map((r) => [r.date, r]));
+
+      // Dense: every day of the month present, zeros where nothing happened.
+      const daily = Array.from({ length: daysInMonth }, (_, i) => {
+        const date = `${match[1]}-${match[2]}-${String(i + 1).padStart(2, "0")}`;
+        const row = byDate.get(date);
+        return {
+          date,
+          orders: row ? Number(row.orders) : 0,
+          revenue: row ? Math.round(Number(row.revenue) * 100) / 100 : 0,
+        };
+      });
+
+      res.json({ changes, daily });
       return;
     }
 

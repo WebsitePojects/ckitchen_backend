@@ -343,6 +343,19 @@ export async function seedPilot(db: DB): Promise<PilotIds> {
         .returning();
     }
 
+    // Walk-in channel (aggregator OTHER) — required by the Walk-In Order
+    // dialog and manual entry: ingest resolves an aggregator account for
+    // EVERY order (listing-scoped idempotency, Rule #5), so a brand without
+    // an OTHER listing 404s on walk-in ingest (found in live QA 2026-07-08).
+    if (!accByAgg.get("OTHER")) {
+      await db.insert(aggregatorAccounts).values({
+        brandId,
+        aggregator: "OTHER",
+        externalMerchantId: `WALKIN-${brandDef.name.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8)}`,
+        credentialRef: `ref-walkin-${brandId.slice(0, 8)}`,
+      });
+    }
+
     accountIds[brandDef.name] = { fp: fpAcc.id, gb: gbAcc.id };
 
     // Menu items + recipes

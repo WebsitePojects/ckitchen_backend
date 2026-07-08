@@ -17,6 +17,7 @@ import { createPrintingRouter } from "./modules/printing/routes.js";
 import { createAnalyticsRouter } from "./modules/analytics/routes.js";
 import { createOutletsRouter } from "./modules/outlets/routes.js";
 import { createEmsRouter } from "./modules/ems/routes.js";
+import { createPublicAttendanceRouter } from "./modules/ems/public-attendance.js";
 import { createMasterRouter } from "./modules/master/routes.js";
 import { createPurchasingRouter } from "./modules/purchasing/routes.js";
 import { createReportsRouter } from "./modules/reports/routes.js";
@@ -84,6 +85,11 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.set("db", db);
 
   app.use("/api/v1", healthRouter);
+  // Public, UNAUTHENTICATED kiosk endpoints — mounted under /api/v1/public with no
+  // auth middleware (deliberate: shared-tablet clock in/out, photo = identity).
+  // Its own router applies a feature flag + per-IP rate limit; nothing here
+  // inherits requireAuth.
+  app.use("/api/v1/public", createPublicAttendanceRouter(db));
   app.use("/api/v1", createAuthRouter(db));
   app.use("/api/v1", createOutletsRouter(db));
   app.use("/api/v1", createBrandsRouter(db));

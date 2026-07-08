@@ -29,8 +29,7 @@ import {
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { normalizeRole } from "../auth/roles.js";
 import { sendError } from "../http-errors.js";
-import { uploadAttendancePhoto } from "./cloudinary.js";
-import { audit } from "./audit.js";
+import { recordAttendancePunch } from "./attendance-shared.js";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -52,9 +51,6 @@ const createAttendanceSchema = z.object({
   photo: z.string().min(1),
   note: z.string().optional(),
 });
-
-/** Reject attendance photos larger than 8 MB (base64 string length ≈ byte budget). */
-const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Router factory
@@ -225,6 +221,10 @@ export function createEmsRouter(db: DB): Router {
   // Record a TIME_IN / TIME_OUT punch with a Cloudinary photo proof.
   // Actor + session come from the verified token (req.user), NEVER the body
   // (anti-spoof, CK1-EMS-005 §3 + security rules).
+  //
+  // SELF-ONLY (default): a non-OWNER may only punch their OWN linked employee
+  // (employee.user_id = the caller). OWNER keeps a kiosk-style override to punch
+  // anyone. The public unauthenticated kiosk lives at POST /public/attendance.
   router.post("/ems/attendance", requireAuth, async (req, res) => {
     const parsed = createAttendanceSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -233,54 +233,81 @@ export function createEmsRouter(db: DB): Router {
     }
     const { employee_id, type, photo, note } = parsed.data;
 
-    if (photo.length > MAX_PHOTO_BYTES) {
-      sendError(res, 400, "PAYLOAD_TOO_LARGE", "Attendance photo exceeds the 8 MB limit.");
-      return;
+    if (normalizeRole(req.user!.role) !== "OWNER") {
+      const [self] = await db
+        .select({ id: employees.id })
+        .from(employees)
+        .where(and(eq(employees.userId, req.user!.id), eq(employees.status, "ACTIVE")));
+      if (!self || self.id !== employee_id) {
+        sendError(res, 403, "SELF_ONLY", "You can only record your own attendance.");
+        return;
+      }
     }
 
-    const [emp] = await db.select().from(employees).where(eq(employees.id, employee_id));
-    if (!emp) {
-      sendError(res, 404, "NOT_FOUND", `Employee ${employee_id} not found.`);
-      return;
-    }
-    if (emp.status !== "ACTIVE") {
-      sendError(res, 400, "VALIDATION_ERROR", `Employee ${emp.fullName} is not ACTIVE.`);
-      return;
-    }
-
-    let uploaded: { url: string; publicId: string };
-    try {
-      uploaded = await uploadAttendancePhoto(photo);
-    } catch {
-      // Never leak Cloudinary config/secret detail to the caller.
-      sendError(res, 502, "UPLOAD_FAILED", "Failed to upload attendance photo.");
-      return;
-    }
-
-    const [record] = await db
-      .insert(attendanceRecords)
-      .values({
-        employeeId: employee_id,
-        type,
-        photoUrl: uploaded.url,
-        photoPublicId: uploaded.publicId,
+    const result = await recordAttendancePunch(
+      db,
+      { employeeId: employee_id, type, photo, note },
+      {
         recordedByUserId: req.user!.id, // anti-spoof: from token, not body
         sessionId: req.user!.sessionId ?? null,
-        note: note ?? null,
-      })
-      .returning();
+        auditActorUserId: req.user!.id,
+        auditActorName: req.user!.name ?? null,
+      },
+    );
+    if (!result.ok) {
+      sendError(res, result.status, result.code, result.message);
+      return;
+    }
+    res.status(201).json(result.record);
+  });
 
-    void audit(db, {
-      actorUserId: req.user!.id,
-      actorName: req.user!.name ?? null,
-      sessionId: req.user!.sessionId ?? null,
-      action: type === "TIME_IN" ? "attendance.time_in" : "attendance.time_out",
-      description: `${type} for ${emp.fullName} (${emp.employeeNo})`,
-      entityType: "attendance_record",
-      entityId: record!.id,
+  // ── GET /ems/attendance/self/today ────────────────────────────────────────
+  // The caller's OWN attendance state for the current server day. Powers the
+  // frontend "clock in/out" gate. Returns employee=null when the caller has no
+  // ACTIVE linked employee row (those users are exempt from the gate).
+  //
+  // NOTE: "today" uses UTC day boundaries — fine for the prototype. Manila-day
+  // (UTC+8) boundaries are a documented follow-up (a punch just after local
+  // midnight can land on the previous UTC day near the 16:00-24:00 UTC window).
+  router.get("/ems/attendance/self/today", requireAuth, async (req, res) => {
+    const [emp] = await db
+      .select()
+      .from(employees)
+      .where(and(eq(employees.userId, req.user!.id), eq(employees.status, "ACTIVE")));
+
+    if (!emp) {
+      res.json({ employee: null, clocked_in: false, clocked_out: false, last_type: null });
+      return;
+    }
+
+    const now = new Date();
+    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+
+    const todays = await db
+      .select()
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.employeeId, emp.id),
+          gte(attendanceRecords.capturedAt, startOfDay),
+          lte(attendanceRecords.capturedAt, endOfDay),
+        ),
+      )
+      .orderBy(desc(attendanceRecords.capturedAt));
+
+    res.json({
+      employee: {
+        id: emp.id,
+        employeeNo: emp.employeeNo,
+        fullName: emp.fullName,
+        department: emp.department,
+        photoUrl: emp.photoUrl,
+      },
+      clocked_in: todays.some((r) => r.type === "TIME_IN"),
+      clocked_out: todays.some((r) => r.type === "TIME_OUT"),
+      last_type: todays.length ? todays[0]!.type : null,
     });
-
-    res.status(201).json(record);
   });
 
   // ── GET /ems/attendance ───────────────────────────────────────────────────

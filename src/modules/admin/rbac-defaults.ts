@@ -47,6 +47,7 @@ export const PAGE_ROLES: Readonly<Record<string, readonly string[]>> = {
 
   // Purchasing
   "/master-data": ["WAREHOUSE_MAIN", "PURCHASING"],
+  "/purchasing": ["OUTLET_MANAGER", "PURCHASING", "WAREHOUSE_MAIN", "WAREHOUSE_OUTLET", "ACCOUNTING"],
 
   // People
   "/employees": ["OUTLET_MANAGER", "HR"],

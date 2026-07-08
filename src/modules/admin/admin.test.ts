@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
 import type { Express } from "express";
+import { eq } from "drizzle-orm";
 import { createApp } from "../../app.js";
 import { createDb, type DB } from "../../db/client.js";
 import { runMigrations } from "../../db/migrate.js";
@@ -10,11 +11,13 @@ import {
   brands,
   locations,
   orders,
+  rolePageAccess,
   userOutletAccess,
   users,
 } from "../../db/schema.js";
 import { hashPassword } from "../auth/service.js";
 import { seedRolePageAccess } from "./routes.js";
+import { MATRIX_ROLES, PAGE_KEYS, defaultAllowed } from "./rbac-defaults.js";
 
 let app: Express;
 let db: DB;
@@ -301,6 +304,68 @@ describe("RBAC role→page matrix", () => {
       .send([{ role: "OWNER", pageKey: "/users", allowed: false }]);
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe("OWNER_LOCKED");
+  });
+});
+
+describe("RBAC matrix merges code-default pages missing from a pre-existing seed", () => {
+  // Simulates a DB that was seeded BEFORE "/purchasing" (or any future page)
+  // was added to PAGE_ROLES: role_page_access has rows for every OTHER page,
+  // but none for the new one. GET /admin/rbac must still surface it using the
+  // code default (loadRbacEntries in routes.ts), not silently omit it.
+  it("GET /admin/rbac includes /purchasing with default roles even though the table predates it", async () => {
+    const created = createDb(); // isolated in-memory db, independent of the shared one above
+    const localDb = created.db;
+    await runMigrations(localDb);
+
+    const preExistingPages = PAGE_KEYS.filter((p) => p !== "/purchasing");
+    await localDb.insert(rolePageAccess).values(
+      MATRIX_ROLES.flatMap((role) =>
+        preExistingPages.map((pageKey) => ({ role, pageKey, allowed: defaultAllowed(role, pageKey) })),
+      ),
+    );
+    // Sanity: the simulated pre-existing seed really has zero /purchasing rows.
+    const before = await localDb.select().from(rolePageAccess).where(eq(rolePageAccess.pageKey, "/purchasing"));
+    expect(before.length).toBe(0);
+
+    const email = "owner-rbac-merge@cloudkitchen.local";
+    const password = "owner-merge-password";
+    await localDb.insert(users).values({
+      name: "Owner Merge",
+      email,
+      passwordHash: await hashPassword(password),
+      role: "OWNER",
+    });
+
+    const localApp = createApp(localDb);
+    const loginRes = await request(localApp).post("/api/v1/auth/login").send({ email, password });
+    expect(loginRes.status).toBe(200);
+    const token = loginRes.body.token as string;
+
+    const res = await request(localApp).get("/api/v1/admin/rbac").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(res.body.pages).toContain("/purchasing");
+
+    const purchasingEntries = res.body.entries.filter(
+      (e: { role: string; pageKey: string }) => e.pageKey === "/purchasing",
+    );
+    // One synthesized entry per matrix role — none persisted, all code-default.
+    expect(purchasingEntries.length).toBe(MATRIX_ROLES.length);
+
+    const byRole = (role: string) =>
+      purchasingEntries.find((e: { role: string; allowed: boolean }) => e.role === role);
+    expect(byRole("PURCHASING").allowed).toBe(true);
+    expect(byRole("WAREHOUSE_MAIN").allowed).toBe(true);
+    expect(byRole("WAREHOUSE_OUTLET").allowed).toBe(true);
+    expect(byRole("OUTLET_MANAGER").allowed).toBe(true);
+    expect(byRole("ACCOUNTING").allowed).toBe(true);
+    expect(byRole("OWNER").allowed).toBe(true); // OWNER always true
+    expect(byRole("HR").allowed).toBe(false);
+    expect(byRole("KITCHEN_CREW").allowed).toBe(false);
+    expect(byRole("BRAND_MANAGER").allowed).toBe(false);
+
+    // The merge is read-only: it must NOT have persisted the synthesized rows.
+    const after = await localDb.select().from(rolePageAccess).where(eq(rolePageAccess.pageKey, "/purchasing"));
+    expect(after.length).toBe(0);
   });
 });
 

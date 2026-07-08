@@ -25,6 +25,7 @@ import {
   roleEnum,
   receivingReportLines,
   receivingReports,
+  supplierItems,
   suppliers,
   warehouses,
 } from "../../db/schema.js";
@@ -576,6 +577,25 @@ export function createPurchasingRouter(db: DB): Router {
           unitCost: poLine.unitCost,
           encoderUserId: req.user!.id,
         });
+
+        // Costs track reality: receiving from a supplier is evidence of
+        // affiliation, and the price actually paid is the freshest signal we
+        // have — so every RECEIVED line upserts supplier_item.last_unit_cost
+        // (unique on supplier_id+ingredient_id). Receiving lines carry no cost
+        // of their own (receiving_report_line has none), so we use the PO
+        // line's ordered unit_cost. supplier_sku is left alone (null on first
+        // insert, untouched on update) — this endpoint has no SKU to offer.
+        await tx
+          .insert(supplierItems)
+          .values({
+            supplierId: po.supplierId,
+            ingredientId: poLine.ingredientId,
+            lastUnitCost: poLine.unitCost,
+          })
+          .onConflictDoUpdate({
+            target: [supplierItems.supplierId, supplierItems.ingredientId],
+            set: { lastUnitCost: poLine.unitCost },
+          });
 
         // Advance the PO line's received qty.
         await tx

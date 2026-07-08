@@ -933,10 +933,14 @@ export const attendanceRecords = pgTable(
     photoUrl: text("photo_url").notNull(),
     photoPublicId: text("photo_public_id").notNull(),
     capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
-    /** The authed user who recorded this punch — derived from req.user (anti-spoof). */
-    recordedByUserId: uuid("recorded_by_user_id")
-      .notNull()
-      .references(() => users.id),
+    /**
+     * The authed user who recorded this punch — derived from req.user (anti-spoof).
+     * NULLABLE (0023): NULL = a public-kiosk punch (POST /public/attendance) made
+     * with no logged-in session; the mandatory photo is the only identity evidence
+     * and the audit row is credited to the "Public" actor. Authenticated punches
+     * always set this from the verified token.
+     */
+    recordedByUserId: uuid("recorded_by_user_id").references(() => users.id),
     /** Session from req.user.sessionId — links to the actor's login session. */
     sessionId: uuid("session_id").references(() => userSessions.id),
     note: text("note"),

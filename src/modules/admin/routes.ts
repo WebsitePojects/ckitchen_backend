@@ -176,6 +176,41 @@ export async function seedRolePageAccess(db: DB): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// RBAC matrix read — merges in code defaults for any (role, pageKey) pair the
+// table doesn't have a row for yet. This is the SAME "fall back to
+// rbac-defaults when the DB doesn't know about it yet" convention already used
+// by GET /me/permissions (see me/routes.ts) — extended from whole-role
+// granularity to per-cell granularity, because a role can easily have SOME
+// rows (from an earlier seed) but be missing a page added to PAGE_ROLES
+// afterward (e.g. a new page shipped after go-live). Persisted rows always
+// win; only genuinely-missing cells are synthesized, so this never masks an
+// admin's deliberate edit.
+// ---------------------------------------------------------------------------
+
+async function loadRbacEntries(
+  db: DB,
+): Promise<{ role: Role; pageKey: string; allowed: boolean }[]> {
+  const rows = await db
+    .select({
+      role: rolePageAccess.role,
+      pageKey: rolePageAccess.pageKey,
+      allowed: rolePageAccess.allowed,
+    })
+    .from(rolePageAccess);
+
+  const present = new Set(rows.map((r) => `${r.role} ${r.pageKey}`));
+  const merged = [...rows];
+  for (const role of MATRIX_ROLES) {
+    for (const pageKey of PAGE_KEYS) {
+      if (!present.has(`${role} ${pageKey}`)) {
+        merged.push({ role, pageKey, allowed: defaultAllowed(role, pageKey) });
+      }
+    }
+  }
+  return merged;
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -630,13 +665,7 @@ export function createAdminRouter(db: DB): Router {
 
   // ── GET /admin/rbac ───────────────────────────────────────────────────────
   router.get("/admin/rbac", async (_req, res) => {
-    const entries = await db
-      .select({
-        role: rolePageAccess.role,
-        pageKey: rolePageAccess.pageKey,
-        allowed: rolePageAccess.allowed,
-      })
-      .from(rolePageAccess);
+    const entries = await loadRbacEntries(db);
     res.json({ roles: MATRIX_ROLES, pages: PAGE_KEYS, entries });
   });
 
@@ -682,13 +711,7 @@ export function createAdminRouter(db: DB): Router {
       metadata: { count: parsed.data.length },
     });
 
-    const entries = await db
-      .select({
-        role: rolePageAccess.role,
-        pageKey: rolePageAccess.pageKey,
-        allowed: rolePageAccess.allowed,
-      })
-      .from(rolePageAccess);
+    const entries = await loadRbacEntries(db);
     res.json({ roles: MATRIX_ROLES, pages: PAGE_KEYS, entries });
   });
 

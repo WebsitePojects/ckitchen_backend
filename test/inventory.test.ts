@@ -960,3 +960,282 @@ describe("Depletion projection: daily_consumption_7d + days_remaining (GET /inve
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// ERP R2 — ingredient edit + supplier affiliation endpoints
+//   PATCH /ingredients/:id
+//   GET/PUT /ingredients/:id/suppliers, DELETE /ingredients/:id/suppliers/:sid
+//   POST /ingredients supplier_id, GET /ingredients suppliers[] enrichment
+// ---------------------------------------------------------------------------
+
+describe("Ingredient edit + supplier affiliations (ERP R2)", () => {
+  const UNKNOWN_UUID = "00000000-0000-0000-0000-000000000000";
+  let supplierAId: string;
+  let supplierACode: string;
+  let supplierBId: string;
+
+  async function createIngredient(
+    name: string,
+    body: Record<string, unknown> = {},
+  ): Promise<string> {
+    const res = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name, unit: "kg", unit_cost: "10.00", low_stock_threshold: "1", ...body });
+    expect(res.status).toBe(201);
+    return res.body.id as string;
+  }
+
+  async function createSupplier(code: string, name: string): Promise<string> {
+    const res = await request(app)
+      .post("/api/v1/suppliers")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code, name });
+    expect(res.status).toBe(201);
+    return res.body.id as string;
+  }
+
+  beforeAll(async () => {
+    supplierACode = "AFFSUP1";
+    supplierAId = await createSupplier(supplierACode, "Affiliation Supplier One");
+    supplierBId = await createSupplier("AFFSUP2", "Affiliation Supplier Two");
+  });
+
+  // ── PATCH /ingredients/:id ────────────────────────────────────────────────
+  it("PATCH updates fields and returns the updated row (200)", async () => {
+    const ingId = await createIngredient("Patch_Basic");
+    const res = await request(app)
+      .patch(`/api/v1/ingredients/${ingId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Patch_Renamed", unit_cost: 12.5 });
+    expect(res.status).toBe(200);
+    expect(res.body.name).toBe("Patch_Renamed");
+    expect(Number(res.body.unitCost)).toBe(12.5);
+  });
+
+  it("PATCH threshold flips below_threshold in GET /inventory automatically", async () => {
+    const ingId = await createIngredient("Patch_Threshold", { low_stock_threshold: "1" });
+    // Receive 10 into MAIN → qty 10, threshold 1 → NOT below.
+    await request(app)
+      .post("/api/v1/inventory/receive")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ items: [{ ingredient_id: ingId, quantity: 10 }] });
+
+    const before = await request(app)
+      .get("/api/v1/inventory?warehouse=MAIN")
+      .set("Authorization", `Bearer ${adminToken}`);
+    const rowBefore = (before.body as Array<{ ingredientId: string; below_threshold: boolean }>).find(
+      (r) => r.ingredientId === ingId,
+    );
+    expect(rowBefore!.below_threshold).toBe(false);
+
+    // Raise threshold past current qty → must now be below (reads the column live).
+    const patch = await request(app)
+      .patch(`/api/v1/ingredients/${ingId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ low_stock_threshold: 20 });
+    expect(patch.status).toBe(200);
+
+    const after = await request(app)
+      .get("/api/v1/inventory?warehouse=MAIN")
+      .set("Authorization", `Bearer ${adminToken}`);
+    const rowAfter = (after.body as Array<{ ingredientId: string; below_threshold: boolean }>).find(
+      (r) => r.ingredientId === ingId,
+    );
+    expect(rowAfter!.below_threshold).toBe(true);
+  });
+
+  it("PATCH with empty body → 400", async () => {
+    const ingId = await createIngredient("Patch_Empty");
+    const res = await request(app)
+      .patch(`/api/v1/ingredients/${ingId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({});
+    expect(res.status).toBe(400);
+  });
+
+  it("PATCH with negative unit_cost → 400", async () => {
+    const ingId = await createIngredient("Patch_Negative");
+    const res = await request(app)
+      .patch(`/api/v1/ingredients/${ingId}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ unit_cost: -5 });
+    expect(res.status).toBe(400);
+  });
+
+  it("PATCH unknown ingredient → 404", async () => {
+    const res = await request(app)
+      .patch(`/api/v1/ingredients/${UNKNOWN_UUID}`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Nope" });
+    expect(res.status).toBe(404);
+  });
+
+  // ── PUT / GET / DELETE affiliations ───────────────────────────────────────
+  it("PUT upserts an affiliation, re-PUT updates sku/cost without duplicating", async () => {
+    const ingId = await createIngredient("Aff_Upsert");
+
+    const first = await request(app)
+      .put(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: supplierAId, supplier_sku: "SKU-1", last_unit_cost: 9 });
+    expect(first.status).toBe(200);
+    expect(first.body.supplierSku).toBe("SKU-1");
+    expect(Number(first.body.lastUnitCost)).toBe(9);
+
+    // Re-PUT same (supplier, ingredient): must UPDATE, not create a 2nd row.
+    const second = await request(app)
+      .put(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: supplierAId, supplier_sku: "SKU-2", last_unit_cost: 11 });
+    expect(second.status).toBe(200);
+    expect(second.body.supplierSku).toBe("SKU-2");
+    expect(Number(second.body.lastUnitCost)).toBe(11);
+    expect(second.body.id).toBe(first.body.id); // same row
+
+    const list = await request(app)
+      .get(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(list.status).toBe(200);
+    expect(list.body).toHaveLength(1);
+    expect(list.body[0].supplierSku).toBe("SKU-2");
+    expect(list.body[0].supplier).toMatchObject({ id: supplierAId, code: supplierACode });
+  });
+
+  it("PUT with unknown supplier → 404; unknown ingredient → 404", async () => {
+    const ingId = await createIngredient("Aff_404");
+    const badSupplier = await request(app)
+      .put(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: UNKNOWN_UUID });
+    expect(badSupplier.status).toBe(404);
+
+    const badIngredient = await request(app)
+      .put(`/api/v1/ingredients/${UNKNOWN_UUID}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: supplierAId });
+    expect(badIngredient.status).toBe(404);
+  });
+
+  it("DELETE removes an affiliation (204) and 404s when absent", async () => {
+    const ingId = await createIngredient("Aff_Delete");
+    await request(app)
+      .put(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: supplierBId });
+
+    const del = await request(app)
+      .delete(`/api/v1/ingredients/${ingId}/suppliers/${supplierBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(del.status).toBe(204);
+
+    const list = await request(app)
+      .get(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(list.body).toHaveLength(0);
+
+    // Deleting again → 404 (no affiliation).
+    const again = await request(app)
+      .delete(`/api/v1/ingredients/${ingId}/suppliers/${supplierBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(again.status).toBe(404);
+  });
+
+  // ── POST /ingredients with supplier_id (atomic) ───────────────────────────
+  it("POST with supplier_id creates ingredient + affiliation atomically", async () => {
+    const res = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        name: "Atomic_WithSupplier",
+        unit: "kg",
+        unit_cost: "33.00",
+        low_stock_threshold: "2",
+        supplier_id: supplierAId,
+        supplier_sku: "ATOM-1",
+      });
+    expect(res.status).toBe(201);
+    const ingId = res.body.id as string;
+
+    const list = await request(app)
+      .get(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(list.body).toHaveLength(1);
+    expect(list.body[0].supplierSku).toBe("ATOM-1");
+    // last_unit_cost defaults to the ingredient's unit_cost.
+    expect(Number(list.body[0].lastUnitCost)).toBe(33);
+  });
+
+  it("POST with unknown supplier_id → 404 and creates NO ingredient", async () => {
+    const res = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        name: "Atomic_Rollback",
+        unit: "kg",
+        unit_cost: "5.00",
+        low_stock_threshold: "1",
+        supplier_id: UNKNOWN_UUID,
+      });
+    expect(res.status).toBe(404);
+
+    // The ingredient must not have been created (all-or-nothing).
+    const all = await request(app)
+      .get("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(
+      (all.body as Array<{ name: string }>).some((r) => r.name === "Atomic_Rollback"),
+    ).toBe(false);
+  });
+
+  // ── GET /ingredients enrichment ───────────────────────────────────────────
+  it("GET /ingredients includes a suppliers[] array (populated + empty)", async () => {
+    const linkedId = await createIngredient("Enrich_Linked");
+    await request(app)
+      .put(`/api/v1/ingredients/${linkedId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: supplierAId });
+    const bareId = await createIngredient("Enrich_Bare");
+
+    const res = await request(app)
+      .get("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const rows = res.body as Array<{
+      id: string;
+      suppliers: Array<{ supplierId: string; name: string; code: string }>;
+    }>;
+    const linked = rows.find((r) => r.id === linkedId);
+    const bare = rows.find((r) => r.id === bareId);
+    expect(linked!.suppliers).toHaveLength(1);
+    expect(linked!.suppliers[0]).toMatchObject({ supplierId: supplierAId, code: supplierACode });
+    expect(bare!.suppliers).toEqual([]);
+  });
+
+  // ── RBAC: KITCHEN_CREW is forbidden on every write ────────────────────────
+  it("KITCHEN_CREW gets 403 on PATCH / PUT / DELETE affiliation writes", async () => {
+    const ingId = await createIngredient("Rbac_Target");
+    // Seed an affiliation as admin so DELETE has a target (still must 403 first).
+    await request(app)
+      .put(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ supplier_id: supplierAId });
+
+    const patch = await request(app)
+      .patch(`/api/v1/ingredients/${ingId}`)
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .send({ unit_cost: 1 });
+    expect(patch.status).toBe(403);
+
+    const put = await request(app)
+      .put(`/api/v1/ingredients/${ingId}/suppliers`)
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .send({ supplier_id: supplierBId });
+    expect(put.status).toBe(403);
+
+    const del = await request(app)
+      .delete(`/api/v1/ingredients/${ingId}/suppliers/${supplierAId}`)
+      .set("Authorization", `Bearer ${kitchenToken}`);
+    expect(del.status).toBe(403);
+  });
+});

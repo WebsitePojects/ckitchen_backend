@@ -32,6 +32,8 @@ import {
   locations,
   stockLedgerEntries,
   stockReservations,
+  supplierItems,
+  suppliers,
   warehouseTypeEnum,
   warehouses,
 } from "../../db/schema.js";
@@ -59,6 +61,28 @@ const createIngredientSchema = z.object({
   unit: z.string().min(1),
   unit_cost: z.union([z.string().min(1), z.number()]),
   low_stock_threshold: z.union([z.string().min(1), z.number()]),
+  // Optional supplier affiliation created atomically with the ingredient (ERP R2).
+  supplier_id: z.string().uuid().optional(),
+  supplier_sku: z.string().max(64).optional(),
+});
+
+// PATCH /ingredients/:id — every field optional, but at least one required.
+const patchIngredientSchema = z
+  .object({
+    name: z.string().min(1).max(120).optional(),
+    unit: z.string().min(1).max(16).optional(),
+    unit_cost: z.number().positive().optional(),
+    low_stock_threshold: z.number().min(0).optional(),
+  })
+  .refine((body) => Object.keys(body).length > 0, {
+    message: "At least one field is required.",
+  });
+
+// PUT /ingredients/:id/suppliers — upsert a (supplier, ingredient) affiliation.
+const linkSupplierSchema = z.object({
+  supplier_id: z.string().uuid(),
+  supplier_sku: z.string().max(64).optional(),
+  last_unit_cost: z.number().min(0).optional(),
 });
 
 const receiveItemSchema = z.object({
@@ -211,14 +235,44 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
 
   // -------------------------------------------------------------------------
   // GET /ingredients — list all ingredients
+  //
+  // Each row is enriched with `suppliers: [{ supplierId, name, code }]` (empty
+  // array when none) so lists can show affiliations without N+1 calls. The
+  // affiliations come from ONE grouped join query (not a per-row lookup).
   // -------------------------------------------------------------------------
   router.get("/ingredients", requireAuth, async (req, res) => {
     const rows = await db.select().from(ingredients);
-    res.json(rows);
+
+    const affiliations = await db
+      .select({
+        ingredientId: supplierItems.ingredientId,
+        supplierId: suppliers.id,
+        name: suppliers.name,
+        code: suppliers.code,
+      })
+      .from(supplierItems)
+      .innerJoin(suppliers, eq(supplierItems.supplierId, suppliers.id));
+
+    const byIngredient = new Map<
+      string,
+      { supplierId: string; name: string; code: string }[]
+    >();
+    for (const a of affiliations) {
+      const list = byIngredient.get(a.ingredientId) ?? [];
+      list.push({ supplierId: a.supplierId, name: a.name, code: a.code });
+      byIngredient.set(a.ingredientId, list);
+    }
+
+    res.json(rows.map((row) => ({ ...row, suppliers: byIngredient.get(row.id) ?? [] })));
   });
 
   // -------------------------------------------------------------------------
   // POST /ingredients — create ingredient (SUPER_ADMIN only)
+  //
+  // Non-breaking extension: an optional `supplier_id` (+ `supplier_sku`) creates
+  // the supplier_item affiliation in the SAME transaction as the ingredient, with
+  // last_unit_cost defaulting to the ingredient's unit_cost. Callers without
+  // supplier_id are unchanged.
   // -------------------------------------------------------------------------
   router.post("/ingredients", requireAuth, requireRole(...ADMIN_ONLY), async (req, res) => {
     const parsed = createIngredientSchema.safeParse(req.body ?? {});
@@ -227,18 +281,247 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
-    const [ingredient] = await db
-      .insert(ingredients)
-      .values({
-        name: parsed.data.name,
-        unit: parsed.data.unit,
-        unitCost: String(parsed.data.unit_cost),
-        lowStockThreshold: String(parsed.data.low_stock_threshold),
-      })
-      .returning();
+    // Validate the supplier BEFORE opening the transaction so an unknown supplier
+    // never creates an ingredient (atomicity of the whole request).
+    if (parsed.data.supplier_id) {
+      const [supplier] = await db
+        .select({ id: suppliers.id })
+        .from(suppliers)
+        .where(eq(suppliers.id, parsed.data.supplier_id));
+      if (!supplier) {
+        sendError(res, 404, "NOT_FOUND", "Supplier not found.");
+        return;
+      }
+    }
+
+    const ingredient = await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(ingredients)
+        .values({
+          name: parsed.data.name,
+          unit: parsed.data.unit,
+          unitCost: String(parsed.data.unit_cost),
+          lowStockThreshold: String(parsed.data.low_stock_threshold),
+        })
+        .returning();
+
+      if (parsed.data.supplier_id) {
+        await tx.insert(supplierItems).values({
+          supplierId: parsed.data.supplier_id,
+          ingredientId: created!.id,
+          supplierSku: parsed.data.supplier_sku ?? null,
+          lastUnitCost: String(parsed.data.unit_cost),
+        });
+      }
+
+      return created!;
+    });
 
     res.status(201).json(ingredient);
   });
+
+  // -------------------------------------------------------------------------
+  // PATCH /ingredients/:id — edit ingredient master fields (SUPER_ADMIN only)
+  //
+  // All fields optional, at least one required. Threshold edits flow straight
+  // into the below_threshold / lowstock logic because those read the column.
+  // Audit `ingredient.update` records the changed fields as old→new pairs.
+  // -------------------------------------------------------------------------
+  router.patch("/ingredients/:id", requireAuth, requireRole(...ADMIN_ONLY), async (req, res) => {
+    const parsed = patchIngredientSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid ingredient payload.", parsed.error.issues);
+      return;
+    }
+
+    const id = paramAsString(req.params.id);
+    const [existing] = await db.select().from(ingredients).where(eq(ingredients.id, id));
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", "Ingredient not found.");
+      return;
+    }
+
+    const updates: Record<string, unknown> = {};
+    const changes: Record<string, { from: unknown; to: unknown }> = {};
+    if (parsed.data.name !== undefined) {
+      updates.name = parsed.data.name;
+      changes.name = { from: existing.name, to: parsed.data.name };
+    }
+    if (parsed.data.unit !== undefined) {
+      updates.unit = parsed.data.unit;
+      changes.unit = { from: existing.unit, to: parsed.data.unit };
+    }
+    if (parsed.data.unit_cost !== undefined) {
+      const next = String(parsed.data.unit_cost);
+      updates.unitCost = next;
+      changes.unit_cost = { from: existing.unitCost, to: next };
+    }
+    if (parsed.data.low_stock_threshold !== undefined) {
+      const next = String(parsed.data.low_stock_threshold);
+      updates.lowStockThreshold = next;
+      changes.low_stock_threshold = { from: existing.lowStockThreshold, to: next };
+    }
+
+    const [updated] = await db
+      .update(ingredients)
+      .set(updates)
+      .where(eq(ingredients.id, id))
+      .returning();
+
+    res.json(updated);
+
+    void audit(db, {
+      actorUserId: req.user?.id ?? null,
+      actorName: req.user?.name ?? null,
+      sessionId: req.user?.sessionId ?? null,
+      action: "ingredient.update",
+      description: `updated ingredient "${existing.name}"`,
+      entityType: "ingredient",
+      entityId: id,
+      metadata: { changes },
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // GET /ingredients/:id/suppliers — affiliations for one ingredient
+  // (any authenticated). ONE join query; supplier summary inline.
+  // -------------------------------------------------------------------------
+  router.get("/ingredients/:id/suppliers", requireAuth, async (req, res) => {
+    const id = paramAsString(req.params.id);
+    const rows = await db
+      .select({
+        id: supplierItems.id,
+        supplierId: supplierItems.supplierId,
+        ingredientId: supplierItems.ingredientId,
+        supplierSku: supplierItems.supplierSku,
+        lastUnitCost: supplierItems.lastUnitCost,
+        supplier: {
+          id: suppliers.id,
+          code: suppliers.code,
+          name: suppliers.name,
+          isActive: suppliers.isActive,
+        },
+      })
+      .from(supplierItems)
+      .innerJoin(suppliers, eq(supplierItems.supplierId, suppliers.id))
+      .where(eq(supplierItems.ingredientId, id));
+    res.json(rows);
+  });
+
+  // -------------------------------------------------------------------------
+  // PUT /ingredients/:id/suppliers — upsert a supplier affiliation (ADMIN only)
+  //
+  // Idempotent on the (supplier, ingredient) unique index: a re-PUT updates the
+  // supplied sku/cost in place instead of creating a duplicate row. Fields not
+  // present in the body keep their existing value on conflict.
+  // -------------------------------------------------------------------------
+  router.put("/ingredients/:id/suppliers", requireAuth, requireRole(...ADMIN_ONLY), async (req, res) => {
+    const parsed = linkSupplierSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid supplier link payload.", parsed.error.issues);
+      return;
+    }
+
+    const id = paramAsString(req.params.id);
+    const [ingredient] = await db.select().from(ingredients).where(eq(ingredients.id, id));
+    if (!ingredient) {
+      sendError(res, 404, "NOT_FOUND", "Ingredient not found.");
+      return;
+    }
+    const [supplier] = await db
+      .select()
+      .from(suppliers)
+      .where(eq(suppliers.id, parsed.data.supplier_id));
+    if (!supplier) {
+      sendError(res, 404, "NOT_FOUND", "Supplier not found.");
+      return;
+    }
+
+    const [row] = await db
+      .insert(supplierItems)
+      .values({
+        supplierId: parsed.data.supplier_id,
+        ingredientId: id,
+        supplierSku: parsed.data.supplier_sku ?? null,
+        lastUnitCost:
+          parsed.data.last_unit_cost !== undefined ? String(parsed.data.last_unit_cost) : "0",
+      })
+      .onConflictDoUpdate({
+        target: [supplierItems.supplierId, supplierItems.ingredientId],
+        set: {
+          // Keep the existing value when the caller omits the field.
+          supplierSku:
+            parsed.data.supplier_sku !== undefined
+              ? parsed.data.supplier_sku
+              : sql`${supplierItems.supplierSku}`,
+          lastUnitCost:
+            parsed.data.last_unit_cost !== undefined
+              ? String(parsed.data.last_unit_cost)
+              : sql`${supplierItems.lastUnitCost}`,
+        },
+      })
+      .returning();
+
+    res.json(row);
+
+    void audit(db, {
+      actorUserId: req.user?.id ?? null,
+      actorName: req.user?.name ?? null,
+      sessionId: req.user?.sessionId ?? null,
+      action: "ingredient.supplier_link",
+      description: `linked supplier ${supplier.code} to ingredient "${ingredient.name}"`,
+      entityType: "ingredient",
+      entityId: id,
+      metadata: {
+        supplierId: supplier.id,
+        supplierSku: row!.supplierSku,
+        lastUnitCost: row!.lastUnitCost,
+      },
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // DELETE /ingredients/:id/suppliers/:supplierId — unlink (ADMIN only)
+  // 204 on success; 404 when no affiliation exists.
+  // -------------------------------------------------------------------------
+  router.delete(
+    "/ingredients/:id/suppliers/:supplierId",
+    requireAuth,
+    requireRole(...ADMIN_ONLY),
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const supplierId = paramAsString(req.params.supplierId);
+
+      const [existing] = await db
+        .select()
+        .from(supplierItems)
+        .where(
+          and(
+            eq(supplierItems.ingredientId, id),
+            eq(supplierItems.supplierId, supplierId),
+          ),
+        );
+      if (!existing) {
+        sendError(res, 404, "NOT_FOUND", "Supplier affiliation not found.");
+        return;
+      }
+
+      await db.delete(supplierItems).where(eq(supplierItems.id, existing.id));
+
+      res.status(204).end();
+
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        actorName: req.user?.name ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "ingredient.supplier_unlink",
+        description: `unlinked supplier ${supplierId} from ingredient ${id}`,
+        entityType: "ingredient",
+        entityId: id,
+        metadata: { supplierId },
+      });
+    },
+  );
 
   // -------------------------------------------------------------------------
   // GET /warehouses — list the two tiers

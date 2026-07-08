@@ -14,6 +14,12 @@
  * actually applied to a specific order, snapshotting type/value as `amount`
  * (a peso figure) at apply time, plus the 3-layer approval state.
  *
+ * WALK-IN ONLY (2026-07-08): POST /orders/:id/discounts is restricted to
+ * orders whose aggregator is OTHER (walk-in/manual). Real FOODPANDA/GRABFOOD
+ * orders carry platform-applied promos in their own payloads — manual entry
+ * on top would double-count, so those return 409 AGGREGATOR_ORDER. Existing
+ * order_discount rows and the approval endpoints are unaffected.
+ *
  * Approval routing (PH defaults — CLIENT TO CONFIRM exact values, see
  * APPROVAL_THRESHOLDS below):
  *   - SENIOR / PWD: statutory. Always AUTO, always auto-APPROVED, always
@@ -395,6 +401,19 @@ export function createDiscountsRouter(db: DB): Router {
     // can land after the order is marked COMPLETED.
     if (order.status === "CANCELLED") {
       sendError(res, 409, "CONFLICT", "Cannot apply a discount to a cancelled order.");
+      return;
+    }
+    // Manual discounts are WALK-IN ONLY (2026-07-08): real FOODPANDA/GRABFOOD
+    // orders carry platform-applied promos in their payloads — manually adding
+    // one here would double-count the discount. Existing order_discount rows
+    // and the approval flow are untouched; only NEW applications are blocked.
+    if (order.aggregator !== "OTHER") {
+      sendError(
+        res,
+        409,
+        "AGGREGATOR_ORDER",
+        "Discounts for aggregator orders come from the platform payload; manual discounts are walk-in only.",
+      );
       return;
     }
 

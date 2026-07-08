@@ -204,6 +204,8 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         hub.emitToLocation(brandLocationId, "order.created", {
           order_id: result.order_id,
           status: result.status,
+          // 0022 — copyable order code, same field name as REST responses.
+          order_code: result.order_code,
           brand_id: parsed.data.brand_id,
           aggregator: parsed.data.aggregator,
           external_ref: parsed.data.external_ref,

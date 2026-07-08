@@ -456,6 +456,16 @@ export const orders = pgTable(
       .references(() => aggregatorAccounts.id),
     aggregator: aggregatorEnum("aggregator").notNull(),
     externalRef: text("external_ref").notNull(),
+    /**
+     * Human-friendly copyable order reference (migration 0022), e.g.
+     * "TOK-FP-7K3QD" — <BRAND 3 alnum chars, X-padded>-<FP|GF|WI>-<5-char
+     * no-0/O/1/I base32 random>. Generated app-side in ingestOrder; nullable
+     * only for schema-level flexibility (backfill gave legacy rows a 6-hex
+     * md5(id) prefix). TS property is snake_case ON PURPOSE: order rows are
+     * returned verbatim by GET /orders(/:id), so the property name IS the
+     * public API field name — the contract says `order_code`.
+     */
+    order_code: text("order_code"),
     customerName: text("customer_name"),
     status: orderStatusEnum("status").notNull().default("NEW"),
     /** Required when status transitions to CANCELLED (MOTM 2026-07-01). */
@@ -478,6 +488,10 @@ export const orders = pgTable(
       table.aggregatorAccountId,
       table.externalRef,
     ),
+    // Migration 0022 — copyable order codes are globally unique (NULLs exempt,
+    // per Postgres unique-index semantics). ingestOrder retries once with a
+    // fresh random suffix if it ever loses this race.
+    uniqueIndex("order_order_code_unique").on(table.order_code),
     index("order_status_placed_at_idx").on(table.status, table.placedAt.desc()),
     index("order_brand_placed_at_idx").on(table.brandId, table.placedAt.desc()),
     index("order_aggregator_account_id_idx").on(table.aggregatorAccountId),

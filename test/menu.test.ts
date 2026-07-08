@@ -697,3 +697,108 @@ describe("Menu item MOTM fields: item_no, remarks, image_url", () => {
     expect(res.status).toBe(403);
   });
 });
+
+// ---------------------------------------------------------------------------
+// DELETE /menu/:id — remove an item (only when it was never ordered)
+// ---------------------------------------------------------------------------
+
+describe("DELETE /api/v1/menu/:id", () => {
+  let brandId: string;
+  let stationId: string;
+
+  beforeAll(async () => {
+    const brandRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Delete Test Brand", color: "#ab34cd" });
+    brandId = brandRes.body.id as string;
+
+    const stRes = await request(app)
+      .get("/api/v1/stations")
+      .set("Authorization", `Bearer ${adminToken}`);
+    stationId = (stRes.body as Array<{ id: string }>)[0].id;
+  });
+
+  async function createItem(name: string): Promise<string> {
+    const res = await request(app)
+      .post(`/api/v1/brands/${brandId}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name, price: 100, station_id: stationId });
+    expect(res.status).toBe(201);
+    return res.body.id as string;
+  }
+
+  it("deletes an unordered item (and its recipe lines) with 204; item disappears from the brand menu", async () => {
+    const itemId = await createItem("Deletable Dish");
+
+    // Give it a recipe line so the cascade path is exercised.
+    const ingRes = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "DeleteTest_Ing", unit: "g", unit_cost: "1.00", low_stock_threshold: "5" });
+    await request(app)
+      .put(`/api/v1/menu/${itemId}/recipe`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ lines: [{ ingredient_id: ingRes.body.id, portion_qty: 10 }] });
+
+    const delRes = await request(app)
+      .delete(`/api/v1/menu/${itemId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(delRes.status).toBe(204);
+
+    const listRes = await request(app)
+      .get(`/api/v1/brands/${brandId}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    const ids = (listRes.body as Array<{ id: string }>).map((i) => i.id);
+    expect(ids).not.toContain(itemId);
+  });
+
+  it("returns 409 HAS_ORDERS for an item that appears in an order", async () => {
+    const itemId = await createItem("Ordered Dish");
+
+    await request(app)
+      .post(`/api/v1/brands/${brandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "OTHER", external_merchant_id: "DEL-TB", credential_ref: "ref-del" });
+
+    const ingest = await request(app)
+      .post("/api/v1/ingest/order")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        brand_id: brandId,
+        aggregator: "OTHER",
+        external_ref: `DEL-${Date.now()}`,
+        allow_oversell: true,
+        items: [{ menu_item_id: itemId, qty: 1 }],
+      });
+    expect(ingest.status).toBe(201);
+
+    const delRes = await request(app)
+      .delete(`/api/v1/menu/${itemId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(delRes.status).toBe(409);
+    expect(delRes.body.error.code).toBe("HAS_ORDERS");
+
+    // Still present — nothing was deleted.
+    const listRes = await request(app)
+      .get(`/api/v1/brands/${brandId}/menu`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    const ids = (listRes.body as Array<{ id: string }>).map((i) => i.id);
+    expect(ids).toContain(itemId);
+  });
+
+  it("rejects KITCHEN_STAFF with 403", async () => {
+    const itemId = await createItem("RBAC Dish");
+    const res = await request(app)
+      .delete(`/api/v1/menu/${itemId}`)
+      .set("Authorization", `Bearer ${staffToken}`);
+    expect(res.status).toBe(403);
+  });
+
+  it("returns 404 for an unknown item", async () => {
+    const res = await request(app)
+      .delete("/api/v1/menu/00000000-0000-0000-0000-000000000000")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(404);
+  });
+});

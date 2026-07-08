@@ -50,6 +50,7 @@
  *        read-back. Event semantics preserved (last-write-wins per ingredient,
  *        deduped lowstock events).
  */
+import { randomBytes } from "node:crypto";
 import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
@@ -110,6 +111,13 @@ export interface StockShortfall {
 export interface IngestResult {
   order_id: string;
   status: string;
+  /**
+   * Human-friendly copyable order reference (migration 0022), e.g.
+   * "TOK-FP-7K3QD". Always set for newly ingested orders; on a
+   * DUPLICATE_ORDER replay it echoes the existing order's code (null only
+   * for pre-0022 legacy rows that somehow escaped the backfill).
+   */
+  order_code: string | null;
   print_jobs: PrintJobSummary[];
   /** Present only on DUPLICATE_ORDER responses. */
   code?: "DUPLICATE_ORDER";
@@ -245,6 +253,45 @@ function isUniqueViolation(err: unknown): boolean {
     }
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Order code generation (migration 0022 — human-friendly copyable reference)
+// ---------------------------------------------------------------------------
+
+/**
+ * Base32 alphabet WITHOUT the ambiguous 0/O and 1/I glyphs — codes get read
+ * aloud over kitchen noise and typed from paper KOTs. Exactly 32 chars, so
+ * `byte % 32` maps uniformly (256 = 8 × 32, no modulo bias).
+ */
+const ORDER_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+
+const AGGREGATOR_CODE: Record<IngestOrderInput["aggregator"], string> = {
+  FOODPANDA: "FP",
+  GRABFOOD: "GF",
+  OTHER: "WI", // walk-in / manual entry
+};
+
+/**
+ * `<BRAND>-<AGG>-<RAND>`, e.g. "TOK-FP-7K3QD".
+ *   BRAND — first 3 alphanumeric chars of the brand name, uppercased,
+ *           X-padded when the name has fewer than 3 ("Bo" → "BOX").
+ *   AGG   — FP | GF | WI.
+ *   RAND  — 5 chars from ORDER_CODE_ALPHABET via crypto randomBytes
+ *           (32^5 ≈ 33.5M — collisions are retried once on the unique index).
+ */
+export function generateOrderCode(
+  brandName: string,
+  aggregator: IngestOrderInput["aggregator"],
+): string {
+  const alnum = brandName.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const brandPart = (alnum + "XXX").slice(0, 3);
+  const bytes = randomBytes(5);
+  let rand = "";
+  for (let i = 0; i < bytes.length; i++) {
+    rand += ORDER_CODE_ALPHABET[bytes[i] % ORDER_CODE_ALPHABET.length];
+  }
+  return `${brandPart}-${AGGREGATOR_CODE[aggregator]}-${rand}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -494,120 +541,148 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
   }
 
   // ── TRANSACTION: order + order_items + print_jobs + reservations ────────
+  // Migration 0022 — the copyable order_code is generated BEFORE the tx. On a
+  // unique violation we distinguish the idempotency constraint
+  // (order_listing_external_ref_unique → existing DUPLICATE_ORDER semantics,
+  // detected by re-querying the listing+ref) from an order_code collision
+  // (the only OTHER unique index on "order") and retry the whole tx exactly
+  // once with a fresh random suffix. Code collision ≠ idempotency collision.
   let createdOrderId = "";
   let createdOrderStatus = "NEW";
+  let createdOrderCode: string | null = null;
   const createdPrintJobs: PrintJobSummary[] = [];
 
-  try {
-    await db.transaction(async (tx) => {
-      // Create the order
-      const [createdOrder] = await tx
-        .insert(orders)
-        .values({
-          brandId: input.brand_id,
-          aggregatorAccountId: account.id,
-          aggregator: input.aggregator,
-          externalRef: input.external_ref,
-          customerName: input.customer_name,
-          status: "NEW",
-          total,
-          placedAt,
-        })
-        .returning();
+  const MAX_CODE_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_CODE_ATTEMPTS; attempt++) {
+    const orderCode = generateOrderCode(brand.name, input.aggregator);
+    // Defensive reset — the order INSERT is the tx's first statement, so a
+    // unique violation can't have pushed print jobs, but keep retries clean.
+    createdPrintJobs.length = 0;
 
-      createdOrderId = createdOrder.id;
-      createdOrderStatus = createdOrder.status;
-
-      // Create order items
-      await tx.insert(orderItems).values(
-        resolvedItems.map((item) => ({
-          orderId: createdOrder.id,
-          menuItemId: item.menuItemId,
-          qty: item.qty,
-          stationId: item.stationId,
-          notes: item.notes ?? null,
-        })),
-      );
-
-      // Create ONE print job per distinct station (S7: printer id comes from
-      // the batched menu/station join — no per-station query in the tx).
-      for (const [stationId, group] of stationGroupMap.entries()) {
-        const kotPayload = {
-          type: "KOT",
-          brand: brand.name,
-          aggregator: input.aggregator,
-          order_ref: input.external_ref,
-          station: group.stationName,
-          placed_at: placedAt.toISOString(),
-          customer: input.customer_name ?? null,
-          items: group.items.map((i) => ({
-            qty: i.qty,
-            name: i.name,
-            notes: i.notes ?? null,
-          })),
-          footer: "CloudKitchen ONE",
-        };
-
-        const [printJob] = await tx
-          .insert(printJobs)
+    try {
+      await db.transaction(async (tx) => {
+        // Create the order
+        const [createdOrder] = await tx
+          .insert(orders)
           .values({
-            orderId: createdOrder.id,
-            stationId,
-            printerId: group.defaultPrinterId,
-            payload: kotPayload,
-            status: "PENDING",
+            brandId: input.brand_id,
+            aggregatorAccountId: account.id,
+            aggregator: input.aggregator,
+            externalRef: input.external_ref,
+            order_code: orderCode,
+            customerName: input.customer_name,
+            status: "NEW",
+            total,
+            placedAt,
           })
           .returning();
 
-        createdPrintJobs.push({
-          id: printJob.id,
-          station: group.stationName,
-          printer: printJob.printerId,
-        });
-      }
+        createdOrderId = createdOrder.id;
+        createdOrderStatus = createdOrder.status;
+        createdOrderCode = createdOrder.order_code;
 
-      // S4 — insert the soft hold: one reservation row per ingredient. Only on
-      // this genuinely-new-order path (duplicates returned earlier; a lost
-      // unique-violation race rolls this back with the whole tx), so replays
-      // can never double-reserve.
-      if (reservationWarehouseId && requiredByIngredient.size > 0) {
-        await tx.insert(stockReservations).values(
-          [...requiredByIngredient.entries()].map(([ingredientId, quantity]) => ({
+        // Create order items
+        await tx.insert(orderItems).values(
+          resolvedItems.map((item) => ({
             orderId: createdOrder.id,
-            ingredientId,
-            warehouseId: reservationWarehouseId as string,
-            quantity: String(quantity),
+            menuItemId: item.menuItemId,
+            qty: item.qty,
+            stationId: item.stationId,
+            notes: item.notes ?? null,
           })),
         );
+
+        // Create ONE print job per distinct station (S7: printer id comes from
+        // the batched menu/station join — no per-station query in the tx).
+        for (const [stationId, group] of stationGroupMap.entries()) {
+          const kotPayload = {
+            type: "KOT",
+            brand: brand.name,
+            aggregator: input.aggregator,
+            order_ref: input.external_ref,
+            station: group.stationName,
+            placed_at: placedAt.toISOString(),
+            customer: input.customer_name ?? null,
+            items: group.items.map((i) => ({
+              qty: i.qty,
+              name: i.name,
+              notes: i.notes ?? null,
+            })),
+            footer: "CloudKitchen ONE",
+          };
+
+          const [printJob] = await tx
+            .insert(printJobs)
+            .values({
+              orderId: createdOrder.id,
+              stationId,
+              printerId: group.defaultPrinterId,
+              payload: kotPayload,
+              status: "PENDING",
+            })
+            .returning();
+
+          createdPrintJobs.push({
+            id: printJob.id,
+            station: group.stationName,
+            printer: printJob.printerId,
+          });
+        }
+
+        // S4 — insert the soft hold: one reservation row per ingredient. Only on
+        // this genuinely-new-order path (duplicates returned earlier; a lost
+        // unique-violation race rolls this back with the whole tx), so replays
+        // can never double-reserve.
+        if (reservationWarehouseId && requiredByIngredient.size > 0) {
+          await tx.insert(stockReservations).values(
+            [...requiredByIngredient.entries()].map(([ingredientId, quantity]) => ({
+              orderId: createdOrder.id,
+              ingredientId,
+              warehouseId: reservationWarehouseId as string,
+              quantity: String(quantity),
+            })),
+          );
+        }
+      });
+
+      break; // tx committed — order created
+    } catch (err) {
+      // FIX C — graceful handling of concurrent duplicate ingests.
+      // If two requests with the same (aggregator_account_id, external_ref) race
+      // past the pre-check above, one INSERT wins and the other hits a UNIQUE
+      // violation (PG code 23505) on order_listing_external_ref_unique. Return
+      // the existing order instead of a 500. Scoped to the listing (account.id),
+      // matching the idempotency check above.
+      if (isUniqueViolation(err)) {
+        const [raceExisting] = await db
+          .select()
+          .from(orders)
+          .where(
+            and(
+              eq(orders.aggregatorAccountId, account.id),
+              eq(orders.externalRef, input.external_ref),
+            ),
+          );
+        if (raceExisting) {
+          return buildDuplicateResponse(db, raceExisting);
+        }
+        // 0022 — a unique violation with NO existing (listing, external_ref)
+        // row means it was NOT the idempotency constraint; the only other
+        // unique index on "order" is order_order_code_unique, so the random
+        // suffix collided. Retry the whole tx once with a fresh code — the
+        // DUPLICATE_ORDER semantics above stay exactly as they were.
+        if (attempt < MAX_CODE_ATTEMPTS) {
+          continue;
+        }
       }
-    });
-  } catch (err) {
-    // FIX C — graceful handling of concurrent duplicate ingests.
-    // If two requests with the same (aggregator_account_id, external_ref) race
-    // past the pre-check above, one INSERT wins and the other hits a UNIQUE
-    // violation (PG code 23505) on order_listing_external_ref_unique. Return
-    // the existing order instead of a 500. Scoped to the listing (account.id),
-    // matching the idempotency check above.
-    if (isUniqueViolation(err)) {
-      const [raceExisting] = await db
-        .select()
-        .from(orders)
-        .where(
-          and(
-            eq(orders.aggregatorAccountId, account.id),
-            eq(orders.externalRef, input.external_ref),
-          ),
-        );
-      if (raceExisting) {
-        return buildDuplicateResponse(db, raceExisting);
-      }
+      throw err;
     }
-    throw err;
   }
 
   const result: IngestResult = {
     order_id: createdOrderId,
     status: createdOrderStatus,
+    order_code: createdOrderCode,
     print_jobs: createdPrintJobs,
   };
   if (shortfalls.length > 0) {
@@ -643,6 +718,7 @@ async function buildDuplicateResponse(
   return {
     order_id: existing.id,
     status: existing.status,
+    order_code: existing.order_code,
     print_jobs: existingJobs.map((j) => ({
       id: j.id,
       station: stationNameById.get(j.stationId) ?? j.stationId,

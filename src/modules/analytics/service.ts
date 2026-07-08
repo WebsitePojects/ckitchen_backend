@@ -14,6 +14,11 @@
  * All functions accept optional from/to date-range strings (ISO-8601 UTC).
  * Default range 2000-01-01 → 2099-12-31 covers all-time when no filter is supplied.
  *
+ * Date-only params ("2026-07-08") expand to the FULL UTC day (from → start of
+ * day, to → end of day) via parseRangeBoundary — see src/modules/date-range.ts
+ * for the "orders placed today were excluded" bug this fixes. Full ISO
+ * datetimes pass through unchanged.
+ *
  * Raw SQL (db.execute + sql template) is used for the aggregation queries because
  * they require LEFT JOIN ON date-range conditions (to preserve brands with no orders
  * in range), groupBy expressions, and a CTE for the margins recipe-cost sub-query.
@@ -21,6 +26,7 @@
  */
 import { sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
+import { parseRangeBoundary } from "../date-range.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -120,8 +126,8 @@ export async function getBrandsAnalytics(
   from?: string,
   to?: string,
 ): Promise<BrandAnalytics[]> {
-  const fromDate = from ? new Date(from) : DEFAULT_FROM;
-  const toDate = to ? new Date(to) : DEFAULT_TO;
+  const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
+  const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
 
   // LEFT JOIN keeps all brands; date range is applied in ON clause (not WHERE)
   // so brands with no orders within the window still appear with 0 aggregates.
@@ -172,8 +178,10 @@ export async function getBrandsAnalytics(
  * Sparse array — hours with no orders are omitted (peak-load view).
  */
 export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrderCount[]> {
-  const startOfDay = new Date(date + "T00:00:00.000Z");
-  const endOfDay = new Date(date + "T23:59:59.999Z");
+  // parseRangeBoundary: a date-only `date` expands to the same full-day bounds
+  // as before; a full ISO datetime no longer produces an Invalid Date.
+  const startOfDay = parseRangeBoundary(date, "from");
+  const endOfDay = parseRangeBoundary(date, "to");
 
   // EXTRACT on TIMESTAMPTZ in PostgreSQL/PGlite is relative to the session timezone.
   // PGlite defaults to UTC, and we store all timestamps as UTC, so this is correct.
@@ -219,8 +227,10 @@ export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrder
  * the existing /analytics/orders-by-hour endpoint already returns.
  */
 export async function getOrdersByHourByBrand(db: DB, date: string): Promise<HourlyBrandBucket[]> {
-  const startOfDay = new Date(date + "T00:00:00.000Z");
-  const endOfDay = new Date(date + "T23:59:59.999Z");
+  // parseRangeBoundary: a date-only `date` expands to the same full-day bounds
+  // as before; a full ISO datetime no longer produces an Invalid Date.
+  const startOfDay = parseRangeBoundary(date, "from");
+  const endOfDay = parseRangeBoundary(date, "to");
 
   // generate_series(0,23) gives the dense hour axis; CROSS JOIN brand gives
   // the dense brand axis; LEFT JOIN "order" (matched on brand + exact hour +
@@ -283,8 +293,8 @@ export async function getAggregatorsAnalytics(
   from?: string,
   to?: string,
 ): Promise<AggregatorAnalytics[]> {
-  const fromDate = from ? new Date(from) : DEFAULT_FROM;
-  const toDate = to ? new Date(to) : DEFAULT_TO;
+  const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
+  const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
 
   const raw = await db.execute(sql`
     SELECT
@@ -331,8 +341,8 @@ export async function getMarginsAnalytics(
   from?: string,
   to?: string,
 ): Promise<BrandMargin[]> {
-  const fromDate = from ? new Date(from) : DEFAULT_FROM;
-  const toDate = to ? new Date(to) : DEFAULT_TO;
+  const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
+  const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
 
   const raw = await db.execute(sql`
     WITH recipe_costs AS (
@@ -414,8 +424,8 @@ export async function getProductPerformance(
   from?: string,
   to?: string,
 ): Promise<ProductPerformance[]> {
-  const fromDate = from ? new Date(from) : DEFAULT_FROM;
-  const toDate = to ? new Date(to) : DEFAULT_TO;
+  const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
+  const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
 
   const raw = await db.execute(sql`
     WITH filtered_items AS (

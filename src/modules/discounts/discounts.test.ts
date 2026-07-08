@@ -11,7 +11,8 @@ import { hashPassword } from "../auth/service.js";
 let app: Express;
 let db: DB;
 let brandId: string;
-let aggregatorAccountId: string;
+let aggregatorAccountId: string; // FOODPANDA — used ONLY by the 409 AGGREGATOR_ORDER test
+let walkInAccountId: string; // OTHER — manual discounts are walk-in only (2026-07-08)
 
 let ownerToken: string;
 let outletManagerToken: string;
@@ -31,14 +32,23 @@ async function login(email: string, password: string): Promise<string> {
   return res.body.token as string;
 }
 
-/** Inserts a bare order row directly (bypasses ingest — only order.total matters here). */
-async function createOrder(total: string): Promise<string> {
+/**
+ * Inserts a bare order row directly (bypasses ingest — only order.total matters
+ * here). Defaults to an OTHER (walk-in) order because manual discounts are
+ * walk-in only since 2026-07-08 — the discount-mechanics tests below exercise
+ * apply/approve behavior, not the aggregator gate, so their fixtures must be
+ * eligible orders. The gate itself has its own explicit 409 test.
+ */
+async function createOrder(
+  total: string,
+  aggregator: "OTHER" | "FOODPANDA" = "OTHER",
+): Promise<string> {
   const [order] = await db
     .insert(orders)
     .values({
       brandId,
-      aggregatorAccountId,
-      aggregator: "FOODPANDA",
+      aggregatorAccountId: aggregator === "OTHER" ? walkInAccountId : aggregatorAccountId,
+      aggregator,
       externalRef: `ext-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       customerName: "Test Customer",
       status: "NEW",
@@ -69,6 +79,14 @@ beforeAll(async () => {
     .values({ brandId, aggregator: "FOODPANDA", externalMerchantId: "merchant-1" })
     .returning();
   aggregatorAccountId = account.id;
+
+  // OTHER (walk-in) listing — the default fixture channel now that manual
+  // discounts are restricted to walk-in orders.
+  const [walkInAccount] = await db
+    .insert(aggregatorAccounts)
+    .values({ brandId, aggregator: "OTHER", externalMerchantId: "walkin-1" })
+    .returning();
+  walkInAccountId = walkInAccount.id;
 
   await db.insert(users).values([
     {
@@ -261,6 +279,25 @@ describe("Apply discount — approval routing + effective_total", () => {
       .set("Authorization", `Bearer ${otherMgrToken}`);
     expect(queue.status).toBe(200);
     expect(queue.body.some((r: { id: string }) => r.id === pendingId)).toBe(false);
+  });
+
+  it("a FOODPANDA order rejects manual discounts with 409 AGGREGATOR_ORDER (walk-in only)", async () => {
+    const orderId = await createOrder("1000.00", "FOODPANDA");
+    const res = await request(app)
+      .post(`/api/v1/orders/${orderId}/discounts`)
+      .set("Authorization", `Bearer ${kitchenCrewToken}`)
+      .send({ type: "PERCENT", value: 5, label: "Platform promo?", reason: "should be blocked" });
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe("AGGREGATOR_ORDER");
+    expect(res.body.error.message).toContain("walk-in only");
+
+    // Reading the (empty) discount list on an aggregator order still works.
+    const detail = await request(app)
+      .get(`/api/v1/orders/${orderId}/discounts`)
+      .set("Authorization", `Bearer ${kitchenCrewToken}`);
+    expect(detail.status).toBe(200);
+    expect(detail.body.discounts).toEqual([]);
+    expect(detail.body.effective_total).toBe("1000.00");
   });
 
   it("SENIOR discount without id_note is rejected (400)", async () => {

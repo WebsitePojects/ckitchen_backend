@@ -14,6 +14,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { parseRangeBoundary } from "../date-range.js";
 import { sendError } from "../http-errors.js";
 import { getSalesReport, type OutletFilter, type SalesGroupBy } from "./service.js";
 import { buildSalesReportPdf, buildSalesReportXlsx } from "./export.js";
@@ -48,6 +49,13 @@ function currentMonthRange(): { from: Date; to: Date } {
  * Resolves { from, to } Date objects from optional query strings, defaulting
  * missing side(s) to the current month's bounds. Returns `null` (with the
  * response already sent as 400) when either date is unparseable or from > to.
+ *
+ * Date-only strings ("2026-07-08") expand to the FULL UTC day via
+ * parseRangeBoundary (from → 00:00:00.000Z, to → 23:59:59.999Z) — previously
+ * `to=<today>` parsed to midnight, so orders COMPLETED today never appeared
+ * ("Reports show no data even after completing orders"). Full ISO datetimes
+ * pass through unchanged. Applies to /reports/sales AND /reports/sales/export
+ * (both call this).
  */
 function resolveRange(
   from: string | undefined,
@@ -55,8 +63,8 @@ function resolveRange(
   res: Parameters<typeof sendError>[0],
 ): { from: Date; to: Date } | null {
   const defaults = currentMonthRange();
-  const fromDate = from ? new Date(from) : defaults.from;
-  const toDate = to ? new Date(to) : defaults.to;
+  const fromDate = from ? parseRangeBoundary(from, "from") : defaults.from;
+  const toDate = to ? parseRangeBoundary(to, "to") : defaults.to;
 
   if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) {
     sendError(res, 400, "VALIDATION_ERROR", "Invalid 'from'/'to' date.");

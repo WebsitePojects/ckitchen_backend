@@ -17,7 +17,7 @@ import { inArray } from "drizzle-orm";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
-import { userOutletAccess, users } from "../src/db/schema.js";
+import { inventoryStock, stockLedgerEntries, userOutletAccess, users } from "../src/db/schema.js";
 
 let app: Express;
 let db: DB;
@@ -799,5 +799,164 @@ describe("POST /api/v1/inventory/receive — upsert accumulates stock in MAIN", 
 
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Depletion projection — daily_consumption_7d + days_remaining in GET /inventory
+//
+// daily_consumption_7d = SUM(stock_ledger OUT / ORDER_DEDUCTION rows for this
+// warehouse posted in the trailing 7 days) / 7, rounded to 2dp.
+// days_remaining = available / daily_consumption_7d rounded to 1dp when the
+// rate > 0 (clamped to 0 when available <= 0), else null ("no recent
+// consumption"). Ledger rows are inserted directly (the ORDER_DEDUCTION →
+// ledger pipeline itself is covered by test/stock-ledger.test.ts and
+// test/deduction.test.ts) so the fixture timestamps/quantities are exact.
+// ---------------------------------------------------------------------------
+
+describe("Depletion projection: daily_consumption_7d + days_remaining (GET /inventory)", () => {
+  let kitchenWarehouseId: string;
+  let mainWarehouseId: string;
+  let rateIngId: string; // 4.9 consumed over 7d → 0.7/day; 100 on hand → 142.9 days
+  let idleIngId: string; // stock but NO recent consumption → rate 0, days null
+  let emptyIngId: string; // consumption but 0 on hand → days clamped to 0
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  async function createIngredient(name: string): Promise<string> {
+    const res = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name, unit: "g", unit_cost: "1.00", low_stock_threshold: "1" });
+    expect(res.status).toBe(201);
+    return res.body.id as string;
+  }
+
+  async function kitchenRow(ingredientId: string) {
+    const res = await request(app)
+      .get("/api/v1/inventory?warehouse=KITCHEN")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    return (res.body as Array<{
+      ingredientId: string;
+      quantity: string;
+      available: number;
+      daily_consumption_7d: number;
+      days_remaining: number | null;
+    }>).find((r) => r.ingredientId === ingredientId);
+  }
+
+  beforeAll(async () => {
+    const whRes = await request(app)
+      .get("/api/v1/warehouses")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(whRes.status).toBe(200);
+    const warehouses = whRes.body as Array<{ id: string; type: string }>;
+    kitchenWarehouseId = warehouses.find((w) => w.type === "KITCHEN")!.id;
+    mainWarehouseId = warehouses.find((w) => w.type === "MAIN")!.id;
+
+    rateIngId = await createIngredient("DP_Rate");
+    idleIngId = await createIngredient("DP_Idle");
+    emptyIngId = await createIngredient("DP_Empty");
+
+    await db.insert(inventoryStock).values([
+      { warehouseId: kitchenWarehouseId, ingredientId: rateIngId, quantity: "100" },
+      { warehouseId: kitchenWarehouseId, ingredientId: idleIngId, quantity: "50" },
+      { warehouseId: kitchenWarehouseId, ingredientId: emptyIngId, quantity: "0" },
+    ]);
+
+    const now = Date.now();
+    await db.insert(stockLedgerEntries).values([
+      // COUNTED for DP_Rate: OUT + ORDER_DEDUCTION + KITCHEN + within 7 days.
+      // 3 + 1.9 = 4.9 over 7 days → 0.7/day.
+      {
+        sourceModule: "ORDER_DEDUCTION", sourceDocumentNo: "DP-ORD-1", sourceLineNo: rateIngId,
+        ingredientId: rateIngId, warehouseId: kitchenWarehouseId,
+        movementType: "OUT", quantity: "3", postedAt: new Date(now - 1 * DAY_MS),
+      },
+      {
+        sourceModule: "ORDER_DEDUCTION", sourceDocumentNo: "DP-ORD-2", sourceLineNo: rateIngId,
+        ingredientId: rateIngId, warehouseId: kitchenWarehouseId,
+        movementType: "OUT", quantity: "1.9", postedAt: new Date(now - 2 * DAY_MS),
+      },
+      // EXCLUDED: outside the 7-day window (would dwarf the rate if counted).
+      {
+        sourceModule: "ORDER_DEDUCTION", sourceDocumentNo: "DP-ORD-OLD", sourceLineNo: rateIngId,
+        ingredientId: rateIngId, warehouseId: kitchenWarehouseId,
+        movementType: "OUT", quantity: "700", postedAt: new Date(now - 8 * DAY_MS),
+      },
+      // EXCLUDED: IN movement (a restock is not consumption).
+      {
+        sourceModule: "RESTOCK", sourceDocumentNo: "DP-RSTK-1", sourceLineNo: rateIngId,
+        ingredientId: rateIngId, warehouseId: kitchenWarehouseId,
+        movementType: "IN", quantity: "50", postedAt: new Date(now - 1 * DAY_MS),
+      },
+      // EXCLUDED: OUT but not ORDER_DEDUCTION (stock logistics, not usage).
+      {
+        sourceModule: "ITO", sourceDocumentNo: "DP-ITO-1", sourceLineNo: `OUT-${rateIngId}`,
+        ingredientId: rateIngId, warehouseId: kitchenWarehouseId,
+        movementType: "OUT", quantity: "99", postedAt: new Date(now - 1 * DAY_MS),
+      },
+      // EXCLUDED: right module/movement/window but the OTHER warehouse.
+      {
+        sourceModule: "ORDER_DEDUCTION", sourceDocumentNo: "DP-ORD-3", sourceLineNo: rateIngId,
+        ingredientId: rateIngId, warehouseId: mainWarehouseId,
+        movementType: "OUT", quantity: "999", postedAt: new Date(now - 1 * DAY_MS),
+      },
+      // DP_Empty: consuming 14 over 7 days (2/day) with 0 on hand.
+      {
+        sourceModule: "ORDER_DEDUCTION", sourceDocumentNo: "DP-ORD-4", sourceLineNo: emptyIngId,
+        ingredientId: emptyIngId, warehouseId: kitchenWarehouseId,
+        movementType: "OUT", quantity: "14", postedAt: new Date(now - 1 * DAY_MS),
+      },
+    ]);
+  });
+
+  it("computes the 7-day daily rate from ORDER_DEDUCTION OUT rows only (4.9/7 → 0.7)", async () => {
+    const row = await kitchenRow(rateIngId);
+    expect(row, "DP_Rate row missing").toBeTruthy();
+    // 3 + 1.9 counted; 700 (too old), 50 (IN), 99 (ITO), 999 (MAIN) all excluded.
+    expect(row!.daily_consumption_7d).toBe(0.7);
+  });
+
+  it("days_remaining = available / daily rate, rounded to 1dp (100 / 0.7 → 142.9)", async () => {
+    const row = await kitchenRow(rateIngId);
+    expect(row!.available).toBe(100); // no reservations on this fixture
+    expect(row!.days_remaining).toBe(142.9);
+  });
+
+  it("no consumption in the window → rate 0 and days_remaining null", async () => {
+    const row = await kitchenRow(idleIngId);
+    expect(row, "DP_Idle row missing").toBeTruthy();
+    expect(row!.daily_consumption_7d).toBe(0);
+    expect(row!.days_remaining).toBeNull();
+  });
+
+  it("available <= 0 with active consumption → days_remaining clamped to 0, never negative", async () => {
+    const row = await kitchenRow(emptyIngId);
+    expect(row, "DP_Empty row missing").toBeTruthy();
+    expect(row!.daily_consumption_7d).toBe(2);
+    expect(row!.days_remaining).toBe(0);
+  });
+
+  it("MAIN warehouse rows also carry the fields (independent per-warehouse rates)", async () => {
+    // DP_Rate has an ORDER_DEDUCTION row against MAIN (999 over 7d) but no MAIN
+    // stock row was created for it, so it does not appear in MAIN inventory.
+    // The seeded/receive-created MAIN rows must still expose the new fields.
+    const res = await request(app)
+      .get("/api/v1/inventory?warehouse=MAIN")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const rows = res.body as Array<{
+      daily_consumption_7d: number;
+      days_remaining: number | null;
+    }>;
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(typeof row.daily_consumption_7d).toBe("number");
+      expect(
+        row.days_remaining === null || typeof row.days_remaining === "number",
+      ).toBe(true);
+    }
   });
 });

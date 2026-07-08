@@ -258,6 +258,14 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   // GET /inventory?warehouse=MAIN|KITCHEN — stock per tier; flags below_threshold
   //
   // Cardinal Rule #8: when qty <= low_stock_threshold the item is flagged.
+  //
+  // Per row the response also carries (all additive — earlier fields unchanged):
+  //   reserved / available          — S4 soft-hold math (see below)
+  //   daily_consumption_7d (number) — avg qty/day consumed by order deductions
+  //                                   over the trailing 7 days (2dp)
+  //   days_remaining (number|null)  — available ÷ daily_consumption_7d (1dp),
+  //                                   0 when available <= 0, null when there
+  //                                   was no consumption in the window
   // -------------------------------------------------------------------------
   router.get("/inventory", requireAuth, resolveOutletContext, async (req, res) => {
     const warehouseParam = req.query.warehouse as string | undefined;
@@ -321,10 +329,58 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       reservedRows.map((r) => [r.ingredientId, Number(r.reserved)]),
     );
 
+    // Depletion projection ("how long will stock survive?") — per-row
+    // `daily_consumption_7d` + `days_remaining`, derived from the universal
+    // stock ledger. ONE grouped aggregate query for the whole warehouse
+    // (GROUP BY ingredient_id), same pattern as the reservations query above:
+    //   consumed_7d = SUM(quantity) of OUT / ORDER_DEDUCTION ledger rows for
+    //                 this warehouse posted in the last 7 days
+    //   daily_consumption_7d = round(consumed_7d / 7, 2dp)
+    //   days_remaining = round(available / daily_consumption_7d, 1dp)
+    //                    (0 when available <= 0 — never negative;
+    //                     null when the rate is 0 — "no recent consumption")
+    // Only real order deductions count as consumption: RECEIVE/ITO/ADJUSTMENT/
+    // RESTOCK movements are stock LOGISTICS, not kitchen usage.
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const consumptionRows = await db
+      .select({
+        ingredientId: stockLedgerEntries.ingredientId,
+        consumed: sql<string>`COALESCE(SUM(${stockLedgerEntries.quantity}), 0)`,
+      })
+      .from(stockLedgerEntries)
+      .where(
+        and(
+          eq(stockLedgerEntries.warehouseId, warehouse.id),
+          eq(stockLedgerEntries.movementType, "OUT"),
+          eq(stockLedgerEntries.sourceModule, "ORDER_DEDUCTION"),
+          gte(stockLedgerEntries.postedAt, sevenDaysAgo),
+        ),
+      )
+      .groupBy(stockLedgerEntries.ingredientId);
+    const consumedByIngredient = new Map(
+      consumptionRows.map((r) => [r.ingredientId, Number(r.consumed)]),
+    );
+
     res.json(
       rows.map((row) => {
         const reserved = reservedByIngredient.get(row.ingredientId) ?? 0;
-        return { ...row, reserved, available: Number(row.quantity) - reserved };
+        const available = Number(row.quantity) - reserved;
+        const consumed7d = consumedByIngredient.get(row.ingredientId) ?? 0;
+        const dailyConsumption = Math.round((consumed7d / 7) * 100) / 100;
+        let daysRemaining: number | null = null;
+        if (dailyConsumption > 0) {
+          // Clamp at 0: already-empty (or oversold/over-reserved) stock has
+          // zero days left, never a negative projection.
+          daysRemaining =
+            available <= 0 ? 0 : Math.round((available / dailyConsumption) * 10) / 10;
+        }
+        return {
+          ...row,
+          reserved,
+          available,
+          daily_consumption_7d: dailyConsumption,
+          days_remaining: daysRemaining,
+        };
       }),
     );
   });

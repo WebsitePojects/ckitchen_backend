@@ -5,6 +5,7 @@
  *   GET  /brands/:id/menu          – list a brand's menu items
  *   POST /brands/:id/menu          – create a menu item (SUPER_ADMIN | BRAND_MANAGER)
  *   PATCH /menu/:id                – update fields incl. availability
+ *   DELETE /menu/:id               – delete (only when never ordered; else 409 HAS_ORDERS)
  *   GET  /menu/:id/recipe          – list recipe lines
  *   PUT  /menu/:id/recipe          – REPLACE recipe lines (transactional delete+insert)
  *
@@ -18,11 +19,14 @@ import type { DB } from "../../db/client.js";
 import {
   availabilityEnum,
   brands,
+  discounts,
   ingredients,
   menuItems,
+  orderItems,
   recipeLines,
 } from "../../db/schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
+import { audit } from "../ems/audit.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { uploadMenuPhoto, ConfigError } from "../ems/cloudinary.js";
 
@@ -224,6 +228,80 @@ export function createMenuRouter(db: DB): Router {
       .returning();
 
     res.json(updated);
+  });
+
+  // -------------------------------------------------------------------------
+  // DELETE /menu/:id — remove a menu item from its brand
+  //
+  // Hard-deletes ONLY items with no order history: order_item rows must keep
+  // referencing what was actually sold (reports/restock/audit depend on it), so
+  // an item that appears in any order returns 409 HAS_ORDERS — retire those by
+  // setting availability to PAUSED instead. Recipe lines and this item's own
+  // promo definitions are removed in the same transaction. A residual FK race
+  // (order ingested between the check and the delete) surfaces as the same 409.
+  // -------------------------------------------------------------------------
+  router.delete("/menu/:id", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [existing] = await db.select().from(menuItems).where(eq(menuItems.id, id));
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+      return;
+    }
+
+    const [referenced] = await db
+      .select({ id: orderItems.id })
+      .from(orderItems)
+      .where(eq(orderItems.menuItemId, id))
+      .limit(1);
+    if (referenced) {
+      sendError(
+        res,
+        409,
+        "HAS_ORDERS",
+        "This item appears in existing orders and cannot be deleted. Set its availability to PAUSED to retire it.",
+      );
+      return;
+    }
+
+    try {
+      await db.transaction(async (tx) => {
+        await tx.delete(recipeLines).where(eq(recipeLines.menuItemId, id));
+        await tx.delete(discounts).where(eq(discounts.menuItemId, id));
+        await tx.delete(menuItems).where(eq(menuItems.id, id));
+      });
+    } catch (err) {
+      // FK violation (23503): an order/applied discount grabbed a reference
+      // between the pre-check and the delete — same answer as the pre-check.
+      const code =
+        err && typeof err === "object"
+          ? ((err as Record<string, unknown>)["code"] ??
+            ((err as { cause?: Record<string, unknown> }).cause?.["code"]))
+          : undefined;
+      if (code === "23503") {
+        sendError(
+          res,
+          409,
+          "HAS_ORDERS",
+          "This item is referenced by existing orders/discounts and cannot be deleted. Set its availability to PAUSED instead.",
+        );
+        return;
+      }
+      throw err;
+    }
+
+    res.status(204).end();
+
+    void audit(db, {
+      actorUserId: req.user?.id ?? null,
+      actorName: req.user?.name ?? null,
+      sessionId: req.user?.sessionId ?? null,
+      action: "menu.delete",
+      description: `deleted menu item "${existing.name}" from brand ${existing.brandId}`,
+      entityType: "menu_item",
+      entityId: id,
+      metadata: { brand_id: existing.brandId, name: existing.name },
+    });
   });
 
   // -------------------------------------------------------------------------

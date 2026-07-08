@@ -201,6 +201,8 @@ export function startSimulator(
           hub.emitToLocation(locationId, "order.created", {
             order_id: result.order_id,
             status: result.status,
+            // 0022 — copyable order code, same payload shape as routes.ts.
+            order_code: result.order_code,
             brand_id: brandId,
             aggregator,
             external_ref: orderInput.external_ref,

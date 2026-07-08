@@ -227,6 +227,22 @@ export async function seedPilot(db: DB): Promise<PilotIds> {
   if (!mainWarehouse || !kitchenWarehouse)
     throw new Error("MAIN or KITCHEN warehouse missing — run the base seed first.");
 
+  // ── 3b. Suppliers (idempotent by code) ────────────────────────────────────
+  // The recipe builder's inline "New ingredient" flow REQUIRES a supplier
+  // affiliation (ERP discipline: every ingredient states where it comes from),
+  // so a pilot environment without suppliers dead-ends that flow (live-QA
+  // find 2026-07-08 — same data-precondition class as the walk-in listing).
+  const { suppliers } = await import("./schema.js");
+  const PILOT_SUPPLIERS = [
+    { code: "SMF", name: "San Miguel Foods", contactName: "Ana Reyes", paymentTermDays: 30 },
+    { code: "MPD", name: "Metro Produce Distributors", contactName: "Jun Santos", paymentTermDays: 15 },
+    { code: "MGP", name: "Magnolia Poultry Supply", contactName: "Liza Cruz", paymentTermDays: 30 },
+  ];
+  for (const s of PILOT_SUPPLIERS) {
+    const [existing] = await db.select().from(suppliers).where(eq(suppliers.code, s.code));
+    if (!existing) await db.insert(suppliers).values(s);
+  }
+
   // ── 4. Ingredients (idempotent by name) ──────────────────────────────────
   const existingIngredients = await db.select().from(ingredients);
   const ingByName = new Map(existingIngredients.map((i) => [i.name, i]));

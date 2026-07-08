@@ -1042,6 +1042,32 @@ export const receivingReportLines = pgTable(
 export type ReceivingReportLine = typeof receivingReportLines.$inferSelect;
 
 // ---------------------------------------------------------------------------
+// Department budget threshold for purchasing (MOTM 2026-06-24 budget-threshold
+// item). Each department gets a monthly peso budget; Purchase Requests warn
+// (not block, first cut — see BUDGET_ENFORCEMENT in purchasing/budget.ts) when
+// submitting would push that department's committed spend over the cap.
+// ---------------------------------------------------------------------------
+
+export const departmentBudgets = pgTable(
+  "department_budget",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    department: departmentEnum("department").notNull(),
+    periodMonth: text("period_month").notNull(), // 'YYYY-MM'
+    amount: numeric("amount", { precision: 14, scale: 2 }).notNull(),
+    note: text("note"),
+    createdBy: uuid("created_by").references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("department_budget_dept_period_unique").on(table.department, table.periodMonth),
+  ],
+).enableRLS();
+export type DepartmentBudget = typeof departmentBudgets.$inferSelect;
+export type NewDepartmentBudget = typeof departmentBudgets.$inferInsert;
+
+// ---------------------------------------------------------------------------
 // W5: role_page_access  (admin-editable role -> page visibility matrix)
 //
 // Persists the same page-key set as the frontend's PAGE_ROLES map

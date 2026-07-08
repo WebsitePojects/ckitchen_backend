@@ -134,6 +134,13 @@
       "when": 1783700000000,
       "tag": "0018_dark_guardian",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1783800000000,
+      "tag": "0019_department_budget",
+      "breakpoints": true
     }
   ]
 }

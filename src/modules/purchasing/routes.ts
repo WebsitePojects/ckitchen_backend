@@ -14,6 +14,7 @@ import { sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
+  departmentBudgets,
   departmentEnum,
   ingredients,
   inventoryStock,
@@ -32,11 +33,20 @@ import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
 import { postLedger } from "../inventory/ledger.js";
+import {
+  BUDGET_ENFORCEMENT,
+  computeCommitted,
+  getBudgetStatus,
+  toPeriod,
+  upsertBudget,
+  type Department,
+} from "./budget.js";
 
 const REQUESTER_ROLES = ["OWNER", "PURCHASING", "WAREHOUSE_OUTLET", "KITCHEN_CREW"] as const;
 const APPROVER_ROLES = ["OWNER"] as const;
 const PO_ROLES = ["OWNER", "PURCHASING"] as const;
 const RECEIVE_ROLES = ["OWNER", "WAREHOUSE_OUTLET"] as const;
+const BUDGET_ROLES = ["OWNER", "ACCOUNTING"] as const;
 
 function docNo(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1e4).toString().padStart(4, "0")}`;
@@ -206,9 +216,147 @@ export function createPurchasingRouter(db: DB): Router {
     });
   }
 
-  prTransition("DRAFT", "SUBMITTED", "submit", REQUESTER_ROLES);
+  // `submit` is pulled OUT of the generic prTransition factory because it must
+  // also run the budget-threshold check (MOTM 2026-06-24). approve/reject stay
+  // generic. The DRAFT→SUBMITTED guard/update/audit below MUST stay byte-for-byte
+  // equivalent to what the factory did, so the response is unchanged (full
+  // non-regression) whenever there is no budget row / the PR is within budget.
+  router.post(
+    "/purchase-requests/:id/submit",
+    requireAuth,
+    requireRole(...REQUESTER_ROLES),
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const [pr] = await db.select().from(purchaseRequests).where(eq(purchaseRequests.id, id));
+      if (!pr) {
+        sendError(res, 404, "NOT_FOUND", "Purchase request not found.");
+        return;
+      }
+      if (pr.status !== "DRAFT") {
+        sendError(res, 409, "CONFLICT", `Purchase request is ${pr.status}; expected DRAFT.`);
+        return;
+      }
+
+      // This PR's own line total, and the department's committed spend for its
+      // period BEFORE this transition — so the PR being submitted (still DRAFT)
+      // is correctly excluded from its own committed sum.
+      const prLines = await db
+        .select()
+        .from(purchaseRequestLines)
+        .where(eq(purchaseRequestLines.prId, id));
+      const prTotal = prLines.reduce(
+        (sum, l) => sum + Number(l.quantity) * Number(l.estUnitCost),
+        0,
+      );
+      const period = toPeriod(pr.createdAt);
+      const committedBefore = await computeCommitted(db, pr.department, period);
+
+      const [updated] = await db
+        .update(purchaseRequests)
+        .set({ status: "SUBMITTED", updatedAt: new Date() })
+        .where(eq(purchaseRequests.id, id))
+        .returning();
+
+      void audit(db, {
+        actorUserId: req.user!.id,
+        actorName: req.user!.name ?? null,
+        sessionId: req.user!.sessionId ?? null,
+        action: "purchase_request.submit",
+        description: `${pr.prNo}: DRAFT → SUBMITTED`,
+        entityType: "purchase_request",
+        entityId: id,
+      });
+
+      // Budget-threshold check. BUDGET_ENFORCEMENT is 'WARN' only right now —
+      // we never hard-block. Referencing the const (rather than hardcoding
+      // "always warn") keeps a future flip to 'BLOCK' a one-line change; the
+      // BLOCK branch is intentionally not implemented until the client confirms.
+      const [budgetRow] = await db
+        .select()
+        .from(departmentBudgets)
+        .where(
+          and(
+            eq(departmentBudgets.department, pr.department),
+            eq(departmentBudgets.periodMonth, period),
+          ),
+        );
+      if (
+        BUDGET_ENFORCEMENT === "WARN" &&
+        budgetRow &&
+        committedBefore + prTotal > Number(budgetRow.amount)
+      ) {
+        res.json({
+          ...updated,
+          budget_warning: {
+            over_by: committedBefore + prTotal - Number(budgetRow.amount),
+            budget: Number(budgetRow.amount),
+            committed: committedBefore,
+          },
+        });
+        return;
+      }
+      // No budget row, or under/at budget → bare PR row, no budget_warning key.
+      res.json(updated);
+    },
+  );
+
   prTransition("SUBMITTED", "APPROVED", "approve", APPROVER_ROLES, true);
   prTransition("SUBMITTED", "REJECTED", "reject", APPROVER_ROLES, true);
+
+  // ── Department budgets (MOTM 2026-06-24 budget threshold) ───────────────────
+
+  router.get("/budgets", requireAuth, async (req, res) => {
+    const period = (req.query.period as string | undefined) ?? toPeriod(new Date());
+    const rows = await db
+      .select()
+      .from(departmentBudgets)
+      .where(eq(departmentBudgets.periodMonth, period));
+    res.json(rows);
+  });
+
+  const budgetUpsertSchema = z.object({
+    department: z.enum(departmentEnum.enumValues),
+    period_month: z.string().regex(/^\d{4}-\d{2}$/),
+    amount: z.number().min(0),
+    note: z.string().optional(),
+  });
+
+  router.put("/budgets", requireAuth, requireRole(...BUDGET_ROLES), async (req, res) => {
+    const parsed = budgetUpsertSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid budget payload.", parsed.error.issues);
+      return;
+    }
+    const { department, period_month, amount, note } = parsed.data;
+    const row = await upsertBudget(db, {
+      department,
+      periodMonth: period_month,
+      amount,
+      note: note ?? null,
+      createdBy: req.user!.id,
+    });
+    void audit(db, {
+      actorUserId: req.user!.id,
+      actorName: req.user!.name ?? null,
+      sessionId: req.user!.sessionId ?? null,
+      action: "department_budget.upsert",
+      description: `${department} ${period_month} -> ₱${amount}`,
+      entityType: "department_budget",
+      entityId: row.id,
+    });
+    res.json(row);
+  });
+
+  router.get("/budgets/:department/status", requireAuth, async (req, res) => {
+    const department = paramAsString(req.params.department);
+    if (!(departmentEnum.enumValues as readonly string[]).includes(department)) {
+      sendError(res, 400, "VALIDATION_ERROR", `Unknown department "${department}".`);
+      return;
+    }
+    const period = (req.query.period as string | undefined) ?? toPeriod(new Date());
+    const status = await getBudgetStatus(db, department as Department, period);
+    res.json(status);
+  });
 
   // ── Purchase Orders ────────────────────────────────────────────────────────
 

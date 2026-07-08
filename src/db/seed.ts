@@ -6,6 +6,7 @@ import { runMigrations } from "./migrate.js";
 import { hashPassword } from "../modules/auth/service.js";
 import { seedRolePageAccess } from "../modules/admin/routes.js";
 import { seedDefaultDiscounts } from "../modules/discounts/routes.js";
+import { seedExampleBudget } from "../modules/purchasing/budget.js";
 import {
   departmentEnum,
   employees,
@@ -205,6 +206,7 @@ export async function seed(db: DB): Promise<SeededUser[]> {
     .where(eq(users.email, ADMIN_CREDENTIAL.email));
   if (ownerUser) {
     await seedDefaultDiscounts(db, ownerUser.id);
+    await seedExampleBudget(db, ownerUser.id);
   }
 
   return seededCreds;

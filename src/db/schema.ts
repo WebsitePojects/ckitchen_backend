@@ -761,6 +761,69 @@ export type StockLedgerEntry = typeof stockLedgerEntries.$inferSelect;
 export type NewStockLedgerEntry = typeof stockLedgerEntries.$inferInsert;
 
 // ---------------------------------------------------------------------------
+// stock_adjustment  (D26 — approved write-off / correction document, migration 0021)
+//
+// The client's MoM "ingredient expiry + over-order negligence" ask: a two-step
+// (request → approve/reject) flow that, on approval, posts an ADJUSTMENT row to
+// stock_ledger_entry and mutates inventory_stock in the SAME transaction.
+//   • direction OUT = write-off / removal (decrements the balance);
+//     direction IN  = correction that adds stock back.
+//   • quantity is ALWAYS positive; the direction carries the sign.
+//   • PENDING → APPROVED | REJECTED. Only OWNER / OUTLET_MANAGER may decide;
+//     an OUTLET_MANAGER may not approve their OWN request (segregation of duties).
+// ---------------------------------------------------------------------------
+
+export const stockAdjustmentDirectionEnum = pgEnum("stock_adjustment_direction", ["IN", "OUT"]);
+
+export const stockAdjustmentReasonEnum = pgEnum("stock_adjustment_reason", [
+  "EXPIRY",
+  "SPOILAGE",
+  "NEGLIGENCE",
+  "CORRECTION",
+  "OTHER",
+]);
+
+export const stockAdjustmentStatusEnum = pgEnum("stock_adjustment_status", [
+  "PENDING",
+  "APPROVED",
+  "REJECTED",
+]);
+
+export const stockAdjustments = pgTable(
+  "stock_adjustment",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    warehouseId: uuid("warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    direction: stockAdjustmentDirectionEnum("direction").notNull(),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    reason: stockAdjustmentReasonEnum("reason").notNull(),
+    note: text("note"),
+    status: stockAdjustmentStatusEnum("status").notNull().default("PENDING"),
+    requestedBy: uuid("requested_by").references(() => users.id),
+    decidedBy: uuid("decided_by").references(() => users.id),
+    decisionNote: text("decision_note"),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("stock_adjustment_status_idx").on(table.status),
+    index("stock_adjustment_warehouse_ingredient_idx").on(
+      table.warehouseId,
+      table.ingredientId,
+    ),
+    index("stock_adjustment_created_at_idx").on(table.createdAt),
+  ],
+).enableRLS();
+
+export type StockAdjustment = typeof stockAdjustments.$inferSelect;
+export type NewStockAdjustment = typeof stockAdjustments.$inferInsert;
+
+// ---------------------------------------------------------------------------
 // EMS: departmentEnum / employee / userSession / auditLog  (CK1-EMS-005)
 // ---------------------------------------------------------------------------
 

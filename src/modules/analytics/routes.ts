@@ -8,10 +8,12 @@
  *   ACCOUNTANT   — sees all brands / all data (finance view)
  *
  * Endpoints (all under /api/v1):
- *   GET /analytics/brands?from&to         — brand revenue ranking + weakest flag
- *   GET /analytics/orders-by-hour?date    — hourly order counts for a date
- *   GET /analytics/aggregators?from&to    — revenue+count split by aggregator
- *   GET /analytics/margins?from&to        — per-brand recipe-cost margin
+ *   GET /analytics/brands?from&to                — brand revenue ranking + weakest flag
+ *   GET /analytics/orders-by-hour?date            — hourly order counts for a date
+ *   GET /analytics/orders-by-hour-by-brand?date   — MOTM #9: hourly order counts, per brand
+ *   GET /analytics/aggregators?from&to            — revenue+count split by aggregator
+ *   GET /analytics/margins?from&to                — per-brand recipe-cost margin
+ *   GET /analytics/products?from&to               — MOTM #8: per menu-item performance
  */
 import { Router } from "express";
 import { z } from "zod";
@@ -23,6 +25,8 @@ import {
   getBrandsAnalytics,
   getMarginsAnalytics,
   getOrdersByHour,
+  getOrdersByHourByBrand,
+  getProductPerformance,
 } from "./service.js";
 
 // ---------------------------------------------------------------------------
@@ -101,6 +105,37 @@ export function createAnalyticsRouter(db: DB): Router {
     },
   );
 
+  // ── GET /analytics/orders-by-hour-by-brand?date ───────────────────────────
+  // MOTM 2026-07-01 #9: "the order by hour is good, but they want to see
+  // which brand it is." Same date validation as /analytics/orders-by-hour;
+  // the sibling endpoint above is left untouched for backward compatibility.
+  router.get(
+    "/analytics/orders-by-hour-by-brand",
+    requireAuth,
+    requireRole(...ANALYTICS_ROLES),
+    async (req, res) => {
+      const parsed = dateSchema.safeParse(req.query);
+      if (!parsed.success) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          "Query param 'date' is required (YYYY-MM-DD).",
+          parsed.error.issues,
+        );
+        return;
+      }
+
+      try {
+        const data = await getOrdersByHourByBrand(db, parsed.data.date);
+        res.json(data);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Internal server error.";
+        sendError(res, 500, "INTERNAL_ERROR", message);
+      }
+    },
+  );
+
   // ── GET /analytics/aggregators?from&to ────────────────────────────────────
   router.get(
     "/analytics/aggregators",
@@ -137,6 +172,29 @@ export function createAnalyticsRouter(db: DB): Router {
 
       try {
         const data = await getMarginsAnalytics(db, parsed.data.from, parsed.data.to);
+        res.json(data);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Internal server error.";
+        sendError(res, 500, "INTERNAL_ERROR", message);
+      }
+    },
+  );
+
+  // ── GET /analytics/products?from&to ───────────────────────────────────────
+  // MOTM 2026-07-01 #8: "Brand and Product Performance" — product side.
+  router.get(
+    "/analytics/products",
+    requireAuth,
+    requireRole(...ANALYTICS_ROLES),
+    async (req, res) => {
+      const parsed = dateRangeSchema.safeParse(req.query);
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "Invalid query parameters.", parsed.error.issues);
+        return;
+      }
+
+      try {
+        const data = await getProductPerformance(db, parsed.data.from, parsed.data.to);
         res.json(data);
       } catch (err) {
         const message = err instanceof Error ? err.message : "Internal server error.";

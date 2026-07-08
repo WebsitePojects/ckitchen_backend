@@ -574,3 +574,351 @@ describe("GET /api/v1/analytics/margins", () => {
     expect(res.status).toBe(401);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Task 9 (MOTM 2026-07-01 #9 / #8) — orders-by-hour-by-brand + products
+//
+// Uses a SEPARATE date (2026-01-16, not 2026-01-15) and its own fixture set
+// so these new orders never touch the FROM/TO(=2026-01-15) window the
+// describe blocks above already asserted exact revenue/order_count numbers
+// against — adding orders into that window would silently inflate those
+// existing totals. Reuses the same brands/menu items (brandAId=Tokyo House,
+// brandBId=Seoul Bowl, menuAId=Teriyaki price=200, menuBId=Korean price=150)
+// created in the top beforeAll.
+//
+//   O-C1  10:00 UTC  Tokyo House  FOODPANDA  1×Teriyaki  total=200
+//   O-C2  10:30 UTC  Tokyo House  GRABFOOD   1×Teriyaki  total=200
+//   O-C3  14:00 UTC  Seoul Bowl   FOODPANDA  1×Korean    total=150
+//   O-C4  11:00 UTC  Tokyo House  OTHER      1×Teriyaki  total=200 → CANCELLED
+//
+// O-C4 is cancelled immediately after ingestion (order stays NEW, so cancel
+// needs no compensating restock). It exists specifically to prove the two
+// new endpoints handle CANCELLED differently:
+//   - orders-by-hour-by-brand does NOT filter status (mirrors the existing
+//     /analytics/orders-by-hour sibling) → hour 11 still shows count=1.
+//   - /analytics/products DOES exclude CANCELLED (explicit MOTM ask) →
+//     Teriyaki qtySold/orders only reflect O-C1 + O-C2, not O-C4.
+// ---------------------------------------------------------------------------
+
+const TEST_DATE_2 = "2026-01-16";
+const FROM2 = "2026-01-16T00:00:00.000Z";
+const TO2 = "2026-01-16T23:59:59.999Z";
+
+let cancelledOrderId: string;
+
+beforeAll(async () => {
+  const oc1 = await request(app)
+    .post("/api/v1/ingest/order")
+    .set("Authorization", `Bearer ${adminToken}`)
+    .send({
+      brand_id: brandAId,
+      aggregator: "FOODPANDA",
+      external_ref: "AN-C1",
+      placed_at: "2026-01-16T10:00:00.000Z",
+      items: [{ menu_item_id: menuAId, qty: 1 }],
+    });
+  expect(oc1.status).toBe(201);
+
+  const oc2 = await request(app)
+    .post("/api/v1/ingest/order")
+    .set("Authorization", `Bearer ${adminToken}`)
+    .send({
+      brand_id: brandAId,
+      aggregator: "GRABFOOD",
+      external_ref: "AN-C2",
+      placed_at: "2026-01-16T10:30:00.000Z",
+      items: [{ menu_item_id: menuAId, qty: 1 }],
+    });
+  expect(oc2.status).toBe(201);
+
+  const oc3 = await request(app)
+    .post("/api/v1/ingest/order")
+    .set("Authorization", `Bearer ${adminToken}`)
+    .send({
+      brand_id: brandBId,
+      aggregator: "FOODPANDA",
+      external_ref: "AN-C3",
+      placed_at: "2026-01-16T14:00:00.000Z",
+      items: [{ menu_item_id: menuBId, qty: 1 }],
+    });
+  expect(oc3.status).toBe(201);
+
+  const oc4 = await request(app)
+    .post("/api/v1/ingest/order")
+    .set("Authorization", `Bearer ${adminToken}`)
+    .send({
+      brand_id: brandAId,
+      aggregator: "OTHER",
+      external_ref: "AN-C4",
+      placed_at: "2026-01-16T11:00:00.000Z",
+      items: [{ menu_item_id: menuAId, qty: 1 }],
+    });
+  expect(oc4.status).toBe(201);
+  cancelledOrderId = oc4.body.order_id as string;
+
+  const cancelRes = await request(app)
+    .post(`/api/v1/orders/${cancelledOrderId}/cancel`)
+    .set("Authorization", `Bearer ${adminToken}`)
+    .send({ reason: "AN_ test fixture: cancel before PREPARING for analytics exclusion check" });
+  expect(cancelRes.status, `cancel failed: ${JSON.stringify(cancelRes.body)}`).toBe(200);
+}, 60_000);
+
+// ---------------------------------------------------------------------------
+// GET /analytics/orders-by-hour-by-brand
+// ---------------------------------------------------------------------------
+
+describe("GET /api/v1/analytics/orders-by-hour-by-brand", () => {
+  it("returns 200 dense array of 24 hour buckets (0..23) for SUPER_ADMIN", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    expect(res.status).toBe(200);
+    const body = res.body as Array<{ hour: number; brands: unknown[] }>;
+    expect(Array.isArray(body)).toBe(true);
+    expect(body).toHaveLength(24);
+    body.forEach((bucket, idx) => expect(Number(bucket.hour)).toBe(idx));
+  });
+
+  it("hour 10: Tokyo House count=2, Seoul Bowl count=0 (O-C1 + O-C2)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    expect(res.status).toBe(200);
+    const body = res.body as Array<{
+      hour: number;
+      brands: Array<{ brandId: string; brandName: string; count: number }>;
+    }>;
+
+    const bucket10 = body.find((b) => Number(b.hour) === 10)!;
+    const tokyo = bucket10.brands.find((b) => b.brandId === brandAId);
+    const seoul = bucket10.brands.find((b) => b.brandId === brandBId);
+    expect(tokyo, "Tokyo House missing from hour 10 bucket").toBeTruthy();
+    expect(seoul, "Seoul Bowl missing from hour 10 bucket").toBeTruthy();
+    expect(Number(tokyo!.count)).toBe(2);
+    expect(Number(seoul!.count)).toBe(0);
+  });
+
+  it("hour 14: Seoul Bowl count=1, Tokyo House count=0 (O-C3)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    const body = res.body as Array<{
+      hour: number;
+      brands: Array<{ brandId: string; brandName: string; count: number }>;
+    }>;
+    const bucket14 = body.find((b) => Number(b.hour) === 14)!;
+    const tokyo = bucket14.brands.find((b) => b.brandId === brandAId);
+    const seoul = bucket14.brands.find((b) => b.brandId === brandBId);
+    expect(Number(seoul!.count)).toBe(1);
+    expect(Number(tokyo!.count)).toBe(0);
+  });
+
+  it("hour 11: Tokyo House count=1 — the CANCELLED order O-C4 still counts (no status filter, matches /orders-by-hour sibling)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    const body = res.body as Array<{
+      hour: number;
+      brands: Array<{ brandId: string; brandName: string; count: number }>;
+    }>;
+    const bucket11 = body.find((b) => Number(b.hour) === 11)!;
+    const tokyo = bucket11.brands.find((b) => b.brandId === brandAId);
+    expect(Number(tokyo!.count)).toBe(1);
+  });
+
+  it("per-brand counts across all 24 hours sum to each brand's total for the date (Tokyo House=3 incl. cancelled, Seoul Bowl=1)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    const body = res.body as Array<{
+      hour: number;
+      brands: Array<{ brandId: string; brandName: string; count: number }>;
+    }>;
+
+    const tokyoTotal = body.reduce((sum, bucket) => {
+      const entry = bucket.brands.find((b) => b.brandId === brandAId);
+      return sum + (entry ? Number(entry.count) : 0);
+    }, 0);
+    const seoulTotal = body.reduce((sum, bucket) => {
+      const entry = bucket.brands.find((b) => b.brandId === brandBId);
+      return sum + (entry ? Number(entry.count) : 0);
+    }, 0);
+
+    expect(tokyoTotal).toBe(3); // O-C1 + O-C2 + O-C4(cancelled, still counted)
+    expect(seoulTotal).toBe(1); // O-C3
+  });
+
+  it("returns 400 when ?date is missing", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("returns 200 for ACCOUNTANT role", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${accountantToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 403 for KITCHEN_STAFF", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .query({ date: TEST_DATE_2 });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("returns 401 for unauthenticated request", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/orders-by-hour-by-brand")
+      .query({ date: TEST_DATE_2 });
+
+    expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GET /analytics/products
+// ---------------------------------------------------------------------------
+
+describe("GET /api/v1/analytics/products", () => {
+  it("returns 200 array for SUPER_ADMIN", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ from: FROM2, to: TO2 });
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+  });
+
+  it("Teriyaki Chicken: qtySold=2, revenue=400, orders=2 — CANCELLED O-C4 excluded (not 3/600/3)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ from: FROM2, to: TO2 });
+
+    expect(res.status).toBe(200);
+    const body = res.body as Array<{
+      menuItemId: string;
+      name: string;
+      brandId: string;
+      brandName: string;
+      qtySold: number;
+      revenue: number;
+      orders: number;
+    }>;
+
+    const teriyaki = body.find((p) => p.menuItemId === menuAId);
+    expect(teriyaki, "Teriyaki Chicken not found in products response").toBeTruthy();
+    expect(teriyaki!.brandId).toBe(brandAId);
+    expect(Number(teriyaki!.qtySold)).toBe(2);
+    expect(Number(teriyaki!.revenue)).toBeCloseTo(400, 2);
+    expect(Number(teriyaki!.orders)).toBe(2);
+  });
+
+  it("Korean Chicken Bowl: qtySold=1, revenue=150, orders=1", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ from: FROM2, to: TO2 });
+
+    const body = res.body as Array<{
+      menuItemId: string;
+      qtySold: number;
+      revenue: number;
+      orders: number;
+    }>;
+    const korean = body.find((p) => p.menuItemId === menuBId);
+    expect(korean, "Korean Chicken Bowl not found").toBeTruthy();
+    expect(Number(korean!.qtySold)).toBe(1);
+    expect(Number(korean!.revenue)).toBeCloseTo(150, 2);
+    expect(Number(korean!.orders)).toBe(1);
+  });
+
+  it("sorts by revenue desc (Teriyaki 400 before Korean 150)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ from: FROM2, to: TO2 });
+
+    const body = res.body as Array<{ menuItemId: string; revenue: number }>;
+    const teriyakiIdx = body.findIndex((p) => p.menuItemId === menuAId);
+    const koreanIdx = body.findIndex((p) => p.menuItemId === menuBId);
+    expect(teriyakiIdx).toBeLessThan(koreanIdx);
+  });
+
+  it("all-time default (no from/to) sums across both fixture dates, still excluding CANCELLED: Teriyaki qtySold=5, orders=5", async () => {
+    // 2026-01-15: O-A1 + O-A2 + O-A3 (3 non-cancelled) + 2026-01-16: O-C1 + O-C2 (2 non-cancelled).
+    // O-C4 (cancelled) never counts, on either date.
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    const body = res.body as Array<{ menuItemId: string; qtySold: number; revenue: number; orders: number }>;
+    const teriyaki = body.find((p) => p.menuItemId === menuAId);
+    expect(teriyaki, "Teriyaki Chicken not found in all-time products response").toBeTruthy();
+    expect(Number(teriyaki!.qtySold)).toBe(5);
+    expect(Number(teriyaki!.revenue)).toBeCloseTo(1000, 2);
+    expect(Number(teriyaki!.orders)).toBe(5);
+  });
+
+  it("menu items with zero sales in a range still appear (LEFT JOIN preserves zero rows, matches sibling convention)", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ from: "2030-01-01T00:00:00.000Z", to: "2030-01-02T00:00:00.000Z" });
+
+    expect(res.status).toBe(200);
+    const body = res.body as Array<{ menuItemId: string; qtySold: number; revenue: number; orders: number }>;
+    const teriyaki = body.find((p) => p.menuItemId === menuAId);
+    expect(teriyaki, "Teriyaki Chicken should still appear with zero sales").toBeTruthy();
+    expect(Number(teriyaki!.qtySold)).toBe(0);
+    expect(Number(teriyaki!.revenue)).toBe(0);
+    expect(Number(teriyaki!.orders)).toBe(0);
+  });
+
+  it("returns 200 for ACCOUNTANT role", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${accountantToken}`)
+      .query({ from: FROM2, to: TO2 });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 403 for KITCHEN_STAFF", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .set("Authorization", `Bearer ${kitchenToken}`)
+      .query({ from: FROM2, to: TO2 });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("returns 401 for unauthenticated request", async () => {
+    const res = await request(app)
+      .get("/api/v1/analytics/products")
+      .query({ from: FROM2, to: TO2 });
+
+    expect(res.status).toBe(401);
+  });
+});

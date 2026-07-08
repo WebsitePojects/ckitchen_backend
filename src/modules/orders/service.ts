@@ -10,8 +10,8 @@
  *
  * All multi-step writes run inside db.transaction() for atomicity.
  *
- * Design note: low-stock events are RETURNED from advanceOrder so the caller
- * (route handler / Task 8 realtime layer) can emit `lowstock.alert` over Socket.IO.
+ * Design note: low-stock / stock-update events are RETURNED from the service so
+ * the caller (route handler / realtime layer) can emit them over Socket.IO.
  * The service itself does NOT emit — separation of concerns for Task 8.
  *
  * Correctness fixes (Opus review):
@@ -23,6 +23,32 @@
  *   FIX D — missing KITCHEN inventory_stock row is created at qty=0 before deducting,
  *            allowing the balance to go visibly negative (prototype allows oversell;
  *            production should decide INSUFFICIENT_STOCK block vs allow+flag)
+ *
+ * S-wave fixes (2026-07-08):
+ *   S3 — cancelOrder races: the CANCELLED update is now CONDITIONAL (WHERE
+ *        status=expected, mirroring FIX A) and the restock decision is driven by
+ *        whether consumption_log rows EXIST for the order (the ledger is the
+ *        source of truth of what was actually deducted) — never by a status
+ *        read taken before the transaction.
+ *   S4 — stock reservation system (soft holds). Ingest inserts one
+ *        stock_reservation row per recipe ingredient against the order's outlet
+ *        KITCHEN warehouse. available = on-hand − SUM(active reservations).
+ *        Shortfall policy: FOODPANDA/GRABFOOD orders are STILL created (the
+ *        platform already took payment) but the result carries `stock_risk`;
+ *        OTHER (walk-in/manual) throws InsufficientStockError → 409, unless
+ *        `allow_oversell: true`. Rule #2 is UNCHANGED: real deduction still
+ *        fires at NEW→PREPARING, which deletes this order's reservations in the
+ *        same tx (the deduction replaces the hold). Cancel also deletes them.
+ *   S5 — cancelOrder returns stockUpdates (new balances after compensating
+ *        restock, same shape as advanceOrder) so the route can emit
+ *        `stock.updated` per ingredient.
+ *   S7 — N+1 kills: ingest batches menu-item/station resolution with inArray
+ *        (and reads the station default printer off the same join); the
+ *        deduction engine pre-fetches recipe lines / ingredients / stock rows
+ *        in one query each, aggregates the deduction per ingredient, keeps the
+ *        per-ingredient atomic UPDATE statements, and does one batched
+ *        read-back. Event semantics preserved (last-write-wins per ingredient,
+ *        deduped lowstock events).
  */
 import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
@@ -38,6 +64,7 @@ import {
   orders,
   printJobs,
   recipeLines,
+  stockReservations,
   warehouses,
 } from "../../db/schema.js";
 import { postLedger } from "../inventory/ledger.js";
@@ -52,6 +79,13 @@ export interface IngestOrderInput {
   external_ref: string;
   customer_name?: string;
   placed_at?: string;
+  /**
+   * S4 — OTHER (walk-in/manual) orders are rejected with INSUFFICIENT_STOCK
+   * when required > available. Setting this true bypasses the block and
+   * behaves like the aggregator path (order created + stock_risk returned).
+   * Ignored for FOODPANDA/GRABFOOD (they never block).
+   */
+  allow_oversell?: boolean;
   items: Array<{
     menu_item_id: string;
     qty: number;
@@ -65,12 +99,26 @@ export interface PrintJobSummary {
   printer: string | null;
 }
 
+/** S4 — one per ingredient whose required qty exceeds available (on-hand − reserved). */
+export interface StockShortfall {
+  ingredient_id: string;
+  ingredient_name: string;
+  required: number;
+  available: number;
+}
+
 export interface IngestResult {
   order_id: string;
   status: string;
   print_jobs: PrintJobSummary[];
   /** Present only on DUPLICATE_ORDER responses. */
   code?: "DUPLICATE_ORDER";
+  /**
+   * S4 — present ONLY when the order was created despite insufficient available
+   * stock (aggregator order, or OTHER with allow_oversell). The route/simulator
+   * emits `stock.risk` to the outlet room when this is set.
+   */
+  stock_risk?: StockShortfall[];
 }
 
 export interface LowStockEvent {
@@ -82,15 +130,15 @@ export interface LowStockEvent {
 
 /**
  * Represents a single ingredient balance change in the KITCHEN warehouse after
- * deduction.  Returned from advanceOrder so the route handler (Task 8) can emit
- * `stock.updated` without an extra DB round-trip.
+ * deduction (advance) or compensating restock (cancel).  Returned so the route
+ * handler can emit `stock.updated` without an extra DB round-trip.
  */
 export interface StockUpdateEvent {
   ingredientId: string;
   ingredientName: string;
-  /** Always "KITCHEN" for deduction-triggered events. */
+  /** Always "KITCHEN" for deduction/restock-triggered events. */
   warehouseType: "KITCHEN" | "MAIN";
-  /** New balance after the deduction (may be negative — prototype allows oversell). */
+  /** New balance after the change (may be negative — prototype allows oversell). */
   quantity: number;
 }
 
@@ -104,6 +152,12 @@ export interface AdvanceResult {
   /** Low-stock events emitted by this stage transition (emit via Task 8 realtime). */
   lowStockEvents: LowStockEvent[];
   /** All stock changes from this transition (emit `stock.updated` for each). */
+  stockUpdates: StockUpdateEvent[];
+}
+
+export interface CancelResult {
+  status: string;
+  /** S5 — new balances after compensating restock (empty when nothing was deducted). */
   stockUpdates: StockUpdateEvent[];
 }
 
@@ -135,11 +189,26 @@ export class ValidationError extends ServiceError {
   }
 }
 
-/** FIX A — thrown when a concurrent advance wins the conditional update race. */
+/** FIX A — thrown when a concurrent advance/cancel wins the conditional update race. */
 export class ConflictError extends ServiceError {
   constructor(message: string) {
     super("CONFLICT", message);
     this.name = "ConflictError";
+  }
+}
+
+/**
+ * S4 — thrown for OTHER (walk-in/manual) ingests whose required qty exceeds
+ * available (on-hand − reserved) and allow_oversell was not set. The route maps
+ * this to 409 INSUFFICIENT_STOCK with the shortfall details.
+ */
+export class InsufficientStockError extends ServiceError {
+  constructor(public readonly shortfalls: StockShortfall[]) {
+    super(
+      "INSUFFICIENT_STOCK",
+      "Insufficient available stock to accept this order.",
+    );
+    this.name = "InsufficientStockError";
   }
 }
 
@@ -212,6 +281,8 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
   // external_ref arriving via a DIFFERENT listing (different
   // aggregator_account_id — e.g. a different outlet's Foodpanda listing) is a
   // distinct order, matching the new order_listing_external_ref_unique index.
+  // S4 note: the duplicate path returns HERE, before any reservation planning —
+  // an idempotent replay can never double-reserve.
   const [existing] = await db
     .select()
     .from(orders)
@@ -226,7 +297,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     return buildDuplicateResponse(db, existing);
   }
 
-  // ── VALIDATE ITEMS, RESOLVE STATIONS ────────────────────────────────────
+  // ── VALIDATE ITEMS, RESOLVE STATIONS (S7 — one batched query) ───────────
   if (!input.items || input.items.length === 0) {
     throw new ValidationError("Order must have at least one item.");
   }
@@ -235,28 +306,35 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     menuItemId: string;
     stationId: string;
     stationName: string;
+    /** Station default printer, read off the same join (S7: no per-station query). */
+    stationDefaultPrinterId: string | null;
     qty: number;
     notes?: string;
     price: string;
     name: string;
   };
 
+  const requestedMenuItemIds = [...new Set(input.items.map((i) => i.menu_item_id))];
+  const menuRows = await db
+    .select({
+      id: menuItems.id,
+      name: menuItems.name,
+      price: menuItems.price,
+      stationId: menuItems.stationId,
+      stationName: kitchenStations.name,
+      stationDefaultPrinterId: kitchenStations.defaultPrinterId,
+    })
+    .from(menuItems)
+    .leftJoin(kitchenStations, eq(menuItems.stationId, kitchenStations.id))
+    .where(inArray(menuItems.id, requestedMenuItemIds));
+  const menuById = new Map(menuRows.map((r) => [r.id, r]));
+
   const resolvedItems: ResolvedItem[] = [];
 
+  // Iterate the INPUT order so the first missing/invalid item throws exactly
+  // like the old per-item loop did (same error, same message).
   for (const item of input.items) {
-    const rows = await db
-      .select({
-        id: menuItems.id,
-        name: menuItems.name,
-        price: menuItems.price,
-        stationId: menuItems.stationId,
-        stationName: kitchenStations.name,
-      })
-      .from(menuItems)
-      .leftJoin(kitchenStations, eq(menuItems.stationId, kitchenStations.id))
-      .where(eq(menuItems.id, item.menu_item_id));
-
-    const menuItem = rows[0];
+    const menuItem = menuById.get(item.menu_item_id);
     if (!menuItem) throw new NotFoundError(`Menu item ${item.menu_item_id} not found.`);
     if (!menuItem.stationId) {
       throw new ValidationError(`Menu item "${menuItem.name}" has no station assigned.`);
@@ -266,6 +344,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
       menuItemId: menuItem.id,
       stationId: menuItem.stationId,
       stationName: menuItem.stationName ?? menuItem.stationId,
+      stationDefaultPrinterId: menuItem.stationDefaultPrinterId,
       qty: item.qty,
       notes: item.notes,
       price: menuItem.price,
@@ -279,10 +358,14 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     .toFixed(2);
 
   // ── GROUP ITEMS BY STATION ───────────────────────────────────────────────
-  const stationGroupMap = new Map<string, { stationName: string; items: ResolvedItem[] }>();
+  const stationGroupMap = new Map<
+    string,
+    { stationName: string; defaultPrinterId: string | null; items: ResolvedItem[] }
+  >();
   for (const item of resolvedItems) {
     const g = stationGroupMap.get(item.stationId) ?? {
       stationName: item.stationName,
+      defaultPrinterId: item.stationDefaultPrinterId,
       items: [],
     };
     g.items.push(item);
@@ -291,7 +374,126 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
 
   const placedAt = input.placed_at ? new Date(input.placed_at) : new Date();
 
-  // ── TRANSACTION: order + order_items + print_jobs ────────────────────────
+  // ── S4: RESERVATION PLANNING (soft hold — Rule #2 deduction unchanged) ───
+  // Compute required qty per ingredient from recipe_lines (portion_qty × item
+  // qty, summed across items sharing an ingredient), then compare against
+  // available = on-hand − SUM(active reservations) in the brand's outlet
+  // KITCHEN warehouse. A brand whose menu items have NO recipe lines reserves
+  // nothing (works exactly as today).
+  const lines =
+    requestedMenuItemIds.length > 0
+      ? await db
+          .select()
+          .from(recipeLines)
+          .where(inArray(recipeLines.menuItemId, requestedMenuItemIds))
+      : [];
+
+  const linesByMenuItem = new Map<string, typeof lines>();
+  for (const line of lines) {
+    const arr = linesByMenuItem.get(line.menuItemId);
+    if (arr) arr.push(line);
+    else linesByMenuItem.set(line.menuItemId, [line]);
+  }
+
+  const requiredByIngredient = new Map<string, number>();
+  for (const item of resolvedItems) {
+    for (const line of linesByMenuItem.get(item.menuItemId) ?? []) {
+      requiredByIngredient.set(
+        line.ingredientId,
+        (requiredByIngredient.get(line.ingredientId) ?? 0) +
+          Number(line.portionQty) * item.qty,
+      );
+    }
+  }
+
+  let reservationWarehouseId: string | null = null;
+  const shortfalls: StockShortfall[] = [];
+
+  if (requiredByIngredient.size > 0) {
+    // Same lookup advanceOrder uses: the order's outlet KITCHEN warehouse via
+    // the brand's home location (D30 transition — see 0015 migration header).
+    const [kitchenWarehouse] = await db
+      .select()
+      .from(warehouses)
+      .where(
+        and(eq(warehouses.type, "KITCHEN"), eq(warehouses.locationId, brand.locationId)),
+      );
+
+    if (kitchenWarehouse) {
+      reservationWarehouseId = kitchenWarehouse.id;
+      const ingredientIds = [...requiredByIngredient.keys()];
+
+      // On-hand quantities (missing stock row ⇒ 0 on hand).
+      const stockRows = await db
+        .select({
+          ingredientId: inventoryStock.ingredientId,
+          quantity: inventoryStock.quantity,
+        })
+        .from(inventoryStock)
+        .where(
+          and(
+            eq(inventoryStock.warehouseId, kitchenWarehouse.id),
+            inArray(inventoryStock.ingredientId, ingredientIds),
+          ),
+        );
+      const onHandById = new Map(stockRows.map((r) => [r.ingredientId, Number(r.quantity)]));
+
+      // Active reservations, grouped (one aggregate query — S7 spirit).
+      const reservedRows = await db
+        .select({
+          ingredientId: stockReservations.ingredientId,
+          reserved: sql<string>`COALESCE(SUM(${stockReservations.quantity}), 0)`,
+        })
+        .from(stockReservations)
+        .where(
+          and(
+            eq(stockReservations.warehouseId, kitchenWarehouse.id),
+            inArray(stockReservations.ingredientId, ingredientIds),
+          ),
+        )
+        .groupBy(stockReservations.ingredientId);
+      const reservedById = new Map(reservedRows.map((r) => [r.ingredientId, Number(r.reserved)]));
+
+      const shortIngredientIds: string[] = [];
+      for (const [ingredientId, required] of requiredByIngredient.entries()) {
+        const available =
+          (onHandById.get(ingredientId) ?? 0) - (reservedById.get(ingredientId) ?? 0);
+        if (required > available) {
+          shortIngredientIds.push(ingredientId);
+          shortfalls.push({
+            ingredient_id: ingredientId,
+            ingredient_name: ingredientId, // resolved to the real name below
+            required,
+            available,
+          });
+        }
+      }
+
+      if (shortfalls.length > 0) {
+        const nameRows = await db
+          .select({ id: ingredients.id, name: ingredients.name })
+          .from(ingredients)
+          .where(inArray(ingredients.id, shortIngredientIds));
+        const nameById = new Map(nameRows.map((r) => [r.id, r.name]));
+        for (const s of shortfalls) {
+          s.ingredient_name = nameById.get(s.ingredient_id) ?? s.ingredient_id;
+        }
+
+        // Policy: FOODPANDA/GRABFOOD orders are still created (the platform
+        // already took the customer's payment) — the caller gets stock_risk and
+        // emits `stock.risk`. OTHER (walk-in/manual) is blocked with 409
+        // INSUFFICIENT_STOCK unless the caller explicitly allows overselling.
+        if (input.aggregator === "OTHER" && input.allow_oversell !== true) {
+          throw new InsufficientStockError(shortfalls);
+        }
+      }
+    }
+    // No KITCHEN warehouse configured for this outlet → reserve nothing
+    // (matches today's behavior: the advance-time deduction will surface the
+    // configuration problem; ingest never did).
+  }
+
+  // ── TRANSACTION: order + order_items + print_jobs + reservations ────────
   let createdOrderId = "";
   let createdOrderStatus = "NEW";
   const createdPrintJobs: PrintJobSummary[] = [];
@@ -327,14 +529,9 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
         })),
       );
 
-      // Create ONE print job per distinct station
+      // Create ONE print job per distinct station (S7: printer id comes from
+      // the batched menu/station join — no per-station query in the tx).
       for (const [stationId, group] of stationGroupMap.entries()) {
-        // Fetch station default printer
-        const [station] = await tx
-          .select()
-          .from(kitchenStations)
-          .where(eq(kitchenStations.id, stationId));
-
         const kotPayload = {
           type: "KOT",
           brand: brand.name,
@@ -356,7 +553,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
           .values({
             orderId: createdOrder.id,
             stationId,
-            printerId: station?.defaultPrinterId ?? null,
+            printerId: group.defaultPrinterId,
             payload: kotPayload,
             status: "PENDING",
           })
@@ -367,6 +564,21 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
           station: group.stationName,
           printer: printJob.printerId,
         });
+      }
+
+      // S4 — insert the soft hold: one reservation row per ingredient. Only on
+      // this genuinely-new-order path (duplicates returned earlier; a lost
+      // unique-violation race rolls this back with the whole tx), so replays
+      // can never double-reserve.
+      if (reservationWarehouseId && requiredByIngredient.size > 0) {
+        await tx.insert(stockReservations).values(
+          [...requiredByIngredient.entries()].map(([ingredientId, quantity]) => ({
+            orderId: createdOrder.id,
+            ingredientId,
+            warehouseId: reservationWarehouseId as string,
+            quantity: String(quantity),
+          })),
+        );
       }
     });
   } catch (err) {
@@ -393,11 +605,15 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     throw err;
   }
 
-  return {
+  const result: IngestResult = {
     order_id: createdOrderId,
     status: createdOrderStatus,
     print_jobs: createdPrintJobs,
   };
+  if (shortfalls.length > 0) {
+    result.stock_risk = shortfalls;
+  }
+  return result;
 }
 
 // Helper shared by idempotency check and race-condition catch
@@ -524,49 +740,82 @@ export async function advanceOrder(
         throw new Error("KITCHEN warehouse not configured for this outlet.");
       }
 
-      // Load all order items for this order
+      // S7 — batched deduction. Old shape: per order item → per recipe line →
+      // 3 queries per line (stock select, ingredient select, read-back). New
+      // shape: ONE query each for order items, recipe lines, ingredients, and
+      // stock rows; the deduction is aggregated PER INGREDIENT (Rule #3 math is
+      // identical: Σ portion_qty × item qty), then applied with the same atomic
+      // per-ingredient `UPDATE ... SET quantity = quantity - X` statements, and
+      // read back with one final inArray query.
       const items = await tx
         .select()
         .from(orderItems)
         .where(eq(orderItems.orderId, orderId));
 
+      const menuItemIds = [...new Set(items.map((i) => i.menuItemId))];
+      const lines =
+        menuItemIds.length > 0
+          ? await tx
+              .select()
+              .from(recipeLines)
+              .where(inArray(recipeLines.menuItemId, menuItemIds))
+          : [];
+
+      const linesByMenuItem = new Map<string, typeof lines>();
+      for (const line of lines) {
+        const arr = linesByMenuItem.get(line.menuItemId);
+        if (arr) arr.push(line);
+        else linesByMenuItem.set(line.menuItemId, [line]);
+      }
+
+      // qty = Σ portion_qty * order_item.qty per ingredient (Rule #3)
+      const deductByIngredient = new Map<string, number>();
       for (const item of items) {
-        // Load recipe lines for this item's menu item
-        const lines = await tx
+        for (const line of linesByMenuItem.get(item.menuItemId) ?? []) {
+          deductByIngredient.set(
+            line.ingredientId,
+            (deductByIngredient.get(line.ingredientId) ?? 0) +
+              Number(line.portionQty) * item.qty,
+          );
+        }
+      }
+
+      const ingredientIds = [...deductByIngredient.keys()];
+      if (ingredientIds.length > 0) {
+        // Pre-fetch all relevant ingredients (names + thresholds) in one query.
+        const ingredientRows = await tx
           .select()
-          .from(recipeLines)
-          .where(eq(recipeLines.menuItemId, item.menuItemId));
+          .from(ingredients)
+          .where(inArray(ingredients.id, ingredientIds));
+        const ingredientById = new Map(ingredientRows.map((i) => [i.id, i]));
 
-        for (const line of lines) {
-          // qty = portion_qty * order_item.qty  (Rule #3: brand-specific portion)
-          const qtyToDeduct = Number(line.portionQty) * item.qty;
-
-          // FIX D — Ensure the KITCHEN inventory_stock row exists before deducting.
-          // If the row is absent (ingredient never received into KITCHEN), create it
-          // at qty=0 and allow the balance to go negative. This makes "oversell"
-          // visible rather than silently skipping the deduction.
-          //
-          // prototype allows oversell; production should decide
-          // INSUFFICIENT_STOCK block vs allow+flag
-          const [existingStock] = await tx
-            .select()
-            .from(inventoryStock)
-            .where(
-              and(
-                eq(inventoryStock.warehouseId, kitchenWarehouse.id),
-                eq(inventoryStock.ingredientId, line.ingredientId),
-              ),
-            );
-
-          if (!existingStock) {
-            await tx.insert(inventoryStock).values({
+        // FIX D — Ensure every KITCHEN inventory_stock row exists before
+        // deducting. Missing rows (ingredient never received into KITCHEN) are
+        // created at qty=0 in one batched insert so the balance can go visibly
+        // negative rather than the deduction being silently skipped.
+        const existingStockRows = await tx
+          .select({ ingredientId: inventoryStock.ingredientId })
+          .from(inventoryStock)
+          .where(
+            and(
+              eq(inventoryStock.warehouseId, kitchenWarehouse.id),
+              inArray(inventoryStock.ingredientId, ingredientIds),
+            ),
+          );
+        const haveStockRow = new Set(existingStockRows.map((r) => r.ingredientId));
+        const missingIds = ingredientIds.filter((id) => !haveStockRow.has(id));
+        if (missingIds.length > 0) {
+          await tx.insert(inventoryStock).values(
+            missingIds.map((ingredientId) => ({
               warehouseId: kitchenWarehouse.id,
-              ingredientId: line.ingredientId,
+              ingredientId,
               quantity: "0",
-            });
-          }
+            })),
+          );
+        }
 
-          // Decrement the SHARED KITCHEN pool for this ingredient
+        // Per-ingredient ATOMIC decrement of the shared KITCHEN pool.
+        for (const [ingredientId, qtyToDeduct] of deductByIngredient.entries()) {
           await tx
             .update(inventoryStock)
             .set({
@@ -575,88 +824,92 @@ export async function advanceOrder(
             .where(
               and(
                 eq(inventoryStock.warehouseId, kitchenWarehouse.id),
-                eq(inventoryStock.ingredientId, line.ingredientId),
+                eq(inventoryStock.ingredientId, ingredientId),
               ),
             );
 
-          // FIX B — Record what was actually deducted in the consumption ledger.
-          // Tagged with orderId so cancelOrder can look up the exact amounts and
-          // restock from this record (not from the current recipe, which may have
-          // changed since the order was placed).
-          // L4c — also stamp the warehouse we deducted FROM, so cancelOrder restocks
-          // that exact warehouse instead of re-deriving via brand→location (which
-          // would credit the wrong outlet if the brand's home location later moved).
-          await tx.insert(consumptionLogs).values({
-            ingredientId: line.ingredientId,
-            quantity: String(qtyToDeduct),
-            loggedBy: userId ?? null,
-            orderId,
-            warehouseId: kitchenWarehouse.id,
-          });
-
-          // ERP R1: post ORDER_DEDUCTION OUT ledger row (same tx, atomic)
+          // ERP R1: post ORDER_DEDUCTION OUT ledger row (same tx, atomic).
+          // Aggregated per ingredient — matches the ledger's idempotency key
+          // (sourceModule, orderId, ingredientId), which only ever admitted one
+          // row per ingredient anyway.
           await postLedger(tx, {
             sourceModule: "ORDER_DEDUCTION",
             sourceDocumentNo: orderId,
-            sourceLineNo: line.ingredientId,
-            ingredientId: line.ingredientId,
+            sourceLineNo: ingredientId,
+            ingredientId,
             warehouseId: kitchenWarehouse.id,
             movementType: "OUT",
             quantity: qtyToDeduct,
             encoderUserId: userId ?? null,
           });
+        }
 
-          // Read back the new balance to check threshold
-          const [stockRow] = await tx
-            .select({
-              quantity: inventoryStock.quantity,
-            })
-            .from(inventoryStock)
-            .where(
-              and(
-                eq(inventoryStock.warehouseId, kitchenWarehouse.id),
-                eq(inventoryStock.ingredientId, line.ingredientId),
-              ),
+        // FIX B — Record what was actually deducted in the consumption ledger
+        // (one batched insert, one row per ingredient with the aggregated qty).
+        // Tagged with orderId + warehouseId so cancelOrder restocks the exact
+        // amounts into the exact warehouse (L4c), regardless of later recipe
+        // or brand-location changes.
+        await tx.insert(consumptionLogs).values(
+          [...deductByIngredient.entries()].map(([ingredientId, qty]) => ({
+            ingredientId,
+            quantity: String(qty),
+            loggedBy: userId ?? null,
+            orderId,
+            warehouseId: kitchenWarehouse.id,
+          })),
+        );
+
+        // One batched read-back of the new balances (S7).
+        const readBack = await tx
+          .select({
+            ingredientId: inventoryStock.ingredientId,
+            quantity: inventoryStock.quantity,
+          })
+          .from(inventoryStock)
+          .where(
+            and(
+              eq(inventoryStock.warehouseId, kitchenWarehouse.id),
+              inArray(inventoryStock.ingredientId, ingredientIds),
+            ),
+          );
+
+        for (const stockRow of readBack) {
+          const ing = ingredientById.get(stockRow.ingredientId);
+          const newQty = Number(stockRow.quantity);
+          const threshold = Number(ing?.lowStockThreshold ?? 0);
+          const ingName = ing?.name ?? stockRow.ingredientId;
+
+          // Record stock update (emit `stock.updated`). The map upsert keeps
+          // the last-write-wins semantics for any duplicate ingredient.
+          stockUpdateMap.set(stockRow.ingredientId, {
+            ingredientId: stockRow.ingredientId,
+            ingredientName: ingName,
+            warehouseType: "KITCHEN",
+            quantity: newQty,
+          });
+
+          // Emit low-stock event if qty is at/below threshold OR has gone negative.
+          // FIX D — negative qty must never be silent (prototype oversell policy).
+          if (newQty <= threshold || newQty < 0) {
+            const alreadyAdded = lowStockEvents.some(
+              (e) => e.ingredientId === stockRow.ingredientId,
             );
-
-          if (stockRow) {
-            const [ing] = await tx
-              .select()
-              .from(ingredients)
-              .where(eq(ingredients.id, line.ingredientId));
-
-            const newQty = Number(stockRow.quantity);
-            const threshold = Number(ing?.lowStockThreshold ?? 0);
-            const ingName = ing?.name ?? line.ingredientId;
-
-            // Record stock update (Task 8: emit `stock.updated`).
-            // The map upsert means if multiple recipe lines share the same ingredient
-            // we report the final balance (last write wins).
-            stockUpdateMap.set(line.ingredientId, {
-              ingredientId: line.ingredientId,
-              ingredientName: ingName,
-              warehouseType: "KITCHEN",
-              quantity: newQty,
-            });
-
-            // Emit low-stock event if qty is at/below threshold OR has gone negative.
-            // FIX D — negative qty must never be silent (prototype oversell policy).
-            if (newQty <= threshold || newQty < 0) {
-              const alreadyAdded = lowStockEvents.some(
-                (e) => e.ingredientId === line.ingredientId,
-              );
-              if (!alreadyAdded) {
-                lowStockEvents.push({
-                  ingredientId: line.ingredientId,
-                  ingredientName: ingName,
-                  quantity: newQty,
-                  threshold,
-                });
-              }
+            if (!alreadyAdded) {
+              lowStockEvents.push({
+                ingredientId: stockRow.ingredientId,
+                ingredientName: ingName,
+                quantity: newQty,
+                threshold,
+              });
             }
           }
         }
       }
+
+      // S4 — the real deduction replaces the soft hold: release this order's
+      // reservations in the SAME transaction. (Also runs when the order had no
+      // recipe lines — harmless no-op.)
+      await tx.delete(stockReservations).where(eq(stockReservations.orderId, orderId));
     }
     // ── END DEDUCTION ENGINE ───────────────────────────────────────────────
   });
@@ -674,14 +927,14 @@ export async function advanceOrder(
 
 // ---------------------------------------------------------------------------
 // cancelOrder — POST /orders/:id/cancel
-// If at/after PREPARING: compensating restock (Rule #2).
+// Compensating restock (Rule #2) driven by the consumption ledger.
 // ---------------------------------------------------------------------------
 
 export async function cancelOrder(
   db: DB,
   orderId: string,
   reason: string,
-): Promise<{ status: string }> {
+): Promise<CancelResult> {
   // MOTM 2026-07-01: a cancellation must record WHY.
   const trimmedReason = typeof reason === "string" ? reason.trim() : "";
   if (trimmedReason.length === 0) {
@@ -701,109 +954,167 @@ export async function cancelOrder(
     throw new ValidationError("A COMPLETED order cannot be cancelled.");
   }
 
-  // Did deduction already happen? It fires on NEW → PREPARING, so any status
-  // at or after PREPARING means the stock was deducted.
-  const STAGES_AFTER_PREPARING = new Set<string>(["PREPARING", "READY"]);
-  const needsRestock = STAGES_AFTER_PREPARING.has(order.status);
+  const expectedCurrentStatus = order.status;
+  // Map: ingredientId → latest StockUpdateEvent (last write wins per ingredient)
+  const stockUpdateMap = new Map<string, StockUpdateEvent>();
 
   await db.transaction(async (tx) => {
-    if (needsRestock) {
+    // S3 (mirrors FIX A) — CONDITIONAL cancel: only flips to CANCELLED if the
+    // status is still what we read. If a concurrent advance (or another cancel)
+    // changed it in between, this finds 0 rows and we abort with 409 — closing
+    // the race where the old code decided "needsRestock" from a stale pre-read
+    // status and could leak stock (cancel-as-NEW racing an advance would skip
+    // the restock for a deduction that DID happen).
+    const updatedRows = await tx
+      .update(orders)
+      .set({ status: "CANCELLED", cancelReason: trimmedReason, updatedAt: new Date() })
+      .where(and(eq(orders.id, orderId), eq(orders.status, expectedCurrentStatus)))
+      .returning();
+
+    if (updatedRows.length === 0) {
+      throw new ConflictError(
+        "Order was modified concurrently. Another status change is already in progress.",
+      );
+    }
+
+    // S4 — release the reservation hold (frees availability for NEW-status
+    // cancels; harmless no-op after PREPARING, where advance already deleted).
+    await tx.delete(stockReservations).where(eq(stockReservations.orderId, orderId));
+
+    // S3 — restock decision: the consumption ledger is the source of truth of
+    // what was ACTUALLY deducted. Rows exist ⇔ the deduction ran ⇔ restock.
+    // (Not the pre-read status: under the conditional update above the status
+    // can no longer lie, but the ledger check also keeps the existing
+    // delete-logs-after-restock double-cancel guard — an already-restocked
+    // order has no rows left.)
+    const logRows = await tx
+      .select()
+      .from(consumptionLogs)
+      .where(eq(consumptionLogs.orderId, orderId));
+
+    if (logRows.length > 0) {
       // ── COMPENSATING RESTOCK ───────────────────────────────────────────
       // FIX B — Restock using the RECORDED consumption ledger for this order,
       // NOT by re-deriving from the current recipe_lines. This is correct even
       // if the recipe was changed after the order was placed.
       //
-      // We also DELETE the log rows so a double-cancel cannot double-restock.
-      const logRows = await tx
-        .select()
-        .from(consumptionLogs)
-        .where(eq(consumptionLogs.orderId, orderId));
-
-      if (logRows.length > 0) {
-        // L4c — restock the EXACT warehouse each deduction hit, read straight off
-        // the consumption_log row (advanceOrder now stamps warehouse_id). This is
-        // strictly more correct than re-deriving via brand→location and cheaper
-        // (no extra query). Legacy rows written before L4c have a null warehouse_id;
-        // for those we fall back to the order's own outlet KITCHEN warehouse.
-        let fallbackKitchenWarehouseId: string | null = null;
-        const resolveFallback = async (): Promise<string> => {
-          if (fallbackKitchenWarehouseId) return fallbackKitchenWarehouseId;
-          const [orderBrand] = await tx
-            .select({ locationId: brands.locationId })
-            .from(brands)
-            .where(eq(brands.id, order.brandId));
-          if (!orderBrand) throw new Error("Order's brand not found.");
-          const [kitchenWarehouse] = await tx
-            .select({ id: warehouses.id })
-            .from(warehouses)
-            .where(
-              and(
-                eq(warehouses.type, "KITCHEN"),
-                eq(warehouses.locationId, orderBrand.locationId),
-              ),
-            );
-          if (!kitchenWarehouse) {
-            throw new Error("KITCHEN warehouse not configured for this outlet.");
-          }
-          fallbackKitchenWarehouseId = kitchenWarehouse.id;
-          return kitchenWarehouse.id;
-        };
-
-        // Aggregate per (warehouse, ingredient) — a single ingredient may appear in
-        // multiple log rows, and (defensively) across warehouses.
-        const restockByWarehouseIngredient = new Map<string, number>();
-        for (const row of logRows) {
-          const warehouseId = row.warehouseId ?? (await resolveFallback());
-          const key = `${warehouseId}|${row.ingredientId}`;
-          restockByWarehouseIngredient.set(
-            key,
-            (restockByWarehouseIngredient.get(key) ?? 0) + Number(row.quantity),
+      // L4c — restock the EXACT warehouse each deduction hit, read straight off
+      // the consumption_log row (advanceOrder stamps warehouse_id). Legacy rows
+      // written before L4c have a null warehouse_id; for those we fall back to
+      // the order's own outlet KITCHEN warehouse.
+      let fallbackKitchenWarehouseId: string | null = null;
+      const resolveFallback = async (): Promise<string> => {
+        if (fallbackKitchenWarehouseId) return fallbackKitchenWarehouseId;
+        const [orderBrand] = await tx
+          .select({ locationId: brands.locationId })
+          .from(brands)
+          .where(eq(brands.id, order.brandId));
+        if (!orderBrand) throw new Error("Order's brand not found.");
+        const [kitchenWarehouse] = await tx
+          .select({ id: warehouses.id })
+          .from(warehouses)
+          .where(
+            and(
+              eq(warehouses.type, "KITCHEN"),
+              eq(warehouses.locationId, orderBrand.locationId),
+            ),
           );
+        if (!kitchenWarehouse) {
+          throw new Error("KITCHEN warehouse not configured for this outlet.");
         }
+        fallbackKitchenWarehouseId = kitchenWarehouse.id;
+        return kitchenWarehouse.id;
+      };
 
-        for (const [key, qtyToRestore] of restockByWarehouseIngredient.entries()) {
-          const [warehouseId, ingredientId] = key.split("|");
-          await tx
-            .update(inventoryStock)
-            .set({
-              quantity: sql`${inventoryStock.quantity} + ${String(qtyToRestore)}::numeric`,
-            })
-            .where(
-              and(
-                eq(inventoryStock.warehouseId, warehouseId),
-                eq(inventoryStock.ingredientId, ingredientId),
-              ),
-            );
+      // Aggregate per (warehouse, ingredient) — a single ingredient may appear in
+      // multiple log rows, and (defensively) across warehouses.
+      const restockByWarehouseIngredient = new Map<string, number>();
+      for (const row of logRows) {
+        const warehouseId = row.warehouseId ?? (await resolveFallback());
+        const key = `${warehouseId}|${row.ingredientId}`;
+        restockByWarehouseIngredient.set(
+          key,
+          (restockByWarehouseIngredient.get(key) ?? 0) + Number(row.quantity),
+        );
+      }
 
-          // ERP R1: post RESTOCK IN ledger row (compensating entry, same tx)
-          await postLedger(tx, {
-            sourceModule: "RESTOCK",
-            sourceDocumentNo: orderId,
-            sourceLineNo: ingredientId,
-            ingredientId,
-            warehouseId,
-            movementType: "IN",
-            quantity: qtyToRestore,
+      for (const [key, qtyToRestore] of restockByWarehouseIngredient.entries()) {
+        const [warehouseId, ingredientId] = key.split("|");
+        await tx
+          .update(inventoryStock)
+          .set({
+            quantity: sql`${inventoryStock.quantity} + ${String(qtyToRestore)}::numeric`,
+          })
+          .where(
+            and(
+              eq(inventoryStock.warehouseId, warehouseId),
+              eq(inventoryStock.ingredientId, ingredientId),
+            ),
+          );
+
+        // ERP R1: post RESTOCK IN ledger row (compensating entry, same tx)
+        await postLedger(tx, {
+          sourceModule: "RESTOCK",
+          sourceDocumentNo: orderId,
+          sourceLineNo: ingredientId,
+          ingredientId,
+          warehouseId,
+          movementType: "IN",
+          quantity: qtyToRestore,
+        });
+      }
+
+      // S5 — read back the new balances (batched per warehouse; in practice a
+      // single KITCHEN warehouse) + ingredient names so the route can emit
+      // `stock.updated` per ingredient, same shape as advanceOrder.
+      const ingredientIdsByWarehouse = new Map<string, string[]>();
+      for (const key of restockByWarehouseIngredient.keys()) {
+        const [warehouseId, ingredientId] = key.split("|");
+        const arr = ingredientIdsByWarehouse.get(warehouseId);
+        if (arr) arr.push(ingredientId);
+        else ingredientIdsByWarehouse.set(warehouseId, [ingredientId]);
+      }
+
+      const allIngredientIds = [...new Set(logRows.map((r) => r.ingredientId))];
+      const nameRows = await tx
+        .select({ id: ingredients.id, name: ingredients.name })
+        .from(ingredients)
+        .where(inArray(ingredients.id, allIngredientIds));
+      const nameById = new Map(nameRows.map((r) => [r.id, r.name]));
+
+      for (const [warehouseId, ingIds] of ingredientIdsByWarehouse.entries()) {
+        const readBack = await tx
+          .select({
+            ingredientId: inventoryStock.ingredientId,
+            quantity: inventoryStock.quantity,
+          })
+          .from(inventoryStock)
+          .where(
+            and(
+              eq(inventoryStock.warehouseId, warehouseId),
+              inArray(inventoryStock.ingredientId, ingIds),
+            ),
+          );
+        for (const row of readBack) {
+          stockUpdateMap.set(row.ingredientId, {
+            ingredientId: row.ingredientId,
+            ingredientName: nameById.get(row.ingredientId) ?? row.ingredientId,
+            warehouseType: "KITCHEN",
+            quantity: Number(row.quantity),
           });
         }
-
-        // Delete the consumption log rows for this order AFTER restocking.
-        // This is the double-cancel guard: if cancelOrder is called again,
-        // logRows will be empty and no restock will happen.
-        await tx
-          .delete(consumptionLogs)
-          .where(eq(consumptionLogs.orderId, orderId));
       }
-    }
 
-    // Mark the order CANCELLED with the recorded reason
-    await tx
-      .update(orders)
-      .set({ status: "CANCELLED", cancelReason: trimmedReason, updatedAt: new Date() })
-      .where(eq(orders.id, orderId));
+      // Delete the consumption log rows for this order AFTER restocking.
+      // This is the double-cancel guard: if cancelOrder is called again,
+      // logRows will be empty and no restock will happen.
+      await tx
+        .delete(consumptionLogs)
+        .where(eq(consumptionLogs.orderId, orderId));
+    }
   });
 
-  return { status: "CANCELLED" };
+  return { status: "CANCELLED", stockUpdates: [...stockUpdateMap.values()] };
 }
 
 // ---------------------------------------------------------------------------

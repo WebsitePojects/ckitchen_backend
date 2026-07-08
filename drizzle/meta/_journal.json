@@ -141,6 +141,13 @@
       "when": 1783800000000,
       "tag": "0019_department_budget",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1783900000000,
+      "tag": "0020_stock_reservation",
+      "breakpoints": true
     }
   ]
 }

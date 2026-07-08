@@ -200,6 +200,8 @@ beforeAll(async () => {
   expect(oa2.status).toBe(201);
 
   // O-A3: Tokyo House, OTHER, 10:15 UTC, 1×Teriyaki → total=200
+  // S4: this fixture never stocks the KITCHEN, and OTHER (walk-in) orders now
+  // 409 on shortfall — allow_oversell keeps the analytics math identical.
   const oa3 = await request(app)
     .post("/api/v1/ingest/order")
     .set("Authorization", `Bearer ${adminToken}`)
@@ -208,6 +210,7 @@ beforeAll(async () => {
       aggregator: "OTHER",
       external_ref: "AN-A3",
       placed_at: "2026-01-15T10:15:00.000Z",
+      allow_oversell: true,
       items: [{ menu_item_id: menuAId, qty: 1 }],
     });
   expect(oa3.status).toBe(201);
@@ -651,6 +654,8 @@ beforeAll(async () => {
       aggregator: "OTHER",
       external_ref: "AN-C4",
       placed_at: "2026-01-16T11:00:00.000Z",
+      // S4: unstocked KITCHEN — see O-A3 note.
+      allow_oversell: true,
       items: [{ menu_item_id: menuAId, qty: 1 }],
     });
   expect(oc4.status).toBe(201);

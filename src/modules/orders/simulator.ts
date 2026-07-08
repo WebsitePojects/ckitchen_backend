@@ -6,10 +6,17 @@
  * timer so it can be unit-tested without starting a setInterval.
  *
  * RBAC: start/stop require SUPER_ADMIN (enforced in routes.ts).
+ *
+ * S1 — realtime parity with the HTTP ingest route: the simulator calls
+ * ingestOrder() directly (no HTTP layer), so it must emit the same socket
+ * events itself. After a genuinely-new ingest it emits `order.created` (same
+ * payload shape as routes.ts) and, when the order was accepted with a
+ * shortfall, `stock.risk` — both to the BRAND'S OWN outlet room.
  */
 import type { DB } from "../../db/client.js";
-import { aggregatorAccounts, menuItems } from "../../db/schema.js";
-import { eq, inArray } from "drizzle-orm";
+import { aggregatorAccounts, brands, menuItems } from "../../db/schema.js";
+import { inArray } from "drizzle-orm";
+import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
 import { ingestOrder, type IngestOrderInput } from "./service.js";
 
@@ -91,13 +98,20 @@ export function getSimulatorStatus(): SimulatorStatus {
 
 /**
  * Starts the simulator.  Every tick (60_000 / rate_per_min ms) it:
- *   1. Fetches menu items for each brand_id.
+ *   1. Fetches menu items + aggregator accounts + home outlet for each brand_id.
  *   2. Picks a random brand, random aggregator (FOODPANDA / GRABFOOD), random items.
  *   3. Calls `ingestOrder` (the same service function used by the real ingest endpoint).
+ *   4. S1 — emits `order.created` (and `stock.risk` when applicable) to the
+ *      brand's outlet room, with the SAME payload shape the ingest route emits.
  *
  * Idempotent: calling start when already running silently replaces the timer.
  */
-export function startSimulator(db: DB, brandIds: string[], ratePerMin: number): void {
+export function startSimulator(
+  db: DB,
+  hub: RealtimeHub,
+  brandIds: string[],
+  ratePerMin: number,
+): void {
   // Clear any existing timer
   stopSimulator();
 
@@ -135,6 +149,14 @@ export function startSimulator(db: DB, brandIds: string[], ratePerMin: number): 
         accountsByBrand.set(acc.brandId, arr);
       }
 
+      // S1 — each brand's home outlet (brand.location_id) so the events reach
+      // the order's OWN room, mirroring the ingest route (S2).
+      const brandRows = await db
+        .select({ id: brands.id, locationId: brands.locationId })
+        .from(brands)
+        .where(inArray(brands.id, brandIds));
+      const locationByBrand = new Map(brandRows.map((b) => [b.id, b.locationId]));
+
       // Pick a random brand that has both items and accounts
       const eligibleBrands = brandIds.filter(
         (id) => (itemsByBrand.get(id)?.length ?? 0) > 0 &&
@@ -171,6 +193,31 @@ export function startSimulator(db: DB, brandIds: string[], ratePerMin: number): 
           entityId: result.order_id,
           metadata: { source: "simulator", aggregator, brand_id: brandId },
         });
+
+        // S1 — realtime parity with POST /ingest/order: without this, simulated
+        // orders never appeared on the live dashboard until a manual refresh.
+        const locationId = locationByBrand.get(brandId);
+        if (locationId) {
+          hub.emitToLocation(locationId, "order.created", {
+            order_id: result.order_id,
+            status: result.status,
+            brand_id: brandId,
+            aggregator,
+            external_ref: orderInput.external_ref,
+            customer_name: orderInput.customer_name ?? null,
+            print_jobs: result.print_jobs,
+          });
+
+          // S4 — accepted-with-shortfall: same stock.risk event as the route.
+          if (result.stock_risk && result.stock_risk.length > 0) {
+            hub.emitToLocation(locationId, "stock.risk", {
+              order_id: result.order_id,
+              external_ref: orderInput.external_ref,
+              brand_id: brandId,
+              shortfalls: result.stock_risk,
+            });
+          }
+        }
       }
     } catch {
       // Simulator errors are non-fatal; log but keep the timer running

@@ -31,6 +31,7 @@ import {
   itos,
   locations,
   stockLedgerEntries,
+  stockReservations,
   warehouseTypeEnum,
   warehouses,
 } from "../../db/schema.js";
@@ -304,7 +305,28 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       .innerJoin(ingredients, eq(inventoryStock.ingredientId, ingredients.id))
       .where(eq(inventoryStock.warehouseId, warehouse.id));
 
-    res.json(rows);
+    // S4 — per-row `reserved` (SUM of active stock_reservation holds for this
+    // warehouse+ingredient) and `available` (quantity − reserved). ONE grouped
+    // aggregate query for the whole warehouse — not per-row lookups. Existing
+    // fields are untouched; rows without holds get reserved=0.
+    const reservedRows = await db
+      .select({
+        ingredientId: stockReservations.ingredientId,
+        reserved: sql<string>`COALESCE(SUM(${stockReservations.quantity}), 0)`,
+      })
+      .from(stockReservations)
+      .where(eq(stockReservations.warehouseId, warehouse.id))
+      .groupBy(stockReservations.ingredientId);
+    const reservedByIngredient = new Map(
+      reservedRows.map((r) => [r.ingredientId, Number(r.reserved)]),
+    );
+
+    res.json(
+      rows.map((row) => {
+        const reserved = reservedByIngredient.get(row.ingredientId) ?? 0;
+        return { ...row, reserved, available: Number(row.quantity) - reserved };
+      }),
+    );
   });
 
   // -------------------------------------------------------------------------

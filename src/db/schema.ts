@@ -668,6 +668,46 @@ export type ConsumptionLog = typeof consumptionLogs.$inferSelect;
 export type NewConsumptionLog = typeof consumptionLogs.$inferInsert;
 
 // ---------------------------------------------------------------------------
+// stock_reservation  (S4 — soft holds against KITCHEN stock, migration 0020)
+//
+// One row per (order, ingredient): a SOFT HOLD created at ingest against the
+// order's outlet KITCHEN warehouse. available = inventory_stock.quantity −
+// SUM(active reservations for that warehouse+ingredient). Rule #2 is NOT
+// changed: real deduction still fires at NEW→PREPARING, which DELETES this
+// order's reservation rows in the same transaction (the deduction replaces the
+// hold). Cancel also deletes them (releases the hold for NEW-status cancels;
+// harmless no-op after PREPARING).
+// ---------------------------------------------------------------------------
+
+export const stockReservations = pgTable(
+  "stock_reservation",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orderId: uuid("order_id")
+      .notNull()
+      .references(() => orders.id),
+    ingredientId: uuid("ingredient_id")
+      .notNull()
+      .references(() => ingredients.id),
+    warehouseId: uuid("warehouse_id")
+      .notNull()
+      .references(() => warehouses.id),
+    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("stock_reservation_order_id_idx").on(table.orderId),
+    index("stock_reservation_warehouse_ingredient_idx").on(
+      table.warehouseId,
+      table.ingredientId,
+    ),
+  ],
+).enableRLS();
+
+export type StockReservation = typeof stockReservations.$inferSelect;
+export type NewStockReservation = typeof stockReservations.$inferInsert;
+
+// ---------------------------------------------------------------------------
 // ERP R1: stock_ledger_entry  (append-only audit trail, shadows inventoryStock)
 // ---------------------------------------------------------------------------
 

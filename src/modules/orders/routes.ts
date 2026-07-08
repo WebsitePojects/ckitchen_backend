@@ -24,17 +24,20 @@
  *   simulator start/stop — SUPER_ADMIN only
  *   simulator status     — any authenticated user (read-only, no state change)
  *
- * Task 8 — realtime emissions:
+ * Task 8 — realtime emissions (always to the ORDER'S OWN outlet room — S2):
  *   order.created  → after successful ingest (not on DUPLICATE_ORDER)
  *   order.updated  → after advance and after cancel
- *   stock.updated  → for each ingredient deducted on NEW→PREPARING
+ *   stock.updated  → for each ingredient deducted on NEW→PREPARING and for
+ *                    each ingredient restocked by a cancel (S5)
  *   lowstock.alert → for each low-stock ingredient triggered by deduction
+ *   stock.risk     → S4: order accepted despite required > available
+ *                    (aggregator order, or OTHER with allow_oversell)
  */
 import { Router, type Response } from "express";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { aggregatorEnum, brands, locations, orderStatusEnum, orders } from "../../db/schema.js";
+import { aggregatorEnum, brands, orderStatusEnum, orders } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
@@ -42,6 +45,7 @@ import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
 import {
   ConflictError,
+  InsufficientStockError,
   NotFoundError,
   ValidationError,
   advanceOrder,
@@ -77,6 +81,8 @@ const ingestOrderSchema = z.object({
   external_ref: z.string().min(1),
   customer_name: z.string().optional(),
   placed_at: z.string().datetime({ offset: true }).optional(),
+  // S4 — OTHER (walk-in/manual) orders 409 on shortfall unless this is true.
+  allow_oversell: z.boolean().optional(),
   items: z.array(ingestItemSchema).min(1),
 });
 
@@ -94,8 +100,12 @@ function handleServiceError(err: unknown, res: Response): void {
     sendError(res, 404, err.code, err.message);
   } else if (err instanceof ValidationError) {
     sendError(res, 400, err.code, err.message);
+  } else if (err instanceof InsufficientStockError) {
+    // S4 — OTHER (walk-in/manual) order blocked: required > available and
+    // allow_oversell was not set. Details carry the per-ingredient shortfalls.
+    sendError(res, 409, err.code, err.message, err.shortfalls);
   } else if (err instanceof ConflictError) {
-    // FIX A — concurrent double-advance returns 409 CONFLICT
+    // FIX A — concurrent double-advance/cancel returns 409 CONFLICT
     sendError(res, 409, err.code, err.message);
   } else {
     const message = err instanceof Error ? err.message : "Internal server error.";
@@ -104,17 +114,21 @@ function handleServiceError(err: unknown, res: Response): void {
 }
 
 // ---------------------------------------------------------------------------
-// Location resolution helper
+// Location resolution helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Returns the ID of the single prototype location.
- * Single DB round-trip; returns null if no location is seeded yet
- * (graceful — the emit is simply skipped rather than crashing).
+ * S2 — resolves a brand's own outlet (brand.location_id). Used by the ingest
+ * route both for the outlet-scope check (S6) and to emit `order.created` to the
+ * ORDER'S OWN room — never "the first location row" (which broadcast every
+ * ingest to whichever outlet happened to sort first).
  */
-async function getDefaultLocationId(db: DB): Promise<string | null> {
-  const [loc] = await db.select({ id: locations.id }).from(locations);
-  return loc?.id ?? null;
+async function getLocationIdForBrand(db: DB, brandId: string): Promise<string | null> {
+  const [row] = await db
+    .select({ locationId: brands.locationId })
+    .from(brands)
+    .where(eq(brands.id, brandId));
+  return row?.locationId ?? null;
 }
 
 /**
@@ -138,7 +152,11 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   const router = Router();
 
   // ── POST /ingest/order ─────────────────────────────────────────────────
-  router.post("/ingest/order", requireAuth, async (req, res) => {
+  // S6 — outlet-scoped: the target brand's outlet must be in the caller's
+  // scope (ALL-scope passes any; ASSIGNED must be a member), mirroring the
+  // GET /orders/:id membership check. The simulator bypasses HTTP and calls
+  // ingestOrder() directly, so it is unaffected.
+  router.post("/ingest/order", requireAuth, resolveOutletContext, async (req, res) => {
     const parsed = ingestOrderSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid order payload.", parsed.error.issues);
@@ -146,6 +164,14 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     }
 
     try {
+      // S6 — scope check. An unknown brand falls through to the service, which
+      // returns the pre-existing 404 (not a misleading 403).
+      const brandLocationId = await getLocationIdForBrand(db, parsed.data.brand_id);
+      if (brandLocationId && !isOutletInScope(req.outletContext, brandLocationId)) {
+        sendError(res, 403, "FORBIDDEN", "Brand is outside your access scope.");
+        return;
+      }
+
       const result = await ingestOrder(db, parsed.data as IngestOrderInput);
 
       // DUPLICATE_ORDER → 200 (idempotent replay, not an error)
@@ -171,11 +197,11 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         metadata: { aggregator: parsed.data.aggregator, external_ref: parsed.data.external_ref },
       });
 
-      // Task 8: emit order.created after successful HTTP response is sent
-      // Use brand_id from the validated input to resolve the location room.
-      const locationId = await getDefaultLocationId(db);
-      if (locationId) {
-        hub.emitToLocation(locationId, "order.created", {
+      // Task 8: emit order.created after successful HTTP response is sent.
+      // S2 — to the ORDER'S OWN outlet room (brand.location_id), never the
+      // deployment's first location row.
+      if (brandLocationId) {
+        hub.emitToLocation(brandLocationId, "order.created", {
           order_id: result.order_id,
           status: result.status,
           brand_id: parsed.data.brand_id,
@@ -184,6 +210,16 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
           customer_name: parsed.data.customer_name ?? null,
           print_jobs: result.print_jobs,
         });
+
+        // S4 — order accepted despite required > available: alert the outlet.
+        if (result.stock_risk && result.stock_risk.length > 0) {
+          hub.emitToLocation(brandLocationId, "stock.risk", {
+            order_id: result.order_id,
+            external_ref: parsed.data.external_ref,
+            brand_id: parsed.data.brand_id,
+            shortfalls: result.stock_risk,
+          });
+        }
       }
     } catch (err) {
       handleServiceError(err, res);
@@ -422,6 +458,14 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
             order_id: id,
             status: result.status,
           });
+
+          // S5 — compensating restock changed KITCHEN balances: emit
+          // stock.updated per ingredient (same shape as the advance path).
+          // Also covers the release of this order's reservation hold — clients
+          // listening for availability changes refresh on stock.updated.
+          for (const update of result.stockUpdates) {
+            hub.emitToLocation(locationId, "stock.updated", update);
+          }
         }
       } catch (err) {
         handleServiceError(err, res);
@@ -441,7 +485,9 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
         return;
       }
 
-      startSimulator(db, parsed.data.brand_ids, parsed.data.rate_per_min);
+      // S1 — pass the hub so simulated orders emit order.created / stock.risk
+      // to their outlet room exactly like HTTP-ingested orders.
+      startSimulator(db, hub, parsed.data.brand_ids, parsed.data.rate_per_min);
       res.json({ ok: true, rate_per_min: parsed.data.rate_per_min });
     },
   );

@@ -1065,3 +1065,111 @@ export const rolePageAccess = pgTable(
 
 export type RolePageAccess = typeof rolePageAccess.$inferSelect;
 export type NewRolePageAccess = typeof rolePageAccess.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// Discounts / Promos + 3-layer approval workflow
+// (MOTM 2026-07-01 items 2b, 2c, 7 — per-product promo/discount, 3 layers of
+// approval [Generally Approved / Supervisor / Admin-Manager], discount per item)
+//
+// NON-REGRESSIVE (backend builder instructions): this is a SEPARATE layer on
+// top of `order`. An order's total math and lifecycle (orders/service.ts) are
+// NEVER mutated here. "Effective total" = order.total − Σ(APPROVED
+// order_discount.amount), computed in this module only. An order with no
+// discount rows behaves exactly as it does today.
+//
+// `discount` is the reusable catalog (promos/vouchers/statutory templates,
+// optionally scoped to a brand and/or a single menu item — item 2b: "per
+// Product an option to place promo/discount"). `order_discount` is what was
+// actually APPLIED to a specific order (or a single order item via `label`),
+// carrying the computed peso `amount` and the 3-layer approval routing.
+// ---------------------------------------------------------------------------
+
+export const discountTypeEnum = pgEnum("discount_type", [
+  "PERCENT",
+  "FIXED",
+  "SENIOR",
+  "PWD",
+  "VOUCHER",
+]);
+
+export const discountScopeEnum = pgEnum("discount_scope", ["ITEM", "ORDER"]);
+
+/** 3 layers of approval (MOTM 2c): AUTO = "Generally Approved". */
+export const approvalLevelEnum = pgEnum("approval_level", ["AUTO", "SUPERVISOR", "ADMIN"]);
+
+export const orderDiscountStatusEnum = pgEnum("order_discount_status", [
+  "PENDING",
+  "APPROVED",
+  "REJECTED",
+]);
+
+/** Promo/discount catalog. `value` is a percent (0-100) for PERCENT/SENIOR/PWD, a peso amount for FIXED. */
+export const discounts = pgTable(
+  "discount",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    scope: discountScopeEnum("scope").notNull(),
+    // Optional targeting (item 2b): null brand_id = platform-wide; null
+    // menu_item_id with scope=ITEM = "any item" template, not yet targeted.
+    brandId: uuid("brand_id").references(() => brands.id),
+    menuItemId: uuid("menu_item_id").references(() => menuItems.id),
+    name: text("name").notNull(),
+    type: discountTypeEnum("type").notNull(),
+    value: numeric("value", { precision: 14, scale: 2 }).notNull(),
+    code: text("code"),
+    vatExempt: boolean("vat_exempt").notNull().default(false),
+    active: boolean("active").notNull().default(true),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("discount_brand_id_idx").on(table.brandId),
+    index("discount_menu_item_id_idx").on(table.menuItemId),
+    index("discount_active_idx").on(table.active),
+  ],
+).enableRLS();
+
+export type Discount = typeof discounts.$inferSelect;
+export type NewDiscount = typeof discounts.$inferInsert;
+
+/**
+ * A discount actually applied to an order (from the catalog, or ad-hoc), plus
+ * its 3-layer approval state. `amount` is the computed peso reduction, snapshot
+ * at apply time (never recomputed off a later-edited catalog row). Only
+ * APPROVED rows reduce the order's effective total (see service.ts).
+ */
+export const orderDiscounts = pgTable(
+  "order_discount",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orderId: uuid("order_id")
+      .notNull()
+      .references(() => orders.id),
+    discountId: uuid("discount_id").references(() => discounts.id),
+    type: discountTypeEnum("type").notNull(),
+    label: text("label").notNull(),
+    amount: numeric("amount", { precision: 14, scale: 2 }).notNull(),
+    approvalLevel: approvalLevelEnum("approval_level").notNull(),
+    status: orderDiscountStatusEnum("status").notNull().default("PENDING"),
+    reason: text("reason"),
+    // Senior/PWD ID capture (statutory requirement — rejected without it).
+    idNote: text("id_note"),
+    requestedBy: uuid("requested_by")
+      .notNull()
+      .references(() => users.id),
+    approvedBy: uuid("approved_by").references(() => users.id),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("order_discount_order_id_idx").on(table.orderId),
+    index("order_discount_status_idx").on(table.status),
+    index("order_discount_discount_id_idx").on(table.discountId),
+  ],
+).enableRLS();
+
+export type OrderDiscount = typeof orderDiscounts.$inferSelect;
+export type NewOrderDiscount = typeof orderDiscounts.$inferInsert;

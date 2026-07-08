@@ -5,6 +5,7 @@ import type { DB } from "./client.js";
 import { runMigrations } from "./migrate.js";
 import { hashPassword } from "../modules/auth/service.js";
 import { seedRolePageAccess } from "../modules/admin/routes.js";
+import { seedDefaultDiscounts } from "../modules/discounts/routes.js";
 import {
   departmentEnum,
   employees,
@@ -196,6 +197,15 @@ export async function seed(db: DB): Promise<SeededUser[]> {
 
   // --- role_page_access matrix (idempotent; preserves later admin edits) ------
   await seedRolePageAccess(db);
+
+  // --- default discount catalog: Senior Citizen + PWD (idempotent) -----------
+  const [ownerUser] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, ADMIN_CREDENTIAL.email));
+  if (ownerUser) {
+    await seedDefaultDiscounts(db, ownerUser.id);
+  }
 
   return seededCreds;
 }

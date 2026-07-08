@@ -14,6 +14,7 @@
  *   POST   /admin/users/:id/unblock         — unblock (fresh login required)
  *   PUT    /admin/users/:id/outlets         — replace outlet access rows
  *   GET    /admin/users/:id/activity        — that user's recent audit rows
+ *   GET    /admin/users/:id/performance     — activity summary + outlet comparison (client point 8)
  *   GET    /admin/rbac                       — full role→page matrix
  *   PUT    /admin/rbac                       — upsert matrix entries
  *
@@ -23,12 +24,14 @@
  * normalize to OWNER) are counted too.
  */
 import { Router } from "express";
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull, lte, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
   auditLogs,
+  brands,
   locations,
+  orders,
   rolePageAccess,
   userBrands,
   userOutletAccess,
@@ -83,6 +86,35 @@ const rbacPutSchema = z
     }),
   )
   .min(1);
+
+const performanceQuerySchema = z.object({
+  from: z.string().optional(),
+  to: z.string().optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Performance report date-range resolution (mirrors reports/routes.ts
+// currentMonthRange/resolveRange — same "default to current UTC calendar
+// month" convention, reimplemented locally since that module isn't exported
+// for reuse and this route only touches src/modules/admin/*).
+// ---------------------------------------------------------------------------
+
+function currentMonthRange(): { from: Date; to: Date } {
+  const now = new Date();
+  const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
+  const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+  return { from, to };
+}
+
+/** Resolves { from, to } from optional query strings; null means invalid/unparseable/inverted. */
+function resolvePerformanceRange(from: string | undefined, to: string | undefined): { from: Date; to: Date } | null {
+  const defaults = currentMonthRange();
+  const fromDate = from ? new Date(from) : defaults.from;
+  const toDate = to ? new Date(to) : defaults.to;
+  if (Number.isNaN(fromDate.getTime()) || Number.isNaN(toDate.getTime())) return null;
+  if (fromDate.getTime() > toDate.getTime()) return null;
+  return { from: fromDate, to: toDate };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -477,6 +509,123 @@ export function createAdminRouter(db: DB): Router {
       .orderBy(desc(auditLogs.createdAt))
       .limit(200);
     res.json(rows);
+  });
+
+  // ── GET /admin/users/:id/performance ──────────────────────────────────────
+  //
+  // Client point 8: "reports about [a user's] accomplishment and done compared
+  // to that outlet's performance." Summarizes one user's audited activity over
+  // a date range (default current month) alongside the order volume/revenue of
+  // the outlet(s) they're scoped to (userOutletAccess), so an OWNER can see a
+  // user's output next to the outlet total it happened inside.
+  router.get("/admin/users/:id/performance", async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const parsedQuery = performanceQuerySchema.safeParse(req.query);
+    if (!parsedQuery.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid query parameters.", parsedQuery.error.issues);
+      return;
+    }
+
+    const [target] = await db.select({ id: users.id, name: users.name, role: users.role }).from(users).where(eq(users.id, id));
+    if (!target) {
+      sendError(res, 404, "NOT_FOUND", "User not found.");
+      return;
+    }
+
+    const range = resolvePerformanceRange(parsedQuery.data.from, parsedQuery.data.to);
+    if (!range) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid 'from'/'to' date, or 'from' after 'to'.");
+      return;
+    }
+    const { from, to } = range;
+
+    // Single query drives both `activity` (raw audit rows) and the
+    // `ordersHandled` proxy below — no need to hit auditLogs twice.
+    const activityRows = await db
+      .select({ action: auditLogs.action, entityType: auditLogs.entityType, entityId: auditLogs.entityId })
+      .from(auditLogs)
+      .where(and(eq(auditLogs.actorUserId, id), gte(auditLogs.createdAt, from), lte(auditLogs.createdAt, to)));
+
+    const byActionMap = new Map<string, number>();
+    const advancedOrderIds = new Set<string>();
+    for (const row of activityRows) {
+      byActionMap.set(row.action, (byActionMap.get(row.action) ?? 0) + 1);
+
+      // PROXY METRIC (documented, not fabricated): there is no first-class
+      // "orders handled by user" fact anywhere in the schema. The closest
+      // honest signal is the audit trail of `order.advance` actions (see
+      // orders/routes.ts POST /orders/:id/advance), written once per stage
+      // transition (NEW→PREPARING→READY→COMPLETED) with the acting user as
+      // `actorUserId`. We count DISTINCT order ids, not raw action rows, so
+      // an order this user pushed through two stages counts once — matching
+      // "orders ... handled" rather than "handling actions taken". This does
+      // NOT include `order.cancel` (a materially different outcome) and will
+      // undercount any handling that never called /advance (e.g. an order
+      // fully driven by the simulator).
+      if (row.action === "order.advance" && row.entityType === "order" && row.entityId) {
+        advancedOrderIds.add(row.entityId);
+      }
+    }
+    const byAction = [...byActionMap.entries()]
+      .map(([action, count]) => ({ action, count }))
+      .sort((a, b) => b.count - a.count);
+
+    // Outlet scope: userOutletAccess is the source of truth for WHERE a user
+    // may act (D22/D31). HQ/ALL-scope roles (OWNER, HR, ACCOUNTING,
+    // WAREHOUSE_MAIN) may legitimately have zero rows here — reported as 0
+    // orders/revenue rather than guessing "every outlet".
+    const accessRows = await db
+      .select({ locationId: userOutletAccess.locationId })
+      .from(userOutletAccess)
+      .where(eq(userOutletAccess.userId, id));
+    const locationIds = accessRows.map((r) => r.locationId);
+
+    let outletOrders = 0;
+    let outletRevenue = 0;
+    if (locationIds.length > 0) {
+      // Mirrors reports/service.ts's money convention (order.total, exact
+      // numeric revenue field) but intentionally does NOT restrict to
+      // COMPLETED-only like the sales report does — "outlet performance" here
+      // means all real order volume/revenue in range, CANCELLED excluded per
+      // the spec (never-realized orders shouldn't count toward performance).
+      const [agg] = await db
+        .select({
+          ordersCount: sql<number>`count(${orders.id})`.mapWith(Number),
+          revenue: sql<number>`coalesce(sum(${orders.total}::numeric), 0)`.mapWith(Number),
+        })
+        .from(orders)
+        .innerJoin(brands, eq(brands.id, orders.brandId))
+        .where(
+          and(
+            inArray(brands.locationId, locationIds),
+            ne(orders.status, "CANCELLED"),
+            gte(orders.placedAt, from),
+            lte(orders.placedAt, to),
+          ),
+        );
+      outletOrders = agg?.ordersCount ?? 0;
+      outletRevenue = Math.round((agg?.revenue ?? 0) * 100) / 100;
+    }
+
+    await audit(db, {
+      actorUserId: req.user!.id,
+      actorName: req.user!.name,
+      sessionId: req.user!.sessionId ?? null,
+      action: "admin.user.view_performance",
+      description: `Viewed performance report for user ${id}`,
+      entityType: "user",
+      entityId: id,
+      metadata: { from: from.toISOString(), to: to.toISOString() },
+    });
+
+    res.json({
+      user: { id: target.id, name: target.name, role: target.role },
+      period: { from: from.toISOString(), to: to.toISOString() },
+      activity: { total: activityRows.length, byAction },
+      ordersHandled: advancedOrderIds.size,
+      outlet: { locationIds, orders: outletOrders, revenue: outletRevenue },
+    });
   });
 
   // ── GET /admin/rbac ───────────────────────────────────────────────────────

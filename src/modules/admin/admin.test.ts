@@ -4,7 +4,15 @@ import type { Express } from "express";
 import { createApp } from "../../app.js";
 import { createDb, type DB } from "../../db/client.js";
 import { runMigrations } from "../../db/migrate.js";
-import { locations, users } from "../../db/schema.js";
+import {
+  aggregatorAccounts,
+  auditLogs,
+  brands,
+  locations,
+  orders,
+  userOutletAccess,
+  users,
+} from "../../db/schema.js";
 import { hashPassword } from "../auth/service.js";
 import { seedRolePageAccess } from "./routes.js";
 
@@ -293,5 +301,165 @@ describe("RBAC role→page matrix", () => {
       .send([{ role: "OWNER", pageKey: "/users", allowed: false }]);
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe("OWNER_LOCKED");
+  });
+});
+
+describe("GET /admin/users/:id/performance (client point 8)", () => {
+  let ownerToken: string;
+  // A self-contained data island (its own outlet, brand, listing, performer +
+  // seeded audit/order rows) so this block is independent of the mutations the
+  // earlier describe blocks make to the shared db.
+  let performerId: string;
+  let perfOutletId: string;
+  let orderA: string;
+  let orderB: string;
+
+  beforeAll(async () => {
+    ownerToken = await login(ADMIN_EMAIL, ADMIN_PASSWORD);
+
+    // Outlet the performer is scoped to (via userOutletAccess).
+    const [outlet] = await db
+      .insert(locations)
+      .values({ code: "PERF1", name: "Performance Test Outlet", status: "ACTIVE", timezone: "Asia/Manila" })
+      .returning();
+    perfOutletId = outlet.id;
+
+    // A DIFFERENT outlet the performer is NOT scoped to — its orders must be excluded.
+    const [otherOutlet] = await db
+      .insert(locations)
+      .values({ code: "PERF2", name: "Other Outlet", status: "ACTIVE", timezone: "Asia/Manila" })
+      .returning();
+
+    const [brand] = await db
+      .insert(brands)
+      .values({ locationId: perfOutletId, name: "Perf Brand", color: "#111111", salesPerfId: "SP-PERF" })
+      .returning();
+    const [otherBrand] = await db
+      .insert(brands)
+      .values({ locationId: otherOutlet.id, name: "Other Brand", color: "#222222", salesPerfId: "SP-OTHER" })
+      .returning();
+
+    const [account] = await db
+      .insert(aggregatorAccounts)
+      .values({ brandId: brand.id, aggregator: "FOODPANDA", externalMerchantId: "perf-merchant" })
+      .returning();
+    const [otherAccount] = await db
+      .insert(aggregatorAccounts)
+      .values({ brandId: otherBrand.id, aggregator: "FOODPANDA", externalMerchantId: "other-merchant" })
+      .returning();
+
+    // The performer (direct insert; role KITCHEN_CREW) + outlet access grant.
+    const [performer] = await db
+      .insert(users)
+      .values({
+        name: "Performer",
+        email: "performer@cloudkitchen.local",
+        passwordHash: await hashPassword("performer-password"),
+        role: "KITCHEN_CREW",
+      })
+      .returning();
+    performerId = performer.id;
+    await db.insert(userOutletAccess).values({ userId: performerId, locationId: perfOutletId });
+
+    // Orders at the performer's outlet: 3 realized (100.00 + 200.50 + 50.00 =
+    // 350.50, orders=3) + 1 CANCELLED (999.00, must be excluded).
+    const mkOrder = async (
+      brandRef: string,
+      accountId: string,
+      total: string,
+      status: "NEW" | "COMPLETED" | "CANCELLED",
+    ) => {
+      const [o] = await db
+        .insert(orders)
+        .values({
+          brandId: brandRef,
+          aggregatorAccountId: accountId,
+          aggregator: "FOODPANDA",
+          externalRef: `perf-${Math.random().toString(36).slice(2)}`,
+          status,
+          total,
+          ...(status === "CANCELLED" ? { cancelReason: "test" } : {}),
+        })
+        .returning();
+      return o.id;
+    };
+    orderA = await mkOrder(brand.id, account.id, "100.00", "COMPLETED");
+    orderB = await mkOrder(brand.id, account.id, "200.50", "NEW");
+    await mkOrder(brand.id, account.id, "50.00", "COMPLETED");
+    await mkOrder(brand.id, account.id, "999.00", "CANCELLED");
+    // Order at the OTHER outlet (out of scope, via otherBrand) — must not be counted.
+    await mkOrder(otherBrand.id, otherAccount.id, "500.00", "COMPLETED");
+
+    // Audit rows authored by the performer:
+    //   order.advance x3 but only 2 DISTINCT order ids (orderA twice, orderB once)
+    //   order.cancel  x1 (NOT counted as "handled")
+    //   admin.user.update x1 (unrelated action)
+    await db.insert(auditLogs).values([
+      { actorUserId: performerId, action: "order.advance", entityType: "order", entityId: orderA },
+      { actorUserId: performerId, action: "order.advance", entityType: "order", entityId: orderA },
+      { actorUserId: performerId, action: "order.advance", entityType: "order", entityId: orderB },
+      { actorUserId: performerId, action: "order.cancel", entityType: "order", entityId: orderA },
+      { actorUserId: performerId, action: "admin.user.update", entityType: "user", entityId: performerId },
+    ]);
+  });
+
+  it("returns activity byAction counts that match seeded audit rows", async () => {
+    const res = await request(app)
+      .get(`/api/v1/admin/users/${performerId}/performance`)
+      .set("Authorization", `Bearer ${ownerToken}`);
+    expect(res.status).toBe(200);
+
+    expect(res.body.user.id).toBe(performerId);
+    expect(res.body.activity.total).toBe(5);
+    const counts = Object.fromEntries(
+      res.body.activity.byAction.map((r: { action: string; count: number }) => [r.action, r.count]),
+    );
+    expect(counts["order.advance"]).toBe(3);
+    expect(counts["order.cancel"]).toBe(1);
+    expect(counts["admin.user.update"]).toBe(1);
+    // byAction is sorted by count desc → the busiest action leads.
+    expect(res.body.activity.byAction[0].action).toBe("order.advance");
+  });
+
+  it("counts ordersHandled as DISTINCT order.advance ids (2, not 3)", async () => {
+    const res = await request(app)
+      .get(`/api/v1/admin/users/${performerId}/performance`)
+      .set("Authorization", `Bearer ${ownerToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.ordersHandled).toBe(2);
+  });
+
+  it("outlet orders/revenue exclude CANCELLED and out-of-scope outlets", async () => {
+    const res = await request(app)
+      .get(`/api/v1/admin/users/${performerId}/performance`)
+      .set("Authorization", `Bearer ${ownerToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.outlet.locationIds).toEqual([perfOutletId]);
+    // 3 realized orders (100.00 + 200.50 + 50.00); the 999.00 CANCELLED and the
+    // 500.00 order at the other outlet are both excluded.
+    expect(res.body.outlet.orders).toBe(3);
+    expect(res.body.outlet.revenue).toBe(350.5);
+  });
+
+  it("returns 404 for an unknown user id", async () => {
+    const res = await request(app)
+      .get(`/api/v1/admin/users/00000000-0000-0000-0000-000000000000/performance`)
+      .set("Authorization", `Bearer ${ownerToken}`);
+    expect(res.status).toBe(404);
+  });
+
+  it("rejects a non-OWNER caller with 403", async () => {
+    const create = await request(app)
+      .post("/api/v1/admin/users")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ name: "Perf Crew", email: "perf-crew@cloudkitchen.local", role: "KITCHEN_CREW", password: "perf-crew-pass" });
+    expect(create.status).toBe(201);
+    const crewToken = await login("perf-crew@cloudkitchen.local", "perf-crew-pass");
+
+    const forbidden = await request(app)
+      .get(`/api/v1/admin/users/${performerId}/performance`)
+      .set("Authorization", `Bearer ${crewToken}`);
+    expect(forbidden.status).toBe(403);
+    expect(forbidden.body.error.code).toBe("FORBIDDEN");
   });
 });

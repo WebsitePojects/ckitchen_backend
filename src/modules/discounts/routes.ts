@@ -355,6 +355,14 @@ export function createDiscountsRouter(db: DB): Router {
       sendError(res, 404, "NOT_FOUND", "Order not found.");
       return;
     }
+    // A cancelled order is finalized-void — it must never accrue new discounts
+    // (found in falsification review 2026-07-08). COMPLETED is intentionally
+    // still allowed: a senior/PWD discount is often captured at payment, which
+    // can land after the order is marked COMPLETED.
+    if (order.status === "CANCELLED") {
+      sendError(res, 409, "CONFLICT", "Cannot apply a discount to a cancelled order.");
+      return;
+    }
 
     let type: DiscountType;
     let value: number;

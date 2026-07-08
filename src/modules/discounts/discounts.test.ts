@@ -4,7 +4,8 @@ import type { Express } from "express";
 import { createApp } from "../../app.js";
 import { createDb, type DB } from "../../db/client.js";
 import { runMigrations } from "../../db/migrate.js";
-import { aggregatorAccounts, brands, locations, orders, users } from "../../db/schema.js";
+import { eq } from "drizzle-orm";
+import { aggregatorAccounts, brands, locations, orders, userOutletAccess, users } from "../../db/schema.js";
 import { hashPassword } from "../auth/service.js";
 
 let app: Express;
@@ -16,11 +17,13 @@ let ownerToken: string;
 let outletManagerToken: string;
 let brandManagerToken: string;
 let kitchenCrewToken: string;
+let otherMgrToken: string;
 
 const OWNER_CRED = { email: "owner@discounts.local", password: "owner-password" };
 const OUTLET_MANAGER_CRED = { email: "outlet-mgr@discounts.local", password: "outlet-password" };
 const BRAND_MANAGER_CRED = { email: "brand-mgr@discounts.local", password: "brand-password" };
 const KITCHEN_CREW_CRED = { email: "crew@discounts.local", password: "crew-password" };
+const OTHER_MGR_CRED = { email: "other-mgr@discounts.local", password: "other-password" };
 
 async function login(email: string, password: string): Promise<string> {
   const res = await request(app).post("/api/v1/auth/login").send({ email, password });
@@ -94,12 +97,33 @@ beforeAll(async () => {
     },
   ]);
 
+  // Grant the primary Outlet Manager access to the test outlet (so, after the
+  // F3 outlet-scoping, they CAN approve this outlet's discounts).
+  const [omUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, OUTLET_MANAGER_CRED.email));
+  await db.insert(userOutletAccess).values({ userId: omUser.id, locationId: location.id });
+
+  // A SECOND outlet + a manager with access ONLY to it — used to prove the F3
+  // block: they must NOT be able to approve the FIRST outlet's discounts.
+  const [location2] = await db
+    .insert(locations)
+    .values({ code: "DISC2", name: "Other Outlet", status: "ACTIVE", timezone: "Asia/Manila" })
+    .returning();
+  await db.insert(users).values({
+    name: "Other Manager",
+    email: OTHER_MGR_CRED.email,
+    passwordHash: await hashPassword(OTHER_MGR_CRED.password),
+    role: "OUTLET_MANAGER",
+  });
+  const [om2] = await db.select({ id: users.id }).from(users).where(eq(users.email, OTHER_MGR_CRED.email));
+  await db.insert(userOutletAccess).values({ userId: om2.id, locationId: location2.id });
+
   app = createApp(db);
 
   ownerToken = await login(OWNER_CRED.email, OWNER_CRED.password);
   outletManagerToken = await login(OUTLET_MANAGER_CRED.email, OUTLET_MANAGER_CRED.password);
   brandManagerToken = await login(BRAND_MANAGER_CRED.email, BRAND_MANAGER_CRED.password);
   kitchenCrewToken = await login(KITCHEN_CREW_CRED.email, KITCHEN_CREW_CRED.password);
+  otherMgrToken = await login(OTHER_MGR_CRED.email, OTHER_MGR_CRED.password);
 });
 
 describe("Discount catalog", () => {
@@ -215,6 +239,28 @@ describe("Apply discount — approval routing + effective_total", () => {
     expect(approved.status).toBe(200);
     expect(approved.body.status).toBe("APPROVED");
     expect(approved.body.effective_total).toBe("900.00");
+  });
+
+  it("F3: an OUTLET_MANAGER cannot see or approve a discount for an outlet outside their access (403)", async () => {
+    const orderId = await createOrder("1000.00");
+    const applyRes = await request(app)
+      .post(`/api/v1/orders/${orderId}/discounts`)
+      .set("Authorization", `Bearer ${kitchenCrewToken}`)
+      .send({ type: "PERCENT", value: 10, label: "Cross-outlet", reason: "tenancy test" });
+    const pendingId = applyRes.body.id as string;
+
+    // `otherMgr` is scoped to the SECOND outlet only — this order is in the first.
+    const approve = await request(app)
+      .post(`/api/v1/order-discounts/${pendingId}/approve`)
+      .set("Authorization", `Bearer ${otherMgrToken}`);
+    expect(approve.status).toBe(403);
+
+    // ...and the request never appears in their approvals queue.
+    const queue = await request(app)
+      .get("/api/v1/discounts/approvals?status=PENDING")
+      .set("Authorization", `Bearer ${otherMgrToken}`);
+    expect(queue.status).toBe(200);
+    expect(queue.body.some((r: { id: string }) => r.id === pendingId)).toBe(false);
   });
 
   it("SENIOR discount without id_note is rejected (400)", async () => {

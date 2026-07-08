@@ -24,7 +24,7 @@
  *       otherwise                                                 → ADMIN       (needs OWNER)
  */
 import { Router } from "express";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -120,6 +120,27 @@ function canDecide(level: ApprovalLevel, role: string | null | undefined): boole
   return norm === "OWNER" || norm === "OUTLET_MANAGER";
 }
 
+/**
+ * F3 fix — the set of order ids the caller may act on, by tenancy scope:
+ * `null` = ALL-scope (no restriction); otherwise the order ids whose outlet
+ * (order → brand.location_id) is in the caller's `outletIds`. Used to
+ * outlet-scope the approvals queue + decisions so an ASSIGNED-scope
+ * OUTLET_MANAGER can't see or approve another outlet's discounts.
+ */
+async function ordersInScope(
+  db: DB,
+  user: { outletScope: string; outletIds: string[] },
+): Promise<string[] | null> {
+  if (user.outletScope === "ALL") return null;
+  const outletIds = user.outletIds ?? [];
+  if (outletIds.length === 0) return [];
+  const brandRows = await db.select({ id: brands.id }).from(brands).where(inArray(brands.locationId, outletIds));
+  const brandIds = brandRows.map((b) => b.id);
+  if (brandIds.length === 0) return [];
+  const orderRows = await db.select({ id: orders.id }).from(orders).where(inArray(orders.brandId, brandIds));
+  return orderRows.map((o) => o.id);
+}
+
 interface OrderTotals {
   subtotal: string;
   discount_total: string;
@@ -207,7 +228,20 @@ export function createDiscountsRouter(db: DB): Router {
       return;
     }
     const status = statusParam as (typeof orderDiscounts.$inferSelect)["status"];
-    const rows = await db.select().from(orderDiscounts).where(eq(orderDiscounts.status, status));
+    // F3: outlet-scope the queue — an ASSIGNED approver only sees their own
+    // outlets' requests (ALL-scope owners see everything).
+    const scopeIds = await ordersInScope(db, req.user!);
+    let rows: (typeof orderDiscounts.$inferSelect)[];
+    if (scopeIds === null) {
+      rows = await db.select().from(orderDiscounts).where(eq(orderDiscounts.status, status));
+    } else if (scopeIds.length === 0) {
+      rows = [];
+    } else {
+      rows = await db
+        .select()
+        .from(orderDiscounts)
+        .where(and(eq(orderDiscounts.status, status), inArray(orderDiscounts.orderId, scopeIds)));
+    }
     res.json(rows);
   });
 
@@ -469,6 +503,13 @@ export function createDiscountsRouter(db: DB): Router {
       }
       if (!canDecide(row.approvalLevel, req.user!.role)) {
         sendError(res, 403, "FORBIDDEN", `Role not permitted to ${action} a ${row.approvalLevel}-level discount.`);
+        return;
+      }
+      // F3: even a permitted role may only decide discounts for orders in their
+      // own outlet scope (ALL-scope owners pass; ASSIGNED managers are pinned).
+      const scopeIds = await ordersInScope(db, req.user!);
+      if (scopeIds !== null && !scopeIds.includes(row.orderId)) {
+        sendError(res, 403, "FORBIDDEN", "This discount belongs to an outlet outside your access scope.");
         return;
       }
 

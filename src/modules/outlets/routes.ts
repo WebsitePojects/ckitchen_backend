@@ -2,13 +2,15 @@ import { Router } from "express";
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { locationStatusEnum, locations, warehouses } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { brandOutlet, brands, locationStatusEnum, locations, warehouses } from "../../db/schema.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { isOutletInScope } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 
 const WRITE_ROLES = ["OWNER"] as const;
 
 const outletStatusValues = locationStatusEnum.enumValues;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const createOutletSchema = z.object({
   code: z.string().min(1).max(32),
@@ -68,6 +70,82 @@ export function createOutletsRouter(db: DB): Router {
     }
 
     res.json(await withWarehouses(db, outlet));
+  });
+
+  // ── GET /outlets/:id/brands ────────────────────────────────────────────────
+  // Outlet-side deployment read (D30): the brands operating at this outlet.
+  // Union of:
+  //   (a) "home" brands — brand.location_id = this outlet. home:true,
+  //       isActive:null, deployedAt:null (a home brand's own deployment is
+  //       not a removable brand_outlet entry from this endpoint's view).
+  //   (b) brand_outlet rows for this outlet (active + inactive) whose brand is
+  //       NOT already covered by (a) — home:false, with the real isActive/
+  //       createdAt of the deployment.
+  // Batched: outlet lookup + 2 parallel queries — no N+1.
+  router.get("/outlets/:id/brands", requireAuth, resolveOutletContext, async (req, res) => {
+    const id = paramAsString(req.params.id);
+    if (!UUID_RE.test(id)) {
+      sendError(res, 400, "VALIDATION_ERROR", "Outlet id must be a valid UUID.");
+      return;
+    }
+
+    const [outlet] = await db.select({ id: locations.id }).from(locations).where(eq(locations.id, id));
+    if (!outlet) {
+      sendError(res, 404, "NOT_FOUND", "Outlet not found.");
+      return;
+    }
+
+    if (!isOutletInScope(req.outletContext, id)) {
+      sendError(res, 403, "FORBIDDEN", "Outlet is outside your access scope.");
+      return;
+    }
+
+    const [homeBrands, deployments] = await Promise.all([
+      db
+        .select({ id: brands.id, name: brands.name, color: brands.color })
+        .from(brands)
+        .where(eq(brands.locationId, id)),
+      db
+        .select({
+          brandId: brandOutlet.brandId,
+          isActive: brandOutlet.isActive,
+          createdAt: brandOutlet.createdAt,
+          name: brands.name,
+          color: brands.color,
+        })
+        .from(brandOutlet)
+        .innerJoin(brands, eq(brandOutlet.brandId, brands.id))
+        .where(eq(brandOutlet.locationId, id)),
+    ]);
+
+    const seen = new Set<string>();
+    const result: Array<{
+      brandId: string;
+      name: string;
+      color: string;
+      home: boolean;
+      isActive: boolean | null;
+      deployedAt: string | null;
+    }> = [];
+
+    for (const b of homeBrands) {
+      result.push({ brandId: b.id, name: b.name, color: b.color, home: true, isActive: null, deployedAt: null });
+      seen.add(b.id);
+    }
+    for (const d of deployments) {
+      if (seen.has(d.brandId)) continue; // already represented as a home brand
+      result.push({
+        brandId: d.brandId,
+        name: d.name,
+        color: d.color,
+        home: false,
+        isActive: d.isActive,
+        deployedAt: d.createdAt.toISOString(),
+      });
+      seen.add(d.brandId);
+    }
+
+    res.json(result);
   });
 
   router.post("/outlets", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {

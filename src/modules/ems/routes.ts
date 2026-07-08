@@ -2,9 +2,9 @@
  * EMS Routes — CK1-EMS-005 (E1 + E2-core + E3 attendance/DTR)
  *
  * Endpoints:
- *   GET  /employees                          — list (filter status/department)
- *   POST /employees                          — create (SUPER_ADMIN)
- *   PATCH /employees/:id                     — partial update (SUPER_ADMIN)
+ *   GET  /employees                          — list (filter status/department/location_id)
+ *   POST /employees                          — create (OWNER, or OUTLET_MANAGER scoped to their outlet)
+ *   PATCH /employees/:id                     — partial update (OWNER, or OUTLET_MANAGER scoped to their outlet)
  *   GET  /employees/:id/profile              — Employee 360 month calendar + stats
  *   GET  /audit                              — audit trail (SUPER_ADMIN/BRAND_MANAGER)
  *   GET  /ems/analytics/employee/:userId     — per-staff analytics (self or admin)
@@ -14,8 +14,8 @@
  *   GET  /ems/attendance                     — list (SUPER_ADMIN: all; others: need employee_id)
  *   GET  /ems/attendance/dtr                 — paired DTR view with worked_minutes
  */
-import { Router } from "express";
-import { and, asc, count, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { Router, type Request, type Response } from "express";
+import { and, asc, count, desc, eq, gte, inArray, lte, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -25,10 +25,12 @@ import {
   departmentEnum,
   employeeStatusEnum,
   employees,
+  locations,
   userSessions,
   users,
 } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { isOutletInScope, listScopeLocationIds, resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { normalizeRole } from "../auth/roles.js";
 import { sendError } from "../http-errors.js";
 import { pairDtrEntries, recordAttendancePunch, type DtrEntry } from "./attendance-shared.js";
@@ -89,6 +91,10 @@ function serializeEmployee(row: typeof employees.$inferSelect) {
 const workDaysInput = z.array(z.enum(WORK_DAY_TOKENS)).min(1);
 const hiredAtInput = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "hired_at must be YYYY-MM-DD").nullable();
 
+// Per-outlet employee assignment (client 2026-07-09): NULL clears / stays
+// unassigned; omitted leaves the current assignment untouched (PATCH only).
+const locationIdInput = z.string().uuid().nullable();
+
 const createEmployeeSchema = z.object({
   user_id: z.string().uuid().optional(),
   employee_no: z.string().min(1),
@@ -99,6 +105,7 @@ const createEmployeeSchema = z.object({
   status: z.enum(employeeStatusEnum.enumValues).optional(),
   work_days: workDaysInput.optional(),
   hired_at: hiredAtInput.optional(),
+  location_id: locationIdInput.optional(),
 });
 
 // PATCH: every field optional (partial update). Unknown keys from old clients are
@@ -112,7 +119,15 @@ const updateEmployeeSchema = z.object({
   status: z.enum(employeeStatusEnum.enumValues).optional(),
   work_days: workDaysInput.optional(),
   hired_at: hiredAtInput.optional(),
+  location_id: locationIdInput.optional(),
 });
+
+/**
+ * Roles allowed to create/edit employee rows. OWNER (HQ) is unrestricted;
+ * OUTLET_MANAGER is ASSIGNED-scope and may only target outlets in their
+ * `user_outlet_access` membership (enforced via {@link isOutletInScope} below).
+ */
+const EMPLOYEE_WRITE_ROLES = ["OWNER", "OUTLET_MANAGER"] as const;
 
 const createAttendanceSchema = z.object({
   employee_id: z.string().uuid(),
@@ -128,10 +143,39 @@ const createAttendanceSchema = z.object({
 export function createEmsRouter(db: DB): Router {
   const router = Router();
 
+  async function resolveReadableEmployee(req: Request, res: Response, employeeId: string, invalidStatus: 400 | 404) {
+    if (!UUID_RE.test(employeeId)) {
+      sendError(
+        res,
+        invalidStatus,
+        invalidStatus === 400 ? "VALIDATION_ERROR" : "NOT_FOUND",
+        invalidStatus === 400 ? "employee_id must be a valid UUID." : `Employee ${employeeId} not found.`,
+      );
+      return null;
+    }
+
+    const [emp] = await db
+      .select({ id: employees.id, locationId: employees.locationId })
+      .from(employees)
+      .where(eq(employees.id, employeeId));
+    if (!emp) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${employeeId} not found.`);
+      return null;
+    }
+
+    if (req.outletContext?.scope !== "ALL" && !isOutletInScope(req.outletContext, emp.locationId)) {
+      sendError(res, 403, "FORBIDDEN", "Employee is outside your access scope.");
+      return null;
+    }
+
+    return emp;
+  }
+
   // ── GET /employees ────────────────────────────────────────────────────────
-  router.get("/employees", requireAuth, async (req, res) => {
+  router.get("/employees", requireAuth, resolveOutletContext, async (req, res) => {
     const statusParam = req.query.status as string | undefined;
     const departmentParam = req.query.department as string | undefined;
+    const locationIdParam = req.query.location_id as string | undefined;
 
     if (statusParam && !(employeeStatusEnum.enumValues as readonly string[]).includes(statusParam)) {
       sendError(res, 400, "VALIDATION_ERROR", `Invalid status. Valid: ${employeeStatusEnum.enumValues.join(", ")}.`);
@@ -141,8 +185,28 @@ export function createEmsRouter(db: DB): Router {
       sendError(res, 400, "VALIDATION_ERROR", `Invalid department. Valid: ${departmentEnum.enumValues.join(", ")}.`);
       return;
     }
+    if (locationIdParam !== undefined && !UUID_RE.test(locationIdParam)) {
+      sendError(res, 400, "VALIDATION_ERROR", "location_id must be a valid UUID.");
+      return;
+    }
 
-    const conditions: ReturnType<typeof eq>[] = [];
+    const conditions: SQL[] = [];
+    if (locationIdParam !== undefined) {
+      if (!isOutletInScope(req.outletContext, locationIdParam)) {
+        sendError(res, 403, "FORBIDDEN", "Outlet is outside your access scope.");
+        return;
+      }
+      conditions.push(eq(employees.locationId, locationIdParam));
+    } else {
+      const scopeLocs = listScopeLocationIds(req.outletContext);
+      if (scopeLocs !== null) {
+        if (scopeLocs.length === 0) {
+          res.json([]);
+          return;
+        }
+        conditions.push(inArray(employees.locationId, scopeLocs));
+      }
+    }
     if (statusParam) conditions.push(eq(employees.status, statusParam as typeof employeeStatusEnum.enumValues[number]));
     if (departmentParam) conditions.push(eq(employees.department, departmentParam as typeof departmentEnum.enumValues[number]));
 
@@ -154,78 +218,137 @@ export function createEmsRouter(db: DB): Router {
   });
 
   // ── POST /employees ───────────────────────────────────────────────────────
-  router.post("/employees", requireAuth, requireRole("OWNER"), async (req, res) => {
-    const parsed = createEmployeeSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
-      return;
-    }
-
-    // Validate referenced user exists when user_id is provided
-    if (parsed.data.user_id) {
-      const [usr] = await db.select({ id: users.id }).from(users).where(eq(users.id, parsed.data.user_id));
-      if (!usr) {
-        sendError(res, 404, "NOT_FOUND", `User ${parsed.data.user_id} not found.`);
+  // OWNER (HQ, unrestricted) or OUTLET_MANAGER (ASSIGNED — may only target an
+  // outlet in their own user_outlet_access membership; see resolveOutletContext
+  // + isOutletInScope). Omitting location_id is unaffected by the scope check.
+  router.post(
+    "/employees",
+    requireAuth,
+    requireRole(...EMPLOYEE_WRITE_ROLES),
+    resolveOutletContext,
+    async (req, res) => {
+      const parsed = createEmployeeSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
         return;
       }
-    }
 
-    const [employee] = await db
-      .insert(employees)
-      .values({
-        userId: parsed.data.user_id ?? null,
-        employeeNo: parsed.data.employee_no,
-        fullName: parsed.data.full_name,
-        department: parsed.data.department,
-        position: parsed.data.position ?? null,
-        photoUrl: parsed.data.photo_url ?? null,
-        status: parsed.data.status ?? "ACTIVE",
-        // Omit work_days when not supplied so the DB column default (the 5-day
-        // week) applies; store the canonical CSV when supplied.
-        ...(parsed.data.work_days ? { workDays: canonicalWorkDaysCsv(parsed.data.work_days) } : {}),
-        hiredAt: parsed.data.hired_at ?? null,
-      })
-      .returning();
+      // Validate referenced user exists when user_id is provided
+      if (parsed.data.user_id) {
+        const [usr] = await db.select({ id: users.id }).from(users).where(eq(users.id, parsed.data.user_id));
+        if (!usr) {
+          sendError(res, 404, "NOT_FOUND", `User ${parsed.data.user_id} not found.`);
+          return;
+        }
+      }
 
-    res.status(201).json(serializeEmployee(employee!));
-  });
+      const hasLocationId = Object.prototype.hasOwnProperty.call(parsed.data, "location_id");
+      let locationId = parsed.data.location_id ?? null;
+      if (parsed.data.location_id === null && req.outletContext?.scope !== "ALL") {
+        sendError(res, 403, "FORBIDDEN", "Cannot create an unassigned employee outside HQ scope.");
+        return;
+      }
+      if (parsed.data.location_id !== null && (hasLocationId || req.outletContext?.scope !== "ALL")) {
+        locationId = await resolveRequestLocationId(db, req, res, parsed.data.location_id);
+        if (!locationId) return;
+      }
+
+      const [employee] = await db
+        .insert(employees)
+        .values({
+          userId: parsed.data.user_id ?? null,
+          employeeNo: parsed.data.employee_no,
+          fullName: parsed.data.full_name,
+          department: parsed.data.department,
+          position: parsed.data.position ?? null,
+          photoUrl: parsed.data.photo_url ?? null,
+          status: parsed.data.status ?? "ACTIVE",
+          // Omit work_days when not supplied so the DB column default (the 5-day
+          // week) applies; store the canonical CSV when supplied.
+          ...(parsed.data.work_days ? { workDays: canonicalWorkDaysCsv(parsed.data.work_days) } : {}),
+          hiredAt: parsed.data.hired_at ?? null,
+          locationId,
+        })
+        .returning();
+
+      res.status(201).json(serializeEmployee(employee!));
+    },
+  );
 
   // ── PATCH /employees/:id ──────────────────────────────────────────────────
-  // Partial update; same OWNER gating as create. Only supplied fields change.
-  // (The EMS module does not audit employee writes — create doesn't either — so
-  // this stays consistent and writes no audit row.)
-  router.patch("/employees/:id", requireAuth, requireRole("OWNER"), async (req, res) => {
-    const id = req.params.id as string;
-    if (!UUID_RE.test(id)) {
-      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
-      return;
-    }
+  // Partial update; same OWNER/OUTLET_MANAGER gating as create (see
+  // EMPLOYEE_WRITE_ROLES). Only supplied fields change. (The EMS module does
+  // not audit employee writes — create doesn't either — so this stays
+  // consistent and writes no audit row.)
+  router.patch(
+    "/employees/:id",
+    requireAuth,
+    requireRole(...EMPLOYEE_WRITE_ROLES),
+    resolveOutletContext,
+    async (req, res) => {
+      const id = req.params.id as string;
+      if (!UUID_RE.test(id)) {
+        sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+        return;
+      }
 
-    const parsed = updateEmployeeSchema.safeParse(req.body ?? {});
-    if (!parsed.success) {
-      sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
-      return;
-    }
+      const parsed = updateEmployeeSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
+        return;
+      }
 
-    const [existing] = await db.select({ id: employees.id }).from(employees).where(eq(employees.id, id));
-    if (!existing) {
-      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
-      return;
-    }
+      const [existing] = await db
+        .select({ id: employees.id, locationId: employees.locationId })
+        .from(employees)
+        .where(eq(employees.id, id));
+      if (!existing) {
+        sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+        return;
+      }
 
-    const updates: Partial<typeof employees.$inferInsert> = { updatedAt: new Date() };
-    if (parsed.data.employee_no !== undefined) updates.employeeNo = parsed.data.employee_no;
-    if (parsed.data.full_name !== undefined) updates.fullName = parsed.data.full_name;
-    if (parsed.data.department !== undefined) updates.department = parsed.data.department;
-    if (parsed.data.position !== undefined) updates.position = parsed.data.position;
-    if (parsed.data.photo_url !== undefined) updates.photoUrl = parsed.data.photo_url;
-    if (parsed.data.status !== undefined) updates.status = parsed.data.status;
-    if (parsed.data.work_days !== undefined) updates.workDays = canonicalWorkDaysCsv(parsed.data.work_days);
-    if (parsed.data.hired_at !== undefined) updates.hiredAt = parsed.data.hired_at;
+      if (req.outletContext?.scope !== "ALL" && !isOutletInScope(req.outletContext, existing.locationId)) {
+        sendError(res, 403, "FORBIDDEN", "Employee is outside your access scope.");
+        return;
+      }
 
-    const [updated] = await db.update(employees).set(updates).where(eq(employees.id, id)).returning();
-    res.json(serializeEmployee(updated!));
-  });
+      if (parsed.data.location_id === null && req.outletContext?.scope !== "ALL") {
+        sendError(res, 403, "FORBIDDEN", "Cannot clear an employee outlet assignment outside HQ scope.");
+        return;
+      }
+
+      // Validate + scope-check the target outlet when a non-null location_id is
+      // supplied. Omitting the field leaves it untouched.
+      if (parsed.data.location_id !== undefined && parsed.data.location_id !== null) {
+        const [loc] = await db
+          .select({ id: locations.id })
+          .from(locations)
+          .where(eq(locations.id, parsed.data.location_id));
+        if (!loc) {
+          sendError(res, 404, "NOT_FOUND", `Outlet ${parsed.data.location_id} not found.`);
+          return;
+        }
+        if (!isOutletInScope(req.outletContext, parsed.data.location_id)) {
+          sendError(res, 403, "FORBIDDEN", "Outlet is outside your access scope.");
+          return;
+        }
+      }
+
+      const updates: Partial<typeof employees.$inferInsert> = { updatedAt: new Date() };
+      if (parsed.data.employee_no !== undefined) updates.employeeNo = parsed.data.employee_no;
+      if (parsed.data.full_name !== undefined) updates.fullName = parsed.data.full_name;
+      if (parsed.data.department !== undefined) updates.department = parsed.data.department;
+      if (parsed.data.position !== undefined) updates.position = parsed.data.position;
+      if (parsed.data.photo_url !== undefined) updates.photoUrl = parsed.data.photo_url;
+      if (parsed.data.status !== undefined) updates.status = parsed.data.status;
+      if (parsed.data.work_days !== undefined) updates.workDays = canonicalWorkDaysCsv(parsed.data.work_days);
+      if (parsed.data.hired_at !== undefined) updates.hiredAt = parsed.data.hired_at;
+      if (parsed.data.location_id !== undefined) updates.locationId = parsed.data.location_id;
+
+      const [updated] = await db.update(employees).set(updates).where(eq(employees.id, id)).returning();
+      res.json(serializeEmployee(updated!));
+    },
+  );
 
   // ── GET /audit ────────────────────────────────────────────────────────────
   router.get(
@@ -423,7 +546,7 @@ export function createEmsRouter(db: DB): Router {
   // ── GET /ems/attendance ───────────────────────────────────────────────────
   // List punches newest-first. Listing ALL employees is SUPER_ADMIN-only;
   // anyone authed may filter to a specific employee_id.
-  router.get("/ems/attendance", requireAuth, async (req, res) => {
+  router.get("/ems/attendance", requireAuth, resolveOutletContext, async (req, res) => {
     const { employee_id, type, from, to } = req.query as Record<string, string | undefined>;
     const limitParam = req.query.limit as string | undefined;
 
@@ -434,6 +557,10 @@ export function createEmsRouter(db: DB): Router {
     if (type && !(attendanceTypeEnum.enumValues as readonly string[]).includes(type)) {
       sendError(res, 400, "VALIDATION_ERROR", `Invalid type. Valid: ${attendanceTypeEnum.enumValues.join(", ")}.`);
       return;
+    }
+    if (employee_id) {
+      const emp = await resolveReadableEmployee(req, res, employee_id, 400);
+      if (!emp) return;
     }
 
     const conditions: ReturnType<typeof eq>[] = [];
@@ -466,7 +593,7 @@ export function createEmsRouter(db: DB): Router {
   //               manually. The employee's NEXT-day TIME_IN is already
   //               permitted because the punch gate and self/today are
   //               day-scoped, so a forfeited yesterday never blocks today.
-  router.get("/ems/attendance/dtr", requireAuth, async (req, res) => {
+  router.get("/ems/attendance/dtr", requireAuth, resolveOutletContext, async (req, res) => {
     const { employee_id, from, to } = req.query as Record<string, string | undefined>;
 
     // M4: same gate as the sibling GET /ems/attendance — the unfiltered DTR
@@ -475,6 +602,10 @@ export function createEmsRouter(db: DB): Router {
     if (!employee_id && normalizeRole(req.user!.role) !== "OWNER") {
       sendError(res, 403, "FORBIDDEN", "Only an OWNER may list all DTR entries. Filter by employee_id.");
       return;
+    }
+    if (employee_id) {
+      const emp = await resolveReadableEmployee(req, res, employee_id, 400);
+      if (!emp) return;
     }
 
     const conditions: ReturnType<typeof eq>[] = [];
@@ -497,12 +628,8 @@ export function createEmsRouter(db: DB): Router {
   // consistent with the punch gate / self-today (Manila-day is a documented
   // follow-up). Pairing is shared with the DTR route (pairDtrEntries), so a
   // PRESENT day here is exactly a COMPLETE DTR entry.
-  router.get("/employees/:id/profile", requireAuth, async (req, res) => {
+  router.get("/employees/:id/profile", requireAuth, resolveOutletContext, async (req, res) => {
     const id = req.params.id as string;
-    if (!UUID_RE.test(id)) {
-      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
-      return;
-    }
 
     const now = new Date();
     const monthParam = req.query.month as string | undefined;
@@ -517,6 +644,9 @@ export function createEmsRouter(db: DB): Router {
     }
     const year = Number(m[1]);
     const monthIndex = monthNum - 1;
+
+    const scopedEmp = await resolveReadableEmployee(req, res, id, 404);
+    if (!scopedEmp) return;
 
     const [emp] = await db.select().from(employees).where(eq(employees.id, id));
     if (!emp) {

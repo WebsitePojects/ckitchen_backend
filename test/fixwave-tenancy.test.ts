@@ -374,6 +374,22 @@ describe("H6 — PO receiving credits the right outlet MAIN", () => {
 // ---------------------------------------------------------------------------
 
 describe("M4 — GET /ems/attendance/dtr role gate", () => {
+  let outletAEmployeeId: string;
+
+  beforeAll(async () => {
+    const create = await request(app)
+      .post("/api/v1/employees")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({
+        employee_no: `FW-M4-${Date.now()}`,
+        full_name: "FW M4 Scoped Employee",
+        department: "KITCHEN",
+        location_id: outletAId,
+      });
+    expect(create.status).toBe(201);
+    outletAEmployeeId = create.body.id as string;
+  });
+
   it("non-OWNER without employee_id → 403", async () => {
     const res = await request(app)
       .get("/api/v1/ems/attendance/dtr")
@@ -390,11 +406,12 @@ describe("M4 — GET /ems/attendance/dtr role gate", () => {
     expect(Array.isArray(res.body)).toBe(true);
   });
 
-  it("non-OWNER WITH employee_id → 200 (self/filtered still allowed)", async () => {
+  it("non-OWNER WITH valid in-scope employee_id → 200 (filtered still allowed)", async () => {
     const res = await request(app)
-      .get("/api/v1/ems/attendance/dtr?employee_id=00000000-0000-4000-a000-000000000001")
+      .get(`/api/v1/ems/attendance/dtr?employee_id=${outletAEmployeeId}`)
       .set("Authorization", `Bearer ${kitchenA}`);
     expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
   });
 });
 

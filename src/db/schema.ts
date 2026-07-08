@@ -876,10 +876,18 @@ export const employees = pgTable(
     workDays: text("work_days").notNull().default("MON,TUE,WED,THU,FRI"),
     /** Hire date — calendar day, no time (migration 0025). NULL = unknown. */
     hiredAt: date("hired_at"),
+    /**
+     * Per-outlet employee assignment (client 2026-07-09, migration 0026). NULL
+     * = unassigned / HQ — the employee is not yet tied to a physical outlet.
+     */
+    locationId: uuid("location_id").references(() => locations.id),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("employee_user_id_idx").on(table.userId)],
+  (table) => [
+    index("employee_user_id_idx").on(table.userId),
+    index("employee_location_id_idx").on(table.locationId),
+  ],
 ).enableRLS();
 
 export type Employee = typeof employees.$inferSelect;

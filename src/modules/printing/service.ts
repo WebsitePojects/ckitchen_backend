@@ -16,7 +16,7 @@
  * without an extra DB round-trip.
  */
 import { randomBytes } from "node:crypto";
-import { and, eq, asc, inArray, getTableColumns } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, inArray, isNull, lte, or } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
   kitchenStations,
@@ -235,7 +235,15 @@ export async function listPendingJobs(db: DB, locationId: string): Promise<Pendi
     })
     .from(printJobs)
     .innerJoin(kitchenStations, eq(printJobs.stationId, kitchenStations.id))
-    .where(and(eq(printJobs.status, "PENDING"), eq(kitchenStations.locationId, locationId)))
+    // v2 lease protocol: an actively-leased (derived CLAIMED) job is invisible to the
+    // legacy pull loop so v1 agents cannot double-print a claimed job.
+    .where(
+      and(
+        eq(printJobs.status, "PENDING"),
+        eq(kitchenStations.locationId, locationId),
+        or(isNull(printJobs.leaseUntil), lte(printJobs.leaseUntil, new Date())),
+      ),
+    )
     .orderBy(asc(printJobs.createdAt));
 
   if (pendingJobs.length === 0) return [];

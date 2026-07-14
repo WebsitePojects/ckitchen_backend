@@ -50,6 +50,10 @@ export const printerConnectionEnum = pgEnum("printer_connection", [
 export const printerStatusEnum = pgEnum("printer_status", ["ONLINE", "OFFLINE", "ERROR"]);
 
 export const printJobStatusEnum = pgEnum("print_job_status", ["PENDING", "PRINTED", "FAILED"]);
+// Printing v2 (D35-D46 §12). CLAIMED is DERIVED: status=PENDING AND lease_until>now().
+export const printerCapabilityEnum = pgEnum("printer_capability", ["ESC_POS_KOT", "WINDOWS_DOCUMENT"]);
+export const printerTransportEnum = pgEnum("printer_transport", ["PHYSICAL", "VIRTUAL"]);
+export const printAttemptResultEnum = pgEnum("print_attempt_result", ["PRINTED", "FAILED", "LEASE_EXPIRED"]);
 
 export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE"]);
 
@@ -267,6 +271,8 @@ export const printers = pgTable("printer", {
   connection: printerConnectionEnum("connection").notNull(),
   address: text("address").notNull(),
   status: printerStatusEnum("status").notNull().default("OFFLINE"),
+  capability: printerCapabilityEnum("capability").notNull().default("ESC_POS_KOT"),
+  transport: printerTransportEnum("transport").notNull().default("PHYSICAL"),
   lastSeen: timestamp("last_seen", { withTimezone: true }),
 }).enableRLS();
 
@@ -710,6 +716,12 @@ export const printJobs = pgTable(
     status: printJobStatusEnum("status").notNull().default("PENDING"),
     error: text("error"),
     retries: integer("retries").notNull().default(0),
+    capability: printerCapabilityEnum("capability").notNull().default("ESC_POS_KOT"),
+    documentType: text("document_type"),
+    contentHash: text("content_hash"),
+    leaseToken: text("lease_token"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    reprintOfId: uuid("reprint_of_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     printedAt: timestamp("printed_at", { withTimezone: true }),
   },
@@ -728,6 +740,31 @@ export const printJobs = pgTable(
 
 export type PrintJob = typeof printJobs.$inferSelect;
 export type NewPrintJob = typeof printJobs.$inferInsert;
+
+// Immutable per-attempt history (§12): every claim that resolves (PRINTED, FAILED,
+// or lease expiry reclaim) appends exactly one row; forbid_mutation enforces append-only.
+export const printJobAttempts = pgTable(
+  "print_job_attempt",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    printJobId: uuid("print_job_id").notNull().references(() => printJobs.id),
+    attemptNo: integer("attempt_no").notNull(),
+    agentId: uuid("agent_id").references(() => printAgents.id),
+    leaseToken: text("lease_token").notNull(),
+    result: printAttemptResultEnum("result").notNull(),
+    error: text("error"),
+    contentHash: text("content_hash"),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("print_job_attempt_job_no_unique").on(table.printJobId, table.attemptNo),
+    index("print_job_attempt_job_idx").on(table.printJobId),
+    check("print_job_attempt_no_positive", sql`${table.attemptNo} > 0`),
+  ],
+).enableRLS();
+
+export type PrintJobAttempt = typeof printJobAttempts.$inferSelect;
 
 export const printAgents = pgTable(
   "print_agent",

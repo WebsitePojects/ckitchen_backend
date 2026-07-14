@@ -37,6 +37,7 @@ import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { requireAgentToken, requireBootstrapToken } from "./agent-auth.js";
+import { ackJobV2, claimJobs, isSpoolingEnabled, processVirtualSpool, renewLease } from "./service-v2.js";
 import {
   PrintNotFoundError,
   PrintValidationError,
@@ -301,6 +302,84 @@ export function createPrintingRouter(db: DB, hub: RealtimeHub): Router {
       }
     },
   );
+
+  // ── Printing v2 lease protocol (D35-D46 §12) — gated by printing.spooling ──
+
+  const requireSpooling = async (res: Response): Promise<boolean> => {
+    if (await isSpoolingEnabled(db)) return true;
+    sendError(res, 503, "FEATURE_DISABLED", "printing.spooling is disabled.");
+    return false;
+  };
+
+  const claimSchema = z.object({
+    capability: z.enum(["ESC_POS_KOT", "WINDOWS_DOCUMENT"]).optional(),
+    limit: z.number().int().min(1).max(20).optional(),
+    lease_seconds: z.number().int().min(10).max(300).optional(),
+  }).strict();
+
+  router.post("/agent/print-jobs/claim", requireAgentToken, async (req, res) => {
+    if (!(await requireSpooling(res))) return;
+    const parsed = claimSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return sendError(res, 400, "VALIDATION_ERROR", "Invalid claim body.", parsed.error.issues);
+    try {
+      const jobs = await claimJobs(db, req.agent!.locationId, {
+        capability: parsed.data.capability,
+        limit: parsed.data.limit,
+        leaseSeconds: parsed.data.lease_seconds,
+      });
+      res.json({ jobs });
+    } catch (err) { handleServiceError(err, res); }
+  });
+
+  const renewSchema = z.object({ lease_token: z.string().min(8), lease_seconds: z.number().int().min(10).max(300).optional() }).strict();
+  router.post("/agent/print-jobs/:id/lease/renew", requireAgentToken, async (req, res) => {
+    if (!(await requireSpooling(res))) return;
+    const parsed = renewSchema.safeParse(req.body ?? {});
+    if (!parsed.success) return sendError(res, 400, "VALIDATION_ERROR", "Invalid renew body.", parsed.error.issues);
+    try {
+      const jobId = paramAsString(req.params.id);
+      const jobLocation = await resolvePrintJobLocationId(db, jobId);
+      if (jobLocation !== req.agent!.locationId) return sendError(res, 403, "UNAUTHORIZED", "Job outside agent location.");
+      res.json(await renewLease(db, jobId, parsed.data.lease_token, parsed.data.lease_seconds));
+    } catch (err) { handleServiceError(err, res); }
+  });
+
+  const ackV2Schema = z.object({
+    lease_token: z.string().min(8),
+    result: z.enum(["PRINTED", "FAILED"]),
+    error: z.string().min(1).optional(),
+    content_hash: z.string().length(64).optional(),
+  }).strict();
+  router.post("/agent/print-jobs/:id/ack-v2", requireAgentToken, async (req, res) => {
+    if (!(await requireSpooling(res))) return;
+    const parsed = ackV2Schema.safeParse(req.body ?? {});
+    if (!parsed.success) return sendError(res, 400, "VALIDATION_ERROR", "Invalid ack body.", parsed.error.issues);
+    try {
+      const jobId = paramAsString(req.params.id);
+      const jobLocation = await resolvePrintJobLocationId(db, jobId);
+      if (jobLocation !== req.agent!.locationId) return sendError(res, 403, "UNAUTHORIZED", "Job outside agent location.");
+      const job = await ackJobV2(db, {
+        jobId,
+        leaseToken: parsed.data.lease_token,
+        result: parsed.data.result,
+        error: parsed.data.error ?? null,
+        contentHash: parsed.data.content_hash ?? null,
+        agentId: req.agent!.id,
+      });
+      hub.emitToLocation(req.agent!.locationId, "print.status", { id: job.id, status: job.status });
+      res.json({ id: job.id, status: job.status, retries: job.retries });
+    } catch (err) { handleServiceError(err, res); }
+  });
+
+  // Verification substitute until hardware acceptance (§12): OWNER-triggered pass
+  // that claims + PRINTED-acks every claimable job on a VIRTUAL-transport printer.
+  router.post("/print-jobs/virtual-spool/run", requireAuth, requireRole("OWNER"), async (req, res) => {
+    if (!(await requireSpooling(res))) return;
+    const body = z.object({ location_id: z.string().uuid() }).strict().safeParse(req.body ?? {});
+    if (!body.success) return sendError(res, 400, "VALIDATION_ERROR", "Invalid body.", body.error.issues);
+    try { res.json(await processVirtualSpool(db, body.data.location_id)); }
+    catch (err) { handleServiceError(err, res); }
+  });
 
   return router;
 }

@@ -43,6 +43,7 @@ import {
   orderDiscounts,
   orders,
 } from "../../db/schema.js";
+import { operationalFeatureFlags } from "../../db/enterprise-schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { normalizeRole } from "../auth/roles.js";
 import { paramAsString, sendError } from "../http-errors.js";
@@ -98,6 +99,34 @@ const APPROVAL_THRESHOLDS = {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// W4-5 (spec §10): "discounts.strict_approval" feature flag. Same
+// read-only select-by-key pattern as REPORTS_COMMISSION_SNAPSHOT_FLAG in
+// src/modules/reports/service.ts and ORDERS_LEGACY_RECIPE_SNAPSHOT_FLAG in
+// src/modules/orders/service.ts. Seeded false (drizzle/0032) -- flag-off
+// behavior below is byte-identical to the pre-W4-5 3-tier AUTO/SUPERVISOR/
+// ADMIN routing. Flag ON: every non-statutory (not SENIOR/PWD) discount is
+// routed straight to ADMIN level, always PENDING -- no AUTO tier, no
+// SUPERVISOR tier (spec: "no crew auto-approve, no supervisor tier").
+// canDecide() below ALREADY restricts ADMIN-level decisions to role
+// "OWNER" only -- this codebase's sole admin-class role (V2_ROLES has no
+// separate ADMIN role; the v1 alias "SUPER_ADMIN" maps to OWNER via
+// ROLE_ALIASES/normalizeRole in auth/roles.ts, same mapping EVIDENCE_ACCESS_
+// ROLES' comment above uses for "the admin/owner role"). So reusing the
+// existing "ADMIN" approval_level here needs no new enum value and no
+// canDecide() change -- OUTLET_MANAGER is already excluded from deciding an
+// ADMIN-level row. SENIOR/PWD stays AUTO + evidence-gated (W4-4), untouched.
+// ---------------------------------------------------------------------------
+export const DISCOUNTS_STRICT_APPROVAL_FLAG = "discounts.strict_approval";
+
+async function isStrictApprovalEnabled(db: DB): Promise<boolean> {
+  const [flag] = await db
+    .select()
+    .from(operationalFeatureFlags)
+    .where(eq(operationalFeatureFlags.key, DISCOUNTS_STRICT_APPROVAL_FLAG));
+  return !!flag?.enabled;
+}
+
 /** Value-range sanity check shared by catalog create/update and ad-hoc apply. */
 function valueRangeError(type: DiscountType, value: number): string | null {
   if (type === "PERCENT" || type === "SENIOR" || type === "PWD") {
@@ -121,14 +150,26 @@ function computeAmount(type: DiscountType, value: number, orderTotal: number): n
   return Math.round(clamped * 100) / 100;
 }
 
-/** Routes a computed discount to its approval layer (MOTM 2c). */
+/**
+ * Routes a computed discount to its approval layer. Flag OFF: MOTM 2c legacy
+ * 3-tier AUTO/SUPERVISOR/ADMIN. Flag ON (W4-5, spec §10): every non-statutory
+ * discount always lands on ADMIN/PENDING -- see DISCOUNTS_STRICT_APPROVAL_FLAG
+ * doc above for why reusing "ADMIN" is sufficient. `strict` is read once per
+ * request by the caller via isStrictApprovalEnabled(), so this stays sync.
+ */
 function routeApproval(
   type: DiscountType,
   amount: number,
   percentOfOrder: number,
+  strict: boolean,
 ): { level: ApprovalLevel; autoApprove: boolean } {
   if (type === "SENIOR" || type === "PWD") {
     return { level: "AUTO", autoApprove: true };
+  }
+  if (strict) {
+    // Spec §10: "ALL OTHER variable discounts ... remarks required, PENDING
+    // until ADMIN approval -- NO crew auto-approve, NO supervisor tier."
+    return { level: "ADMIN", autoApprove: false };
   }
   if (percentOfOrder <= APPROVAL_THRESHOLDS.AUTO_MAX_PERCENT || amount <= APPROVAL_THRESHOLDS.AUTO_MAX_AMOUNT) {
     return { level: "AUTO", autoApprove: true };
@@ -444,6 +485,9 @@ export function createDiscountsRouter(db: DB): Router {
       return;
     }
 
+    // W4-5 (spec §10): read once per request; see DISCOUNTS_STRICT_APPROVAL_FLAG.
+    const strict = await isStrictApprovalEnabled(db);
+
     let type: DiscountType;
     let value: number;
     let label: string;
@@ -473,6 +517,25 @@ export function createDiscountsRouter(db: DB): Router {
         sendError(res, 400, "VALIDATION_ERROR", rangeErr);
         return;
       }
+    }
+
+    // W4-5 (spec §10) strict mode: non-statutory PERCENT discounts must be
+    // 10-30%. Interpretation note (no spec text covers FIXED/VOUCHER
+    // explicitly -- "10-30% only" reads as a percentage-specific rule): a
+    // peso FIXED/VOUCHER discount has no percent to range-check here, so it
+    // is left to valueRangeError's existing positive-amount check and simply
+    // falls through to routeApproval's strict branch (ADMIN/PENDING, remarks
+    // already required unconditionally by applyDiscountSchema above) -- same
+    // destination an in-range PERCENT reaches. SENIOR/PWD never reaches this
+    // branch (type is never "PERCENT" for those).
+    if (strict && type === "PERCENT" && (value < 10 || value > 30)) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        "Non-statutory PERCENT discounts must be between 10 and 30 percent (spec §10, strict approval mode).",
+      );
+      return;
     }
 
     // Statutory: SENIOR/PWD always require the ID capture note.
@@ -512,7 +575,7 @@ export function createDiscountsRouter(db: DB): Router {
     const orderTotal = Number(order.total);
     const amount = computeAmount(type, value, orderTotal);
     const percentOfOrder = orderTotal > 0 ? (amount / orderTotal) * 100 : 100;
-    const { level, autoApprove } = routeApproval(type, amount, percentOfOrder);
+    const { level, autoApprove } = routeApproval(type, amount, percentOfOrder, strict);
     const status = autoApprove ? "APPROVED" : "PENDING";
     const now = new Date();
 

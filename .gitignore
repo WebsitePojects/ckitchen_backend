@@ -21,3 +21,6 @@ prisma/*.db
 # PGlite file-backed local dev DB
 .data/
 .gstack/
+
+# Discount evidence (private, gitignored - src/modules/discounts/evidence.ts LocalFsProvider)
+.evidence/

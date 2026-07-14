@@ -190,6 +190,48 @@
       "when": 1784500000000,
       "tag": "0026_employee_location_id",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1784600000000,
+      "tag": "0027_enterprise_operations_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1784700000000,
+      "tag": "0028_stock_return_batches",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1784800000000,
+      "tag": "0029_bom_job_orders",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1784900000000,
+      "tag": "0030_customer_orders",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1785000000000,
+      "tag": "0031_transfer_orders_qa_release",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1785100000000,
+      "tag": "0032_w4_client_rules_foundation",
+      "breakpoints": true
     }
   ]
 }

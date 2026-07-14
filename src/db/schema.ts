@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   date,
   index,
   integer,
@@ -58,6 +59,37 @@ export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE
 export const userStatusEnum = pgEnum("user_status", ["ACTIVE", "BLOCKED"]);
 
 export const warehouseTypeEnum = pgEnum("warehouse_type", ["MAIN", "KITCHEN"]);
+
+// Enterprise operations foundation (D35-D46). Legacy enums/columns stay in
+// place while feature-flagged migrations move writes to explicit stock nodes,
+// generic items, lots, and listing-owned outlet identity.
+export const warehousePurposeEnum = pgEnum("warehouse_purpose", [
+  "HQ_MAIN",
+  "OUTLET_STORAGE",
+  "KITCHEN",
+  "PRODUCTION",
+  "QUARANTINE",
+]);
+
+export const itemTypeEnum = pgEnum("item_type", [
+  "RAW",
+  "PACKAGING",
+  "CONSUMABLE",
+  "WIP",
+  "FINISHED_GOOD",
+  "SERVICE",
+]);
+
+export const listingMappingStatusEnum = pgEnum("listing_mapping_status", [
+  "RESOLVED",
+  "MAPPING_REQUIRED",
+  "DISABLED",
+]);
+
+export const consumptionModeEnum = pgEnum("consumption_mode", [
+  "STOCKED_OUTPUT",
+  "MADE_TO_ORDER",
+]);
 
 // Roles v2 (D24/D29): the enum keeps BOTH the original v1 values (as accepted
 // aliases — Postgres can't cheaply drop enum values, and legacy tokens/rows may
@@ -172,10 +204,15 @@ export const aggregatorAccounts = pgTable(
     brandId: uuid("brand_id")
       .notNull()
       .references(() => brands.id),
+    /** Physical outlet owning this channel listing (D39). Nullable only during migration. */
+    locationId: uuid("location_id").references(() => locations.id),
     aggregator: aggregatorEnum("aggregator").notNull(),
     externalMerchantId: text("external_merchant_id").notNull(),
     credentialRef: text("credential_ref"),
     isActive: boolean("is_active").notNull().default(true),
+    mappingStatus: listingMappingStatusEnum("mapping_status")
+      .notNull()
+      .default("MAPPING_REQUIRED"),
     /**
      * W3 (D33 #10): aggregator commission, percent (0-100). NULL = not yet
      * configured — the sales report treats NULL as 0 (gross == net) until the
@@ -183,7 +220,11 @@ export const aggregatorAccounts = pgTable(
      */
     commissionRate: numeric("commission_rate", { precision: 5, scale: 2 }),
   },
-  (table) => [index("aggregator_account_brand_id_idx").on(table.brandId)],
+  (table) => [
+    index("aggregator_account_brand_id_idx").on(table.brandId),
+    index("aggregator_account_location_id_idx").on(table.locationId),
+    index("aggregator_account_mapping_status_idx").on(table.mappingStatus),
+  ],
 ).enableRLS();
 
 export type AggregatorAccount = typeof aggregatorAccounts.$inferSelect;
@@ -259,13 +300,28 @@ export type NewKitchenStation = typeof kitchenStations.$inferInsert;
 // ingredient
 // ---------------------------------------------------------------------------
 
-export const ingredients = pgTable("ingredient", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  name: text("name").notNull(),
-  unit: text("unit").notNull(),
-  unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull(),
-  lowStockThreshold: numeric("low_stock_threshold", { precision: 14, scale: 4 }).notNull(),
-}).enableRLS();
+export const ingredients = pgTable(
+  "ingredient",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    /** Generic Item code. Nullable only while legacy rows are deterministically backfilled. */
+    code: text("code"),
+    name: text("name").notNull(),
+    unit: text("unit").notNull(),
+    itemType: itemTypeEnum("item_type").notNull().default("RAW"),
+    lotTracked: boolean("lot_tracked").notNull().default(false),
+    shelfLifeDays: integer("shelf_life_days"),
+    isActive: boolean("is_active").notNull().default(true),
+    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull(),
+    lowStockThreshold: numeric("low_stock_threshold", { precision: 14, scale: 4 }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("ingredient_code_unique")
+      .on(table.code)
+      .where(sql`${table.code} IS NOT NULL`),
+    index("ingredient_type_active_idx").on(table.itemType, table.isActive),
+  ],
+).enableRLS();
 
 export type Ingredient = typeof ingredients.$inferSelect;
 export type NewIngredient = typeof ingredients.$inferInsert;
@@ -285,6 +341,11 @@ export const menuItems = pgTable(
     price: numeric("price", { precision: 14, scale: 2 }).notNull(),
     prepTimeMin: integer("prep_time_min"),
     stationId: uuid("station_id").references(() => kitchenStations.id),
+    consumptionMode: consumptionModeEnum("consumption_mode")
+      .notNull()
+      .default("MADE_TO_ORDER"),
+    /** Required for STOCKED_OUTPUT: the produced WIP/finished item consumed at sale time. */
+    stockItemId: uuid("stock_item_id").references(() => ingredients.id),
     availability: availabilityEnum("availability").notNull().default("AVAILABLE"),
     /** MOTM 2026-07-01: per-item photo, product number, and remarks. */
     imageUrl: text("image_url"),
@@ -294,6 +355,7 @@ export const menuItems = pgTable(
   (table) => [
     index("menu_item_brand_id_idx").on(table.brandId),
     index("menu_item_station_id_idx").on(table.stationId),
+    index("menu_item_stock_item_id_idx").on(table.stockItemId),
     // Product number unique within a brand (only when set).
     uniqueIndex("menu_item_brand_item_no_unique")
       .on(table.brandId, table.itemNo)
@@ -342,8 +404,25 @@ export const warehouses = pgTable(
       .notNull()
       .references(() => locations.id),
     type: warehouseTypeEnum("type").notNull(),
+    purpose: warehousePurposeEnum("purpose"),
+    code: text("code"),
+    name: text("name"),
+    isActive: boolean("is_active").notNull().default(true),
   },
-  (table) => [uniqueIndex("warehouse_location_type_unique").on(table.locationId, table.type)],
+  (table) => [
+    // Purpose is the enterprise identity. Legacy (location,type) uniqueness is
+    // retained during the dark migration so old MAIN/KITCHEN resolvers cannot
+    // become ambiguous before every writer moves to purpose-aware resolution.
+    uniqueIndex("warehouse_location_type_unique").on(table.locationId, table.type),
+    uniqueIndex("warehouse_location_purpose_unique")
+      .on(table.locationId, table.purpose)
+      .where(sql`${table.purpose} IS NOT NULL`),
+    uniqueIndex("warehouse_code_unique").on(table.code).where(sql`${table.code} IS NOT NULL`),
+    index("warehouse_location_purpose_idx").on(table.locationId, table.purpose),
+    uniqueIndex("warehouse_single_hq_main_unique")
+      .on(table.purpose)
+      .where(sql`${table.purpose} = 'HQ_MAIN' AND ${table.isActive} = true`),
+  ],
 ).enableRLS();
 
 export type Warehouse = typeof warehouses.$inferSelect;
@@ -452,6 +531,8 @@ export const orders = pgTable(
     brandId: uuid("brand_id")
       .notNull()
       .references(() => brands.id),
+    /** Immutable physical outlet snapshot resolved from the channel listing (D39). */
+    locationId: uuid("location_id").references(() => locations.id),
     aggregatorAccountId: uuid("aggregator_account_id")
       .notNull()
       .references(() => aggregatorAccounts.id),
@@ -476,6 +557,18 @@ export const orders = pgTable(
     prepAt: timestamp("prep_at", { withTimezone: true }),
     readyAt: timestamp("ready_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
+    /**
+     * W4 (spec §10): the channel's BASE commission percent (0-100), snapshotted
+     * from `channel_commercial_term` (src/db/w4-schema.ts) at ingestion time.
+     * NULL = terms missing = a finance exception, NEVER silently treated as 0
+     * ("Missing terms create a visible finance exception, not a silent 0%.").
+     * The snapshot-at-ingestion lookup and finance-exception surfacing are
+     * later streams' service logic; this column only stores the immutable
+     * snapshot value.
+     */
+    commissionRateSnapshot: numeric("commission_rate_snapshot", { precision: 5, scale: 2 }),
+    /** W4 (spec §10): the channel's MARKETING rate percent snapshot, same rules as above. */
+    marketingRateSnapshot: numeric("marketing_rate_snapshot", { precision: 5, scale: 2 }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -496,6 +589,15 @@ export const orders = pgTable(
     index("order_status_placed_at_idx").on(table.status, table.placedAt.desc()),
     index("order_brand_placed_at_idx").on(table.brandId, table.placedAt.desc()),
     index("order_aggregator_account_id_idx").on(table.aggregatorAccountId),
+    index("order_location_placed_at_idx").on(table.locationId, table.placedAt.desc()),
+    check(
+      "order_commission_rate_snapshot_range",
+      sql`${table.commissionRateSnapshot} IS NULL OR (${table.commissionRateSnapshot} >= 0 AND ${table.commissionRateSnapshot} <= 100)`,
+    ),
+    check(
+      "order_marketing_rate_snapshot_range",
+      sql`${table.marketingRateSnapshot} IS NULL OR (${table.marketingRateSnapshot} >= 0 AND ${table.marketingRateSnapshot} <= 100)`,
+    ),
   ],
 ).enableRLS();
 
@@ -517,6 +619,16 @@ export const orderItems = pgTable(
       .notNull()
       .references(() => kitchenStations.id),
     notes: text("notes"),
+    /**
+     * W4 (spec §6/§7 mirror of `customer_order_line.componentRequirementsSnapshot`,
+     * customer-orders-schema.ts): recipe lines captured at order creation, e.g.
+     * `[{ ingredientId, portionQty, uom }, ...]`. NULL for orders predating this
+     * column / STOCKED_OUTPUT lines that never explode a BOM (spec §6 no-double-
+     * deduction rule). Populating this snapshot and switching deduction to read
+     * from it (behind the `orders.legacy_recipe_snapshot` feature flag) is later
+     * streams' service work; this column only adds the storage.
+     */
+    componentSnapshot: jsonb("component_snapshot"),
   },
   (table) => [
     index("order_item_order_id_idx").on(table.orderId),
@@ -866,6 +978,8 @@ export const employees = pgTable(
     position: text("position"),
     photoUrl: text("photo_url"),
     status: employeeStatusEnum("status").notNull().default("ACTIVE"),
+    /** Explicit policy: owners may be exempt while accounting/operations staff remain required. */
+    attendanceRequired: boolean("attendance_required").notNull().default(true),
     /**
      * Weekly work schedule (Employee 360, migration 0025). CSV of day tokens drawn
      * from MON,TUE,WED,THU,FRI,SAT,SUN in canonical Mon→Sun order. Default = the
@@ -918,6 +1032,9 @@ export const auditLogs = pgTable(
     actorUserId: uuid("actor_user_id").references(() => users.id),
     actorName: text("actor_name"),
     sessionId: uuid("session_id").references(() => userSessions.id),
+    locationId: uuid("location_id").references(() => locations.id),
+    correlationId: text("correlation_id"),
+    postingId: uuid("posting_id"),
     action: text("action").notNull(),
     description: text("description"),
     entityType: text("entity_type"),
@@ -929,6 +1046,8 @@ export const auditLogs = pgTable(
     index("audit_log_created_at_idx").on(table.createdAt.desc()),
     index("audit_log_actor_idx").on(table.actorUserId),
     index("audit_log_entity_idx").on(table.entityType, table.entityId),
+    index("audit_log_location_created_idx").on(table.locationId, table.createdAt.desc()),
+    index("audit_log_correlation_idx").on(table.correlationId),
   ],
 ).enableRLS();
 
@@ -1337,6 +1456,15 @@ export const orderDiscounts = pgTable(
     reason: text("reason"),
     // Senior/PWD ID capture (statutory requirement — rejected without it).
     idNote: text("id_note"),
+    /**
+     * W4 (spec §10): private storage key for the discount's ID-image evidence
+     * (senior/PWD or other variable-discount proof). NEVER a public URL — the
+     * evidence is served only through short-lived signed URLs, excluded from
+     * ordinary order/report responses, and every access is durably audited
+     * via `discount_evidence_access_log` (src/db/w4-schema.ts). The signed-URL
+     * issuance flow itself is later streams' service work.
+     */
+    evidenceRef: text("evidence_ref"),
     requestedBy: uuid("requested_by")
       .notNull()
       .references(() => users.id),

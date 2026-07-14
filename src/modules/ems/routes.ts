@@ -106,6 +106,11 @@ const createEmployeeSchema = z.object({
   work_days: workDaysInput.optional(),
   hired_at: hiredAtInput.optional(),
   location_id: locationIdInput.optional(),
+  // Client-confirmed (2026-07-10, §10): explicit per-employee override — owner
+  // role alone is not the historical source of an employee's attendance policy
+  // (e.g. an Accounting Head stays Required; an Owner may be Exempt). Omitted
+  // on create -> DB default (true) applies; omitted on update -> unchanged.
+  attendance_required: z.boolean().optional(),
 });
 
 // PATCH: every field optional (partial update). Unknown keys from old clients are
@@ -120,6 +125,7 @@ const updateEmployeeSchema = z.object({
   work_days: workDaysInput.optional(),
   hired_at: hiredAtInput.optional(),
   location_id: locationIdInput.optional(),
+  attendance_required: z.boolean().optional(),
 });
 
 /**
@@ -268,6 +274,9 @@ export function createEmsRouter(db: DB): Router {
           ...(parsed.data.work_days ? { workDays: canonicalWorkDaysCsv(parsed.data.work_days) } : {}),
           hiredAt: parsed.data.hired_at ?? null,
           locationId,
+          ...(parsed.data.attendance_required !== undefined
+            ? { attendanceRequired: parsed.data.attendance_required }
+            : {}),
         })
         .returning();
 
@@ -344,6 +353,7 @@ export function createEmsRouter(db: DB): Router {
       if (parsed.data.work_days !== undefined) updates.workDays = canonicalWorkDaysCsv(parsed.data.work_days);
       if (parsed.data.hired_at !== undefined) updates.hiredAt = parsed.data.hired_at;
       if (parsed.data.location_id !== undefined) updates.locationId = parsed.data.location_id;
+      if (parsed.data.attendance_required !== undefined) updates.attendanceRequired = parsed.data.attendance_required;
 
       const [updated] = await db.update(employees).set(updates).where(eq(employees.id, id)).returning();
       res.json(serializeEmployee(updated!));
@@ -682,6 +692,11 @@ export function createEmsRouter(db: DB): Router {
     // Pre-hire scheduled days are NOT absences. Fall back to created_at's date
     // when hired_at is unknown.
     const hireStr = toDateString(emp.hiredAt) ?? toDateString(emp.createdAt) ?? "0000-01-01";
+    // D3 (spec §10): an employee explicitly exempted from the attendance
+    // requirement is never flagged ABSENT (a no-punch scheduled day falls
+    // through to REST instead). Punching itself stays allowed either way —
+    // this only gates the absence FLAG, not the punch gate in attendance-shared.ts.
+    const exempt = emp.attendanceRequired === false;
 
     type DayStatus = "PRESENT" | "ABSENT" | "REST" | "FUTURE" | "FORFEITED" | "OPEN";
     interface ProfileDay {
@@ -729,10 +744,11 @@ export function createEmsRouter(db: DB): Router {
         }
       } else if (!scheduled) {
         status = "REST";
-      } else if (dateStr >= hireStr && dateStr < todayStr) {
+      } else if (!exempt && dateStr >= hireStr && dateStr < todayStr) {
         status = "ABSENT";
       } else {
-        // Pre-hire scheduled day (or today, not yet over) — not an absence.
+        // Pre-hire scheduled day (or today, not yet over), or an
+        // attendance_required=false exempt employee — not an absence.
         status = "REST";
       }
 

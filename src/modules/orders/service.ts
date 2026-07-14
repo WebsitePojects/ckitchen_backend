@@ -51,10 +51,12 @@
  *        deduped lowstock events).
  */
 import { randomBytes } from "node:crypto";
-import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
+import { menuItemOutlets, operationalFeatureFlags } from "../../db/enterprise-schema.js";
 import {
   aggregatorAccounts,
+  brandOutlet,
   brands,
   consumptionLogs,
   ingredients,
@@ -69,6 +71,35 @@ import {
   warehouses,
 } from "../../db/schema.js";
 import { postLedger } from "../inventory/ledger.js";
+import { resolveCommercialTermSnapshots } from "../commercial-terms/service.js";
+
+type Tx = Parameters<Parameters<DB["transaction"]>[0]>[0];
+
+// W4-2 (spec §6/§7): when enabled, NEW→PREPARING deduction reads each
+// order item's frozen order_item.component_snapshot instead of live
+// recipe_lines, so a recipe/BOM edit made AFTER an order was accepted never
+// changes that order's deduction. Seeded false (drizzle/0032) — flag-off
+// deduction is byte-identical to the pre-W4-2 live-read behavior. Same
+// read-only lookup pattern as src/modules/transfers/service.ts
+// assertFeatureEnabled / src/modules/stock/reconciliation-service.ts (select
+// by key, no advisory lock needed here since this call site never writes the
+// flag row).
+export const ORDERS_LEGACY_RECIPE_SNAPSHOT_FLAG = "orders.legacy_recipe_snapshot";
+
+async function isLegacyRecipeSnapshotEnabled(tx: Tx): Promise<boolean> {
+  const [flag] = await tx
+    .select()
+    .from(operationalFeatureFlags)
+    .where(eq(operationalFeatureFlags.key, ORDERS_LEGACY_RECIPE_SNAPSHOT_FLAG));
+  return !!flag?.enabled;
+}
+
+/** Shape persisted into order_item.component_snapshot (schema.ts comment on the column). */
+type ComponentSnapshotLine = {
+  ingredientId: string;
+  portionQty: string;
+  uom: string;
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -76,6 +107,8 @@ import { postLedger } from "../inventory/ledger.js";
 
 export interface IngestOrderInput {
   brand_id: string;
+  /** Preferred enterprise identity. Legacy callers may omit only when one listing matches. */
+  aggregator_account_id?: string;
   aggregator: "FOODPANDA" | "GRABFOOD" | "OTHER";
   external_ref: string;
   customer_name?: string;
@@ -110,6 +143,8 @@ export interface StockShortfall {
 
 export interface IngestResult {
   order_id: string;
+  /** Immutable physical outlet resolved from the concrete channel listing. */
+  location_id: string | null;
   status: string;
   /**
    * Human-friendly copyable order reference (migration 0022), e.g.
@@ -127,6 +162,11 @@ export interface IngestResult {
    * emits `stock.risk` to the outlet room when this is set.
    */
   stock_risk?: StockShortfall[];
+}
+
+export interface IngestOrderOptions {
+  /** null = HQ/all scope; array = server-resolved outlet memberships. */
+  allowedLocationIds?: string[] | null;
 }
 
 export interface LowStockEvent {
@@ -202,6 +242,20 @@ export class ConflictError extends ServiceError {
   constructor(message: string) {
     super("CONFLICT", message);
     this.name = "ConflictError";
+  }
+}
+
+export class AmbiguousListingError extends ServiceError {
+  constructor(message: string) {
+    super("AMBIGUOUS_LISTING", message);
+    this.name = "AmbiguousListingError";
+  }
+}
+
+export class ListingMappingRequiredError extends ServiceError {
+  constructor(message: string) {
+    super("MAPPING_REQUIRED", message);
+    this.name = "ListingMappingRequiredError";
   }
 }
 
@@ -298,7 +352,11 @@ export function generateOrderCode(
 // ingestOrder — POST /ingest/order
 // ---------------------------------------------------------------------------
 
-export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<IngestResult> {
+export async function ingestOrder(
+  db: DB,
+  input: IngestOrderInput,
+  options: IngestOrderOptions = {},
+): Promise<IngestResult> {
   // ── VALIDATE BRAND ───────────────────────────────────────────────────────
   const [brand] = await db.select().from(brands).where(eq(brands.id, input.brand_id));
   if (!brand) throw new NotFoundError(`Brand ${input.brand_id} not found.`);
@@ -307,19 +365,79 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
   // Must happen BEFORE the idempotency check: idempotency is scoped to the
   // listing (aggregator_account_id), not the raw aggregator enum, so the
   // account has to be resolved first (Rule #5, listing-scoped variant).
-  const [account] = await db
-    .select()
-    .from(aggregatorAccounts)
-    .where(
-      and(
-        eq(aggregatorAccounts.brandId, input.brand_id),
-        eq(aggregatorAccounts.aggregator, input.aggregator),
-      ),
-    );
-  if (!account) {
+  const allCandidates = input.aggregator_account_id
+    ? await db
+        .select()
+        .from(aggregatorAccounts)
+        .where(
+          and(
+            eq(aggregatorAccounts.id, input.aggregator_account_id),
+            eq(aggregatorAccounts.brandId, input.brand_id),
+            eq(aggregatorAccounts.aggregator, input.aggregator),
+            eq(aggregatorAccounts.isActive, true),
+          ),
+        )
+    : await db
+        .select()
+        .from(aggregatorAccounts)
+        .where(
+          and(
+            eq(aggregatorAccounts.brandId, input.brand_id),
+            eq(aggregatorAccounts.aggregator, input.aggregator),
+            eq(aggregatorAccounts.isActive, true),
+          ),
+        );
+  if (allCandidates.length === 0) {
     throw new NotFoundError(
       `No aggregator account found for brand ${input.brand_id} + ${input.aggregator}.`,
     );
+  }
+
+  const resolvedCandidates = allCandidates.filter(
+    (candidate) => candidate.mappingStatus === "RESOLVED" && !!candidate.locationId,
+  );
+  let account: (typeof allCandidates)[number];
+  let accountLocationId: string | null = null;
+  if (input.aggregator_account_id) {
+    account = allCandidates[0]!;
+  } else if (resolvedCandidates.length === 1) {
+    account = resolvedCandidates[0]!;
+  } else if (resolvedCandidates.length > 1 || allCandidates.length > 1) {
+    throw new AmbiguousListingError(
+      `Multiple active ${input.aggregator} listings exist for brand ${input.brand_id}; aggregator_account_id is required.`,
+    );
+  } else {
+    account = allCandidates[0]!;
+  }
+
+  if (account.mappingStatus === "RESOLVED" && account.locationId) {
+    accountLocationId = account.locationId;
+  } else {
+    // Temporary compatibility is allowed only when the deployment is provably
+    // single-outlet. Multi-outlet ambiguity produces zero downstream effects.
+    const deployments = await db
+      .select({ locationId: brandOutlet.locationId })
+      .from(brandOutlet)
+      .where(and(eq(brandOutlet.brandId, brand.id), eq(brandOutlet.isActive, true)));
+    if (deployments.length === 1) accountLocationId = deployments[0]!.locationId;
+    else if (deployments.length === 0) accountLocationId = brand.locationId;
+    else {
+      throw new ListingMappingRequiredError(
+        `Listing ${account.id} must be mapped to one of ${deployments.length} active outlets before ingestion.`,
+      );
+    }
+  }
+
+  if (!accountLocationId) {
+    throw new ListingMappingRequiredError(`Listing ${account.id} has no physical outlet mapping.`);
+  }
+
+  if (
+    options.allowedLocationIds !== undefined &&
+    options.allowedLocationIds !== null &&
+    !options.allowedLocationIds.includes(accountLocationId)
+  ) {
+    throw new ServiceError("FORBIDDEN", "The channel listing is outside the actor's outlet scope.");
   }
 
   // ── IDEMPOTENCY CHECK (Rule #5 — listing-scoped) ─────────────────────────
@@ -370,11 +488,32 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
       stationId: menuItems.stationId,
       stationName: kitchenStations.name,
       stationDefaultPrinterId: kitchenStations.defaultPrinterId,
+      stationLocationId: kitchenStations.locationId,
+      availability: menuItems.availability,
     })
     .from(menuItems)
     .leftJoin(kitchenStations, eq(menuItems.stationId, kitchenStations.id))
     .where(inArray(menuItems.id, requestedMenuItemIds));
   const menuById = new Map(menuRows.map((r) => [r.id, r]));
+
+  const deployedMenuRows = await db
+    .select({
+      menuItemId: menuItemOutlets.menuItemId,
+      stationId: menuItemOutlets.stationId,
+      stationName: kitchenStations.name,
+      stationDefaultPrinterId: kitchenStations.defaultPrinterId,
+      availability: menuItemOutlets.availability,
+    })
+    .from(menuItemOutlets)
+    .innerJoin(kitchenStations, eq(menuItemOutlets.stationId, kitchenStations.id))
+    .where(
+      and(
+        eq(menuItemOutlets.locationId, accountLocationId),
+        eq(menuItemOutlets.isActive, true),
+        inArray(menuItemOutlets.menuItemId, requestedMenuItemIds),
+      ),
+    );
+  const deploymentByMenuItem = new Map(deployedMenuRows.map((row) => [row.menuItemId, row]));
 
   const resolvedItems: ResolvedItem[] = [];
 
@@ -383,15 +522,30 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
   for (const item of input.items) {
     const menuItem = menuById.get(item.menu_item_id);
     if (!menuItem) throw new NotFoundError(`Menu item ${item.menu_item_id} not found.`);
-    if (!menuItem.stationId) {
+    const deployment = deploymentByMenuItem.get(menuItem.id);
+    const stationId = deployment?.stationId ?? menuItem.stationId;
+    const stationName = deployment?.stationName ?? menuItem.stationName;
+    const stationDefaultPrinterId =
+      deployment?.stationDefaultPrinterId ?? menuItem.stationDefaultPrinterId;
+    const availability = deployment?.availability ?? menuItem.availability;
+    const legacyStationMatchesOutlet = menuItem.stationLocationId === accountLocationId;
+    if (!deployment && !legacyStationMatchesOutlet) {
+      throw new ValidationError(
+        `Menu item "${menuItem.name}" is not deployed to the listing's physical outlet.`,
+      );
+    }
+    if (availability !== "AVAILABLE") {
+      throw new ValidationError(`Menu item "${menuItem.name}" is ${availability}.`);
+    }
+    if (!stationId) {
       throw new ValidationError(`Menu item "${menuItem.name}" has no station assigned.`);
     }
 
     resolvedItems.push({
       menuItemId: menuItem.id,
-      stationId: menuItem.stationId,
-      stationName: menuItem.stationName ?? menuItem.stationId,
-      stationDefaultPrinterId: menuItem.stationDefaultPrinterId,
+      stationId,
+      stationName: stationName ?? stationId,
+      stationDefaultPrinterId,
       qty: item.qty,
       notes: item.notes,
       price: menuItem.price,
@@ -421,6 +575,18 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
 
   const placedAt = input.placed_at ? new Date(input.placed_at) : new Date();
 
+  // W4 (spec section 10, gap B4): resolve + freeze the BASE + MARKETING
+  // commercial-term snapshot at order-placement time. NEVER recomputed from
+  // channel_commercial_term later -- reports read this snapshot, not live
+  // rows (that is the whole point of B4). Written unconditionally on every
+  // ingest (additive columns; harmless when nothing reads them yet).
+  const commercialTermSnapshot = await resolveCommercialTermSnapshots(
+    db,
+    account.id,
+    placedAt,
+    account.commissionRate ?? null,
+  );
+
   // ── S4: RESERVATION PLANNING (soft hold — Rule #2 deduction unchanged) ───
   // Compute required qty per ingredient from recipe_lines (portion_qty × item
   // qty, summed across items sharing an ingredient), then compare against
@@ -440,6 +606,26 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
     const arr = linesByMenuItem.get(line.menuItemId);
     if (arr) arr.push(line);
     else linesByMenuItem.set(line.menuItemId, [line]);
+  }
+
+  // W4-2 (spec §6/§7): freeze each item's recipe lines AT CREATION into
+  // order_item.component_snapshot. Written unconditionally (additive +
+  // harmless when the read side is flagged off) so a later recipe/BOM edit
+  // can never retroactively change what THIS order deducts once the flag is
+  // switched on. A menu item with zero recipe lines snapshots an empty array
+  // (a real, immutable fact captured at order time) — that is NOT the same
+  // as the NULL a pre-existing order (placed before this column existed) has,
+  // which is the only case advanceOrder falls back to a live recipe_lines read.
+  const componentSnapshotByMenuItem = new Map<string, ComponentSnapshotLine[]>();
+  for (const menuItemId of requestedMenuItemIds) {
+    componentSnapshotByMenuItem.set(
+      menuItemId,
+      (linesByMenuItem.get(menuItemId) ?? []).map((line) => ({
+        ingredientId: line.ingredientId,
+        portionQty: String(line.portionQty),
+        uom: line.unit,
+      })),
+    );
   }
 
   const requiredByIngredient = new Map<string, number>();
@@ -463,7 +649,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
       .select()
       .from(warehouses)
       .where(
-        and(eq(warehouses.type, "KITCHEN"), eq(warehouses.locationId, brand.locationId)),
+        and(eq(warehouses.type, "KITCHEN"), eq(warehouses.locationId, accountLocationId)),
       );
 
     if (kitchenWarehouse) {
@@ -566,6 +752,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
           .insert(orders)
           .values({
             brandId: input.brand_id,
+            locationId: accountLocationId,
             aggregatorAccountId: account.id,
             aggregator: input.aggregator,
             externalRef: input.external_ref,
@@ -574,6 +761,10 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
             status: "NEW",
             total,
             placedAt,
+            // W4 (spec section 10, gap B4): immutable commission/marketing
+            // rate snapshot, resolved once above (outside this retry loop).
+            commissionRateSnapshot: commercialTermSnapshot.commissionRateSnapshot,
+            marketingRateSnapshot: commercialTermSnapshot.marketingRateSnapshot,
           })
           .returning();
 
@@ -589,6 +780,10 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
             qty: item.qty,
             stationId: item.stationId,
             notes: item.notes ?? null,
+            // W4-2: frozen recipe snapshot at creation time (see
+            // componentSnapshotByMenuItem above) — [] for a zero-recipe menu
+            // item, never null, for every order created through this path.
+            componentSnapshot: componentSnapshotByMenuItem.get(item.menuItemId) ?? [],
           })),
         );
 
@@ -681,6 +876,7 @@ export async function ingestOrder(db: DB, input: IngestOrderInput): Promise<Inge
 
   const result: IngestResult = {
     order_id: createdOrderId,
+    location_id: accountLocationId,
     status: createdOrderStatus,
     order_code: createdOrderCode,
     print_jobs: createdPrintJobs,
@@ -717,6 +913,7 @@ async function buildDuplicateResponse(
 
   return {
     order_id: existing.id,
+    location_id: existing.locationId,
     status: existing.status,
     order_code: existing.order_code,
     print_jobs: existingJobs.map((j) => ({
@@ -796,11 +993,15 @@ export async function advanceOrder(
       // an outlet-2 order deduct outlet-1 stock). The order's outlet is derived
       // from its brand's home location (D30 transition: orders still key on
       // brand.location_id; see 0015 migration header).
-      const [orderBrand] = await tx
-        .select({ locationId: brands.locationId })
-        .from(brands)
-        .where(eq(brands.id, order.brandId));
-      if (!orderBrand) throw new Error("Order's brand not found.");
+      let orderLocationId = order.locationId;
+      if (!orderLocationId) {
+        const [legacyBrand] = await tx
+          .select({ locationId: brands.locationId })
+          .from(brands)
+          .where(eq(brands.id, order.brandId));
+        if (!legacyBrand) throw new Error("Order's brand not found.");
+        orderLocationId = legacyBrand.locationId;
+      }
 
       const [kitchenWarehouse] = await tx
         .select()
@@ -808,7 +1009,7 @@ export async function advanceOrder(
         .where(
           and(
             eq(warehouses.type, "KITCHEN"),
-            eq(warehouses.locationId, orderBrand.locationId),
+            eq(warehouses.locationId, orderLocationId),
           ),
         );
 
@@ -828,31 +1029,91 @@ export async function advanceOrder(
         .from(orderItems)
         .where(eq(orderItems.orderId, orderId));
 
-      const menuItemIds = [...new Set(items.map((i) => i.menuItemId))];
-      const lines =
-        menuItemIds.length > 0
-          ? await tx
-              .select()
-              .from(recipeLines)
-              .where(inArray(recipeLines.menuItemId, menuItemIds))
-          : [];
-
-      const linesByMenuItem = new Map<string, typeof lines>();
-      for (const line of lines) {
-        const arr = linesByMenuItem.get(line.menuItemId);
-        if (arr) arr.push(line);
-        else linesByMenuItem.set(line.menuItemId, [line]);
-      }
+      // W4-2 (spec §6/§7): with the flag ON, deduction reads each item's
+      // FROZEN order_item.component_snapshot (captured at order creation —
+      // see ingestOrder's componentSnapshotByMenuItem) instead of live
+      // recipe_lines, so a recipe/BOM edit made after this order was accepted
+      // can never change what it deducts. Flag OFF keeps the pre-W4-2
+      // behavior byte-for-byte: always a live recipe_lines read.
+      const useSnapshotDeduction = await isLegacyRecipeSnapshotEnabled(tx);
 
       // qty = Σ portion_qty * order_item.qty per ingredient (Rule #3)
       const deductByIngredient = new Map<string, number>();
-      for (const item of items) {
-        for (const line of linesByMenuItem.get(item.menuItemId) ?? []) {
-          deductByIngredient.set(
-            line.ingredientId,
-            (deductByIngredient.get(line.ingredientId) ?? 0) +
-              Number(line.portionQty) * item.qty,
-          );
+
+      if (useSnapshotDeduction) {
+        // NULL component_snapshot only ever occurs on an order_item created
+        // BEFORE this column existed (schema.ts comment on order_item);
+        // every order_item written by ingestOrder going forward always has
+        // an array (possibly empty). Those NULL rows fall back to a live
+        // recipe_lines read, batched into ONE query for exactly the
+        // menu items that need it (S7 spirit — no per-item query).
+        const fallbackItems = items.filter(
+          (item) => item.componentSnapshot === null || item.componentSnapshot === undefined,
+        );
+        const fallbackMenuItemIds = [...new Set(fallbackItems.map((i) => i.menuItemId))];
+        const fallbackLines =
+          fallbackMenuItemIds.length > 0
+            ? await tx
+                .select()
+                .from(recipeLines)
+                .where(inArray(recipeLines.menuItemId, fallbackMenuItemIds))
+            : [];
+        const fallbackLinesByMenuItem = new Map<string, typeof fallbackLines>();
+        for (const line of fallbackLines) {
+          const arr = fallbackLinesByMenuItem.get(line.menuItemId);
+          if (arr) arr.push(line);
+          else fallbackLinesByMenuItem.set(line.menuItemId, [line]);
+        }
+
+        for (const item of items) {
+          if (item.componentSnapshot === null || item.componentSnapshot === undefined) {
+            // Fallback: pre-existing order_item with no snapshot — live read.
+            for (const line of fallbackLinesByMenuItem.get(item.menuItemId) ?? []) {
+              deductByIngredient.set(
+                line.ingredientId,
+                (deductByIngredient.get(line.ingredientId) ?? 0) +
+                  Number(line.portionQty) * item.qty,
+              );
+            }
+          } else {
+            // Frozen snapshot deduction — immune to later recipe edits.
+            const snapshotLines = item.componentSnapshot as ComponentSnapshotLine[];
+            for (const line of snapshotLines) {
+              deductByIngredient.set(
+                line.ingredientId,
+                (deductByIngredient.get(line.ingredientId) ?? 0) +
+                  Number(line.portionQty) * item.qty,
+              );
+            }
+          }
+        }
+      } else {
+        // Flag OFF — unchanged pre-W4-2 behavior: always a live recipe_lines
+        // read, ignoring component_snapshot entirely.
+        const menuItemIds = [...new Set(items.map((i) => i.menuItemId))];
+        const lines =
+          menuItemIds.length > 0
+            ? await tx
+                .select()
+                .from(recipeLines)
+                .where(inArray(recipeLines.menuItemId, menuItemIds))
+            : [];
+
+        const linesByMenuItem = new Map<string, typeof lines>();
+        for (const line of lines) {
+          const arr = linesByMenuItem.get(line.menuItemId);
+          if (arr) arr.push(line);
+          else linesByMenuItem.set(line.menuItemId, [line]);
+        }
+
+        for (const item of items) {
+          for (const line of linesByMenuItem.get(item.menuItemId) ?? []) {
+            deductByIngredient.set(
+              line.ingredientId,
+              (deductByIngredient.get(line.ingredientId) ?? 0) +
+                Number(line.portionQty) * item.qty,
+            );
+          }
         }
       }
 
@@ -1081,18 +1342,22 @@ export async function cancelOrder(
       let fallbackKitchenWarehouseId: string | null = null;
       const resolveFallback = async (): Promise<string> => {
         if (fallbackKitchenWarehouseId) return fallbackKitchenWarehouseId;
-        const [orderBrand] = await tx
-          .select({ locationId: brands.locationId })
-          .from(brands)
-          .where(eq(brands.id, order.brandId));
-        if (!orderBrand) throw new Error("Order's brand not found.");
+        let orderLocationId = order.locationId;
+        if (!orderLocationId) {
+          const [legacyBrand] = await tx
+            .select({ locationId: brands.locationId })
+            .from(brands)
+            .where(eq(brands.id, order.brandId));
+          if (!legacyBrand) throw new Error("Order's brand not found.");
+          orderLocationId = legacyBrand.locationId;
+        }
         const [kitchenWarehouse] = await tx
           .select({ id: warehouses.id })
           .from(warehouses)
           .where(
             and(
               eq(warehouses.type, "KITCHEN"),
-              eq(warehouses.locationId, orderBrand.locationId),
+              eq(warehouses.locationId, orderLocationId),
             ),
           );
         if (!kitchenWarehouse) {
@@ -1228,8 +1493,14 @@ export async function listOrders(
       .from(brands)
       .where(inArray(brands.locationId, filters.location_ids));
     const brandIds = brandRows.map((b) => b.id);
-    if (brandIds.length === 0) return [];
-    conditions.push(inArray(orders.brandId, brandIds));
+    conditions.push(
+      or(
+        inArray(orders.locationId, filters.location_ids),
+        brandIds.length > 0
+          ? and(sql`${orders.locationId} IS NULL`, inArray(orders.brandId, brandIds))
+          : sql`false`,
+      )!,
+    );
   }
 
   if (filters.brand_id) conditions.push(eq(orders.brandId, filters.brand_id));

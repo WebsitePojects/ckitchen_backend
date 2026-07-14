@@ -1,13 +1,47 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
+import { btree_gist } from "@electric-sql/pglite/contrib/btree_gist";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import type { PgQueryResultHKT } from "drizzle-orm/pg-core";
 import { PgDatabase } from "drizzle-orm/pg-core";
 import postgres from "postgres";
 import { drizzle as drizzlePostgres } from "drizzle-orm/postgres-js";
 import { isPostgresUrl } from "../config.js";
-import * as schema from "./schema.js";
+import * as enterpriseSchema from "./enterprise-schema.js";
+import * as legacySchema from "./schema.js";
+import * as productionSchema from "./production-schema.js";
+import * as returnsSchema from "./returns-schema.js";
+import * as customerOrdersSchema from "./customer-orders-schema.js";
+import * as transferOrdersSchema from "./transfer-orders-schema.js";
+import * as w4Schema from "./w4-schema.js";
+
+// Drizzle receives all bounded schema modules. The legacy module remains the
+// compatibility surface; enterprise-schema owns D35-D46 core stock tables;
+// returns-schema owns the D35-D46 §5 Stock Return Batch tables; production-schema
+// owns the D35-D46 §6 BOM/Job Order tables; customer-orders-schema owns the
+// D35-D46 §7 Customer Order/allocation/fulfillment tables; transfer-orders-schema
+// owns the D35-D46 §2 HQ Transfer Order and QA Release tables; w4-schema owns
+// the W4 client-rules foundation (discount evidence audit log + channel
+// commercial terms, spec §10/§6/§7).
+const schema = {
+  ...legacySchema,
+  ...enterpriseSchema,
+  ...returnsSchema,
+  ...productionSchema,
+  ...customerOrdersSchema,
+  ...transferOrdersSchema,
+  ...w4Schema,
+};
+
+// PGlite contrib extension required by migration 0032's `channel_commercial_term`
+// EXCLUDE USING gist constraint (overlap prevention on effective-dated commercial
+// terms). Registered on every PGlite instance (in-memory + file-backed) so
+// `CREATE EXTENSION IF NOT EXISTS btree_gist` in the migration succeeds under
+// both the test harness and `npm run migrate`'s local dev path. Real Postgres
+// (Supabase, via postgres-js below) ships btree_gist as a standard contrib
+// extension already available to `CREATE EXTENSION`.
+const pgliteExtensions = { btree_gist };
 
 // Common base type for both backends (PGlite and postgres-js each extend PgDatabase with
 // their own query-result HKT). Using the shared base — rather than a union of the two
@@ -52,7 +86,17 @@ export function createDb(opts?: string | CreateDbOptions) {
   if (dataDir && !dataDir.startsWith("memory://")) {
     mkdirSync(dirname(dataDir), { recursive: true });
   }
-  const client = new PGlite(dataDir);
+  // GOTCHA: PGlite's constructor overload resolution does NOT treat an
+  // explicitly-passed `undefined` dataDir the same as omitting the argument
+  // entirely -- calling `new PGlite(undefined, { extensions })` silently
+  // fails to register the extensions (CREATE EXTENSION later errors
+  // "extension \"btree_gist\" is not available"), while `new PGlite({
+  // extensions })` (single-arg form) works. So the in-memory (falsy dataDir)
+  // case must call the one-argument constructor, not pass `undefined`
+  // positionally.
+  const client = dataDir
+    ? new PGlite(dataDir, { extensions: pgliteExtensions })
+    : new PGlite({ extensions: pgliteExtensions });
   const db = drizzlePglite(client, { schema });
   return { client, db };
 }

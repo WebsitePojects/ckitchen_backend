@@ -47,12 +47,37 @@ import { requireAuth, requireRole } from "../auth/middleware.js";
 import { normalizeRole } from "../auth/roles.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
+import {
+  EvidenceValidationError,
+  issueSignedUrl,
+  readLocalEvidenceFile,
+  storeEvidence,
+  verifyEvidenceToken,
+} from "./evidence.js";
 
 type DiscountType = (typeof discountTypeEnum.enumValues)[number];
 type ApprovalLevel = "AUTO" | "SUPERVISOR" | "ADMIN";
 
 const CATALOG_WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 const APPROVAL_QUEUE_ROLES = ["OWNER", "OUTLET_MANAGER"] as const;
+/**
+ * W4 (spec §10): who may pull a signed evidence-image URL. "admin/owner/
+ * accounting" maps to this repo's role set as OWNER (the admin/owner role)
+ * + ACCOUNTING (the finance role that reconciles statutory discounts).
+ */
+const EVIDENCE_ACCESS_ROLES = ["OWNER", "ACCOUNTING"] as const;
+
+/**
+ * W4 (spec §10): `order_discount.evidence_ref` is a private storage key and
+ * MUST NEVER appear in an ordinary order/discount response — only the
+ * dedicated evidence-url endpoint (which audits every access) may resolve it.
+ * Every response builder below that returns an `order_discount` row routes
+ * through this so a forgotten column-list edit can't leak it.
+ */
+function omitEvidenceRef<T extends { evidenceRef?: unknown }>(row: T): Omit<T, "evidenceRef"> {
+  const { evidenceRef: _evidenceRef, ...rest } = row;
+  return rest;
+}
 
 // ---------------------------------------------------------------------------
 // APPROVAL_THRESHOLDS — PH defaults, first cut. CLIENT TO CONFIRM exact
@@ -200,6 +225,8 @@ const applyDiscountSchema = z
     label: z.string().min(1).optional(),
     reason: z.string().min(1, "reason is required"),
     id_note: z.string().min(1).optional(),
+    /** W4 (spec §10): base64 data URI, required for SENIOR/PWD, optional otherwise. */
+    evidence_image: z.string().min(1).optional(),
   })
   .refine((body) => !!body.discount_id || (!!body.type && body.value !== undefined), {
     message: "Provide either discount_id or {type, value}.",
@@ -248,7 +275,7 @@ export function createDiscountsRouter(db: DB): Router {
         .from(orderDiscounts)
         .where(and(eq(orderDiscounts.status, status), inArray(orderDiscounts.orderId, scopeIds)));
     }
-    res.json(rows);
+    res.json(rows.map(omitEvidenceRef));
   });
 
   router.post("/discounts", requireAuth, requireRole(...CATALOG_WRITE_ROLES), async (req, res) => {
@@ -454,6 +481,34 @@ export function createDiscountsRouter(db: DB): Router {
       return;
     }
 
+    // W4 (spec §10): SENIOR/PWD statutory discounts also require a private
+    // ID-image evidence upload — rejected without it. Non-statutory discounts
+    // may optionally attach evidence too (e.g. a manager-approved variable
+    // discount), so evidence_image is stored whenever it is provided.
+    if ((type === "SENIOR" || type === "PWD") && !body.evidence_image) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_ERROR",
+        `evidence_image is required for ${type} discounts.`,
+        { reason: "EVIDENCE_REQUIRED" },
+      );
+      return;
+    }
+    let evidenceRef: string | null = null;
+    if (body.evidence_image) {
+      try {
+        const stored = await storeEvidence({ dataUrl: body.evidence_image });
+        evidenceRef = stored.evidenceRef;
+      } catch (err) {
+        if (err instanceof EvidenceValidationError) {
+          sendError(res, 400, "VALIDATION_ERROR", err.message, { reason: err.code });
+          return;
+        }
+        throw err;
+      }
+    }
+
     const orderTotal = Number(order.total);
     const amount = computeAmount(type, value, orderTotal);
     const percentOfOrder = orderTotal > 0 ? (amount / orderTotal) * 100 : 100;
@@ -473,6 +528,7 @@ export function createDiscountsRouter(db: DB): Router {
         status,
         reason: body.reason,
         idNote: body.id_note ?? null,
+        evidenceRef,
         requestedBy: req.user!.id,
         approvedBy: autoApprove ? req.user!.id : null,
         approvedAt: autoApprove ? now : null,
@@ -491,7 +547,7 @@ export function createDiscountsRouter(db: DB): Router {
 
     const allRows = await db.select().from(orderDiscounts).where(eq(orderDiscounts.orderId, orderId));
     const totals = computeOrderTotals(order.total, allRows);
-    res.status(201).json({ ...row, ...totals });
+    res.status(201).json({ ...omitEvidenceRef(row), ...totals });
   });
 
   router.get("/orders/:id/discounts", requireAuth, async (req, res) => {
@@ -503,7 +559,7 @@ export function createDiscountsRouter(db: DB): Router {
     }
     const rows = await db.select().from(orderDiscounts).where(eq(orderDiscounts.orderId, orderId));
     const totals = computeOrderTotals(order.total, rows);
-    res.json({ discounts: rows, ...totals });
+    res.json({ discounts: rows.map(omitEvidenceRef), ...totals });
   });
 
   // ── Approval queue + decisions ─────────────────────────────────────────
@@ -556,12 +612,86 @@ export function createDiscountsRouter(db: DB): Router {
       const [order] = await db.select().from(orders).where(eq(orders.id, row.orderId));
       const allRows = await db.select().from(orderDiscounts).where(eq(orderDiscounts.orderId, row.orderId));
       const totals = order ? computeOrderTotals(order.total, allRows) : undefined;
-      res.json({ ...updated, ...totals });
+      res.json({ ...omitEvidenceRef(updated), ...totals });
     });
   }
 
   decide("approve");
   decide("reject");
+
+  // ── Evidence access (W4 spec §10) ──────────────────────────────────────
+
+  // Admin/owner/accounting only: mints a short-lived signed URL for a
+  // discount's private evidence image and durably audits the access
+  // (discount_evidence_access_log) in the same DB transaction as issuance.
+  router.get(
+    "/order-discounts/:id/evidence-url",
+    requireAuth,
+    requireRole(...EVIDENCE_ACCESS_ROLES),
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const [row] = await db.select().from(orderDiscounts).where(eq(orderDiscounts.id, id));
+      if (!row) {
+        sendError(res, 404, "NOT_FOUND", "Discount request not found.");
+        return;
+      }
+      if (!row.evidenceRef) {
+        sendError(res, 404, "NOT_FOUND", "No evidence is attached to this discount.");
+        return;
+      }
+      const rawPurpose = req.query.purpose;
+      const purpose = typeof rawPurpose === "string" && rawPurpose.trim() ? rawPurpose.trim() : "review";
+      try {
+        const { url, expiresAt } = await issueSignedUrl(db, {
+          orderDiscountId: row.id,
+          evidenceRef: row.evidenceRef,
+          accessedBy: req.user!.id,
+          purpose,
+        });
+
+        void audit(db, {
+          actorUserId: req.user!.id,
+          actorName: req.user!.name ?? null,
+          sessionId: req.user!.sessionId ?? null,
+          action: "order_discount.evidence_access",
+          description: `Issued a signed evidence URL for order_discount ${id} (purpose: ${purpose})`,
+          entityType: "order_discount",
+          entityId: id,
+        });
+
+        res.json({ url, expires_at: expiresAt.toISOString() });
+      } catch {
+        sendError(res, 500, "EVIDENCE_ERROR", "Failed to issue an evidence URL.");
+      }
+    },
+  );
+
+  // Unauthenticated by design — the signed, short-lived, unguessable token
+  // itself IS the authorization (LocalFsProvider dev/test path only; a real
+  // Cloudinary-configured deployment never routes through here). Every
+  // token was minted by issueSignedUrl(), which already wrote the audit
+  // row at issuance time — this route only ever streams bytes for a token
+  // that passed that gate.
+  router.get("/discount-evidence/:token", async (req, res) => {
+    const token = paramAsString(req.params.token);
+    const result = verifyEvidenceToken(token);
+    if (!result.ok) {
+      if (result.reason === "expired") {
+        res.status(410).end();
+      } else {
+        res.status(404).end();
+      }
+      return;
+    }
+    const file = await readLocalEvidenceFile(result.ref);
+    if (!file) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader("Content-Type", file.mime);
+    res.setHeader("Cache-Control", "no-store");
+    res.send(file.buffer);
+  });
 
   return router;
 }

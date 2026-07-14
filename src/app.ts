@@ -24,6 +24,12 @@ import { createReportsRouter } from "./modules/reports/routes.js";
 import { createAdminRouter } from "./modules/admin/routes.js";
 import { createMeRouter } from "./modules/me/routes.js";
 import { createDiscountsRouter } from "./modules/discounts/routes.js";
+import { createCommercialTermsRouter } from "./modules/commercial-terms/routes.js";
+import { createStockReturnsRouter } from "./modules/stock-returns/routes.js";
+import { createProductionRouter } from "./modules/production/routes.js";
+import { createCustomerOrdersRouter } from "./modules/customer-orders/routes.js";
+import { createTransfersRouter } from "./modules/transfers/routes.js";
+import { createQaReleasesRouter } from "./modules/qa-releases/routes.js";
 import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 
 /**
@@ -107,6 +113,12 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.use("/api/v1", createAdminRouter(db));
   app.use("/api/v1", createMeRouter(db));
   app.use("/api/v1", createDiscountsRouter(db));
+  app.use("/api/v1", createCommercialTermsRouter(db));
+  app.use("/api/v1", createStockReturnsRouter(db, hub));
+  app.use("/api/v1", createProductionRouter(db, hub));
+  app.use("/api/v1", createCustomerOrdersRouter(db, hub));
+  app.use("/api/v1", createTransfersRouter(db, hub));
+  app.use("/api/v1", createQaReleasesRouter(db, hub));
 
   // Safety net — unmatched routes → 404; anything thrown/rejected in a handler
   // is normalized here so internals (stack/SQL) never leak to the client.

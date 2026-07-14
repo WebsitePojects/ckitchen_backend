@@ -196,6 +196,62 @@ export async function seed(db: DB): Promise<SeededUser[]> {
     }
   }
 
+  // --- client-confirmed named people (2026-07-10, enterprise-operations-
+  // foundation.md §10) — standalone employee rows (no user_id/login: emails and
+  // credentials are a controlled activation input and are never fabricated).
+  // attendance_required is explicit per-person, since Owner role alone is not
+  // the historical source of an employee's attendance policy. Idempotent on
+  // employee_no. seed-pilot.ts has no employee-creation logic of its own (it
+  // only adds brands/menu/ingredients on top of this base seed), so these live
+  // here alongside the rest of the employee seeding.
+  const CLIENT_PEOPLE: Array<{
+    employeeNo: string;
+    fullName: string;
+    department: typeof departmentEnum.enumValues[number];
+    position: string;
+    attendanceRequired: boolean;
+  }> = [
+    {
+      employeeNo: "EMP-CLIENT-MSERRANO",
+      fullName: "Manilyn Serrano",
+      department: "ACCOUNTING",
+      position: "Accounting Head / section admin",
+      attendanceRequired: true,
+    },
+    {
+      employeeNo: "EMP-CLIENT-BBUROG",
+      fullName: "Babylyn Burog",
+      department: "ADMIN",
+      position: "Owner / admin",
+      attendanceRequired: false,
+    },
+    {
+      employeeNo: "EMP-CLIENT-BJBUROG",
+      fullName: "BJ Burog",
+      department: "ADMIN",
+      position: "Owner / admin",
+      attendanceRequired: false,
+    },
+  ];
+  for (const person of CLIENT_PEOPLE) {
+    const [existing] = await db
+      .select({ id: employees.id })
+      .from(employees)
+      .where(eq(employees.employeeNo, person.employeeNo));
+    if (!existing) {
+      await db.insert(employees).values({
+        // userId, photoUrl, hiredAt, locationId: unknown per §10 — stay null,
+        // never fabricated.
+        employeeNo: person.employeeNo,
+        fullName: person.fullName,
+        department: person.department,
+        position: person.position,
+        status: "ACTIVE",
+        attendanceRequired: person.attendanceRequired,
+      });
+    }
+  }
+
   // --- role_page_access matrix (idempotent; preserves later admin edits) ------
   await seedRolePageAccess(db);
 

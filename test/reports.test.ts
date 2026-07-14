@@ -40,6 +40,7 @@ import { seed } from "../src/db/seed.js";
 import { loadConfig } from "../src/config.js";
 import { signToken } from "../src/modules/auth/service.js";
 import { aggregatorAccounts, brands, users } from "../src/db/schema.js";
+import { menuItemOutlets } from "../src/db/enterprise-schema.js";
 
 let app: Express;
 let db: DB;
@@ -164,6 +165,10 @@ beforeAll(async () => {
     .send({ name: "AN_Report Item B", price: "300", station_id: grillStationId });
   expect(menuBRes.status).toBe(201);
   const menuBId = menuBRes.body.id as string;
+  await db.insert(menuItemOutlets).values([
+    { menuItemId: menuAId, locationId: outlet1Id, stationId: grillStationId },
+    { menuItemId: menuBId, locationId: outlet2Id, stationId: grillStationId },
+  ]);
 
   async function ingest(
     brandId: string,

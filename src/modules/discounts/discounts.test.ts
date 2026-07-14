@@ -314,7 +314,18 @@ describe("Apply discount — approval routing + effective_total", () => {
     const res = await request(app)
       .post(`/api/v1/orders/${orderId}/discounts`)
       .set("Authorization", `Bearer ${kitchenCrewToken}`)
-      .send({ type: "SENIOR", value: 20, label: "Senior Citizen", reason: "Statutory", id_note: "Senior ID 12345" });
+      .send({
+        type: "SENIOR",
+        value: 20,
+        label: "Senior Citizen",
+        reason: "Statutory",
+        id_note: "Senior ID 12345",
+        // W4 (spec §10): SENIOR/PWD now also requires a private evidence
+        // upload (src/modules/discounts/evidence.ts) — see
+        // test/discount-evidence.test.ts for the full evidence contract;
+        // this fixture only needs valid base64 + an allowed MIME type.
+        evidence_image: "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAA=",
+      });
     expect(res.status).toBe(201);
     expect(res.body.approvalLevel).toBe("AUTO");
     expect(res.body.status).toBe("APPROVED");

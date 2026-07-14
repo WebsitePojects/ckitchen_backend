@@ -47,6 +47,7 @@ import {
   ConflictError,
   InsufficientStockError,
   NotFoundError,
+  ServiceError,
   ValidationError,
   advanceOrder,
   cancelOrder,
@@ -77,6 +78,7 @@ const ingestItemSchema = z.object({
 
 const ingestOrderSchema = z.object({
   brand_id: z.string().uuid(),
+  aggregator_account_id: z.string().uuid().optional(),
   aggregator: z.enum(aggregatorEnum.enumValues),
   external_ref: z.string().min(1),
   customer_name: z.string().optional(),
@@ -107,6 +109,8 @@ function handleServiceError(err: unknown, res: Response): void {
   } else if (err instanceof ConflictError) {
     // FIX A — concurrent double-advance/cancel returns 409 CONFLICT
     sendError(res, 409, err.code, err.message);
+  } else if (err instanceof ServiceError) {
+    sendError(res, err.code === "FORBIDDEN" ? 403 : 409, err.code, err.message);
   } else {
     const message = err instanceof Error ? err.message : "Internal server error.";
     sendError(res, 500, "INTERNAL_ERROR", message);
@@ -123,25 +127,17 @@ function handleServiceError(err: unknown, res: Response): void {
  * ORDER'S OWN room — never "the first location row" (which broadcast every
  * ingest to whichever outlet happened to sort first).
  */
-async function getLocationIdForBrand(db: DB, brandId: string): Promise<string | null> {
-  const [row] = await db
-    .select({ locationId: brands.locationId })
-    .from(brands)
-    .where(eq(brands.id, brandId));
-  return row?.locationId ?? null;
-}
-
 /**
  * Resolves the location_id for a given order by joining order → brand → location.
  * Used for advance / cancel events where we have an orderId but no brand_id in scope.
  */
 async function getLocationIdForOrder(db: DB, orderId: string): Promise<string | null> {
   const rows = await db
-    .select({ locationId: brands.locationId })
+    .select({ orderLocationId: orders.locationId, legacyLocationId: brands.locationId })
     .from(orders)
     .innerJoin(brands, eq(orders.brandId, brands.id))
     .where(eq(orders.id, orderId));
-  return rows[0]?.locationId ?? null;
+  return rows[0]?.orderLocationId ?? rows[0]?.legacyLocationId ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -166,13 +162,10 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     try {
       // S6 — scope check. An unknown brand falls through to the service, which
       // returns the pre-existing 404 (not a misleading 403).
-      const brandLocationId = await getLocationIdForBrand(db, parsed.data.brand_id);
-      if (brandLocationId && !isOutletInScope(req.outletContext, brandLocationId)) {
-        sendError(res, 403, "FORBIDDEN", "Brand is outside your access scope.");
-        return;
-      }
-
-      const result = await ingestOrder(db, parsed.data as IngestOrderInput);
+      const result = await ingestOrder(db, parsed.data as IngestOrderInput, {
+        allowedLocationIds:
+          req.outletContext?.scope === "ALL" ? null : (req.outletContext?.outletIds ?? []),
+      });
 
       // DUPLICATE_ORDER → 200 (idempotent replay, not an error)
       if (result.code === "DUPLICATE_ORDER") {
@@ -200,8 +193,8 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       // Task 8: emit order.created after successful HTTP response is sent.
       // S2 — to the ORDER'S OWN outlet room (brand.location_id), never the
       // deployment's first location row.
-      if (brandLocationId) {
-        hub.emitToLocation(brandLocationId, "order.created", {
+      if (result.location_id) {
+        hub.emitToLocation(result.location_id, "order.created", {
           order_id: result.order_id,
           status: result.status,
           // 0022 — copyable order code, same field name as REST responses.
@@ -215,7 +208,7 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
 
         // S4 — order accepted despite required > available: alert the outlet.
         if (result.stock_risk && result.stock_risk.length > 0) {
-          hub.emitToLocation(brandLocationId, "stock.risk", {
+          hub.emitToLocation(result.location_id, "stock.risk", {
             order_id: result.order_id,
             external_ref: parsed.data.external_ref,
             brand_id: parsed.data.brand_id,

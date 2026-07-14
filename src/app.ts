@@ -30,6 +30,7 @@ import { createProductionRouter } from "./modules/production/routes.js";
 import { createCustomerOrdersRouter } from "./modules/customer-orders/routes.js";
 import { createTransfersRouter } from "./modules/transfers/routes.js";
 import { createQaReleasesRouter } from "./modules/qa-releases/routes.js";
+import { createMiddlewareRouter } from "./modules/middleware/routes.js";
 import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 
 /**
@@ -87,6 +88,9 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
     }),
   );
 
+  // Middleware webhook needs the EXACT raw bytes for signature verification (spec §11) —
+  // scope a raw parser to that one path BEFORE the json parser consumes the stream.
+  app.use("/api/v1/middleware/webhook", express.raw({ type: () => true, limit: "2mb" }));
   app.use(express.json({ limit: "12mb" })); // base64 attendance photos (≤8 MB) must reach the handler, not be 413'd by the parser
   app.set("db", db);
 
@@ -119,6 +123,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.use("/api/v1", createCustomerOrdersRouter(db, hub));
   app.use("/api/v1", createTransfersRouter(db, hub));
   app.use("/api/v1", createQaReleasesRouter(db, hub));
+  app.use("/api/v1", createMiddlewareRouter(db));
 
   // Safety net — unmatched routes → 404; anything thrown/rejected in a handler
   // is normalized here so internals (stack/SQL) never leak to the client.

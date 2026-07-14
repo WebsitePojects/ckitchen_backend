@@ -232,6 +232,13 @@
       "when": 1785100000000,
       "tag": "0032_w4_client_rules_foundation",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1785200000000,
+      "tag": "0033_middleware_events",
+      "breakpoints": true
     }
   ]
 }

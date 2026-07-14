@@ -15,6 +15,7 @@ import * as returnsSchema from "./returns-schema.js";
 import * as customerOrdersSchema from "./customer-orders-schema.js";
 import * as transferOrdersSchema from "./transfer-orders-schema.js";
 import * as w4Schema from "./w4-schema.js";
+import * as middlewareSchema from "./middleware-schema.js";
 
 // Drizzle receives all bounded schema modules. The legacy module remains the
 // compatibility surface; enterprise-schema owns D35-D46 core stock tables;
@@ -23,7 +24,8 @@ import * as w4Schema from "./w4-schema.js";
 // D35-D46 §7 Customer Order/allocation/fulfillment tables; transfer-orders-schema
 // owns the D35-D46 §2 HQ Transfer Order and QA Release tables; w4-schema owns
 // the W4 client-rules foundation (discount evidence audit log + channel
-// commercial terms, spec §10/§6/§7).
+// commercial terms, spec §10/§6/§7); middleware-schema owns the §11 provider
+// event store (webhook intake + async processor).
 const schema = {
   ...legacySchema,
   ...enterpriseSchema,
@@ -32,6 +34,7 @@ const schema = {
   ...customerOrdersSchema,
   ...transferOrdersSchema,
   ...w4Schema,
+  ...middlewareSchema,
 };
 
 // PGlite contrib extension required by migration 0032's `channel_commercial_term`

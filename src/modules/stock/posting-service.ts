@@ -370,6 +370,12 @@ function validateRoute(
     if (new Set(movements.map((m) => m.warehouseId)).size !== 1) {
       reject("An adjustment posting is scoped to one warehouse.");
     }
+  } else {
+    // Fail-closed (W6 hardening): every routeClass MUST have an explicit branch
+    // above. An unrecognized class previously fell through with NO route
+    // validation at all — reject instead so a future StockRouteClass member
+    // added without a validation branch cannot post unchecked.
+    reject(`Unrecognized route class ${policy.routeClass} — no validation branch defined.`);
   }
 }
 

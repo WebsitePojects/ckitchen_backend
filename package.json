@@ -11,6 +11,7 @@
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",
     "seed:pilot": "tsx src/db/seed-pilot.ts",
+    "seed:merchants": "tsx src/db/seed-merchants.ts",
     "agent:mock": "tsx agent-mock/index.ts",
     "db:generate": "drizzle-kit generate"
   },

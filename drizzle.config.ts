@@ -10,6 +10,7 @@ export default defineConfig({
     "./src/db/customer-orders-schema.ts",
     "./src/db/transfer-orders-schema.ts",
     "./src/db/w4-schema.ts",
+    "./src/db/outbound-schema.ts",
   ],
   out: "./drizzle",
 });

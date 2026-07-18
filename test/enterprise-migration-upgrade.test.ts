@@ -13,7 +13,6 @@ import {
   topologyMigrationExceptions,
 } from "../src/db/enterprise-schema.js";
 import {
-  aggregatorAccounts,
   ingredients,
   warehouses,
 } from "../src/db/schema.js";
@@ -96,13 +95,20 @@ describe("migration 0027 production-like upgrade", () => {
     expect(migratedItem.code).toMatch(/^ITM-[A-F0-9]{12}$/);
     const [migratedMain] = await db.select().from(warehouses).where(eq(warehouses.id, main.id));
     expect(migratedMain).toMatchObject({ purpose: "HQ_MAIN", isActive: true });
-    const [migratedListing] = await db
-      .select()
-      .from(aggregatorAccounts)
-      .where(eq(aggregatorAccounts.id, listing.id));
-    expect(migratedListing).toMatchObject({
-      locationId: location.id,
-      mappingStatus: "RESOLVED",
+    // Migration 0035 (outbound aggregator commands) later added control_mode/
+    // api_merchant_id to aggregator_account — columns this deliberately-
+    // frozen-at-0027 physical table does not have yet. A raw-SQL read (like
+    // the legacy inserts above) checks only the columns 0027 itself owns,
+    // instead of `db.select().from(aggregatorAccounts)`, which would select
+    // every column the LIVE Drizzle model knows about and fail with
+    // "column does not exist" against this intentionally-partial schema.
+    const { rows: migratedListingRows } = await client.query<{ location_id: string; mapping_status: string }>(
+      `select location_id, mapping_status from aggregator_account where id = $1`,
+      [listing.id],
+    );
+    expect(migratedListingRows[0]).toMatchObject({
+      location_id: location.id,
+      mapping_status: "RESOLVED",
     });
     expect(
       await db

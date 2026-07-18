@@ -16,6 +16,7 @@ import * as customerOrdersSchema from "./customer-orders-schema.js";
 import * as transferOrdersSchema from "./transfer-orders-schema.js";
 import * as w4Schema from "./w4-schema.js";
 import * as middlewareSchema from "./middleware-schema.js";
+import * as outboundSchema from "./outbound-schema.js";
 
 // Drizzle receives all bounded schema modules. The legacy module remains the
 // compatibility surface; enterprise-schema owns D35-D46 core stock tables;
@@ -25,7 +26,10 @@ import * as middlewareSchema from "./middleware-schema.js";
 // owns the D35-D46 §2 HQ Transfer Order and QA Release tables; w4-schema owns
 // the W4 client-rules foundation (discount evidence audit log + channel
 // commercial terms, spec §10/§6/§7); middleware-schema owns the §11 provider
-// event store (webhook intake + async processor).
+// event store (webhook intake + async processor); outbound-schema owns the
+// AGGREGATOR_API_INTEGRATION_SPEC.md §4-5 outbound aggregator command queue
+// (aggregator_command; the additive control_mode/api_merchant_id columns it
+// needs live directly on schema.ts's existing aggregatorAccounts table).
 const schema = {
   ...legacySchema,
   ...enterpriseSchema,
@@ -35,6 +39,7 @@ const schema = {
   ...transferOrdersSchema,
   ...w4Schema,
   ...middlewareSchema,
+  ...outboundSchema,
 };
 
 // PGlite contrib extension required by migration 0032's `channel_commercial_term`

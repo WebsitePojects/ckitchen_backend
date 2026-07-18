@@ -72,6 +72,7 @@ import {
 } from "../../db/schema.js";
 import { postLedger } from "../inventory/ledger.js";
 import { resolveCommercialTermSnapshots } from "../commercial-terms/service.js";
+import { enqueueLifecycleCommand } from "../outbound/service.js";
 
 type Tx = Parameters<Parameters<DB["transaction"]>[0]>[0];
 
@@ -1250,6 +1251,29 @@ export async function advanceOrder(
     }
     // ── END DEDUCTION ENGINE ───────────────────────────────────────────────
   });
+
+  // Outbound integration hook (AGGREGATOR_API_INTEGRATION_SPEC.md §4-5):
+  // best-effort, AFTER the order-transition transaction above has already
+  // committed — outbound sync to Grab/foodpanda must never block or roll
+  // back a stock-critical order transition (the commit above is already
+  // durable regardless of what happens next). enqueueLifecycleCommand
+  // itself no-ops unless integration.outbound_commands is ON AND the
+  // order's channel listing is control_mode=API ("feature-flagged, no
+  // behavior change when flag off or mode DEVICE"). Awaited (not truly
+  // fire-and-forget) so callers/tests see a deterministic result — any
+  // unexpected failure is caught and logged, never thrown, so a bug in the
+  // outbound queue can never surface as an advanceOrder failure.
+  if (next === "PREPARING" || next === "READY") {
+    await enqueueLifecycleCommand(db, {
+      orderId: updatedOrder.id,
+      aggregatorAccountId: updatedOrder.aggregatorAccountId,
+      stage: next,
+      actorUserId: userId ?? null,
+    }).catch((err) => {
+      console.error("[orders] outbound lifecycle command hook failed", err);
+      return null;
+    });
+  }
 
   return {
     order_id: updatedOrder.id,

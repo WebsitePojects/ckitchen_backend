@@ -55,6 +55,19 @@ export const printerCapabilityEnum = pgEnum("printer_capability", ["ESC_POS_KOT"
 export const printerTransportEnum = pgEnum("printer_transport", ["PHYSICAL", "VIRTUAL"]);
 export const printAttemptResultEnum = pgEnum("print_attempt_result", ["PRINTED", "FAILED", "LEASE_EXPIRED"]);
 
+/**
+ * Outbound integration (migration 0035, AGGREGATOR_API_INTEGRATION_SPEC.md
+ * §5 cutover plan): who is authoritative for a channel listing's order
+ * accept/reject/ready/pause/availability actions.
+ *   DEVICE — the merchant tablet/phone is authoritative; ORION never sends
+ *            outbound commands for this listing (default — safe for every
+ *            existing listing until a client explicitly cuts over).
+ *   SHADOW — ORION ingests read-only in parallel for reconciliation; it may
+ *            send NOTIFY_MENU_UPDATED only (never order-affecting commands).
+ *   API    — ORION is authoritative; the device becomes standby.
+ */
+export const channelControlModeEnum = pgEnum("channel_control_mode", ["DEVICE", "SHADOW", "API"]);
+
 export const locationStatusEnum = pgEnum("location_status", ["ACTIVE", "INACTIVE"]);
 
 /** W5 (admin backend): account status. BLOCKED users are refused login (checked
@@ -223,6 +236,16 @@ export const aggregatorAccounts = pgTable(
      * client supplies real per-listing rates (CLIENT_QUESTIONS Part 2).
      */
     commissionRate: numeric("commission_rate", { precision: 5, scale: 2 }),
+    /**
+     * Outbound integration (migration 0035): who is authoritative for this
+     * listing's order accept/reject/ready/pause/availability actions.
+     * Defaults DEVICE — every existing listing keeps running on its
+     * merchant tablet/phone until explicitly cut over (AGGREGATOR_API_
+     * INTEGRATION_SPEC.md §5).
+     */
+    controlMode: channelControlModeEnum("control_mode").notNull().default("DEVICE"),
+    /** Grab merchantID / Delivery Hero (foodpanda) vendor id, once partner API access is issued. */
+    apiMerchantId: text("api_merchant_id"),
   },
   (table) => [
     index("aggregator_account_brand_id_idx").on(table.brandId),

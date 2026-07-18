@@ -40,7 +40,7 @@
 import { Router, type Request, type Response } from "express";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { aggregatorCommandStatusEnum, aggregatorCommandTypeEnum } from "../../db/outbound-schema.js";
+import { aggregatorCommandStatusEnum, aggregatorCommandTypeEnum, orderDisputeStatusEnum } from "../../db/outbound-schema.js";
 import { channelControlModeEnum } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
@@ -48,8 +48,17 @@ import { normalizeRole } from "../auth/roles.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { OutboundError } from "./errors.js";
 import { KITCHEN_CREW_ALLOWED_COMMAND_TYPES } from "./policies.js";
-import { enqueueCommand, getListingById, listChannelListings, listCommands, listListingItems, updateControlMode } from "./service.js";
-import type { OutboundCommandType } from "./types.js";
+import {
+  createDispute,
+  enqueueCommand,
+  getListingById,
+  listChannelListings,
+  listCommands,
+  listDisputes,
+  listListingItems,
+  updateControlMode,
+} from "./service.js";
+import { DISPUTE_REASON_CODES, type OutboundCommandType } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Bounds
@@ -66,6 +75,7 @@ const MAX_OFFSET = 1_000_000;
 const COMMAND_TYPES = aggregatorCommandTypeEnum.enumValues;
 const COMMAND_STATUSES = aggregatorCommandStatusEnum.enumValues;
 const CONTROL_MODES = channelControlModeEnum.enumValues;
+const DISPUTE_STATUSES = orderDisputeStatusEnum.enumValues;
 
 const uuidSchema = z.string().uuid();
 
@@ -96,6 +106,11 @@ const availabilitySchema = z
   .object({
     available: z.boolean(),
     reason: z.string().trim().max(MAX_REASON_LEN).optional(),
+    // Migration 0036 (finding F/G) — foodpanda's yellow/grey snooze legend:
+    // null/absent = indefinite. The sugar route below is always ITEM-scoped
+    // by URL shape; OPTION_GROUP scope goes through the generic /commands
+    // route with the full payload (scope + option_group_id).
+    unavailable_until: z.string().datetime({ offset: true }).nullable().optional(),
   })
   .strict();
 
@@ -108,6 +123,20 @@ const controlModeSchema = z
 const listQuerySchema = z.object({
   listing_id: uuidSchema.optional(),
   status: z.enum(COMMAND_STATUSES as [string, ...string[]]).optional(),
+  limit: z.coerce.number().int().positive().max(MAX_LIMIT).optional(),
+  offset: z.coerce.number().int().nonnegative().max(MAX_OFFSET).optional(),
+});
+
+const contestCancellationSchema = z
+  .object({
+    dispute_reason: z.enum(DISPUTE_REASON_CODES as unknown as [string, ...string[]]),
+    evidence_note: z.string().trim().max(MAX_REASON_LEN).optional(),
+  })
+  .strict();
+
+const listDisputesQuerySchema = z.object({
+  listing_id: uuidSchema.optional(),
+  status: z.enum(DISPUTE_STATUSES as [string, ...string[]]).optional(),
   limit: z.coerce.number().int().positive().max(MAX_LIMIT).optional(),
   offset: z.coerce.number().int().nonnegative().max(MAX_OFFSET).optional(),
 });
@@ -150,6 +179,22 @@ function toCommandResponse(cmd: Awaited<ReturnType<typeof enqueueCommand>>) {
     provider_ref: cmd.providerRef,
     created_at: cmd.createdAt,
     updated_at: cmd.updatedAt,
+  };
+}
+
+function toDisputeResponse(d: Awaited<ReturnType<typeof createDispute>>) {
+  return {
+    id: d.id,
+    order_id: d.orderId,
+    raised_by: d.raisedBy,
+    reason: d.reason,
+    status: d.status,
+    aggregator_command_id: d.aggregatorCommandId,
+    evidence_note: d.evidenceNote,
+    resolved_at: d.resolvedAt,
+    resolution_note: d.resolutionNote,
+    created_at: d.createdAt,
+    updated_at: d.updatedAt,
   };
 }
 
@@ -196,6 +241,21 @@ export function createOutboundRouter(db: DB): Router {
       }
 
       const commandType = parsed.data.command_type as OutboundCommandType;
+
+      // Migration 0036 (finding N2) — CONTEST_CANCELLATION must always create
+      // its paired order_dispute row; the generic route has no way to do
+      // that, so it refuses the type outright and points callers at the
+      // dedicated endpoint (createDispute is the only writer of that type).
+      if (commandType === "CONTEST_CANCELLATION") {
+        sendError(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          "CONTEST_CANCELLATION must be raised via POST /channel-listings/:id/orders/:orderId/contest-cancellation.",
+        );
+        return;
+      }
+
       const role = normalizeRole(req.user!.role);
       if (role === "KITCHEN_CREW" && !KITCHEN_CREW_ALLOWED_COMMAND_TYPES.has(commandType)) {
         sendError(res, 403, "FORBIDDEN", `KITCHEN_CREW may not send ${commandType}.`);
@@ -324,6 +384,9 @@ export function createOutboundRouter(db: DB): Router {
             item_id: itemId,
             available: parsed.data.available,
             ...(parsed.data.reason !== undefined ? { reason: parsed.data.reason } : {}),
+            // Migration 0036 (finding F/G) — always ITEM-scoped via this
+            // URL shape; OPTION_GROUP scope is generic-route-only.
+            ...(parsed.data.unavailable_until !== undefined ? { unavailable_until: parsed.data.unavailable_until } : {}),
           },
           idempotencyKey,
           ...actorCtx(req),
@@ -334,6 +397,80 @@ export function createOutboundRouter(db: DB): Router {
       }
     },
   );
+
+  // ── POST /channel-listings/:id/orders/:orderId/contest-cancellation ────
+  router.post(
+    "/channel-listings/:id/orders/:orderId/contest-cancellation",
+    requireAuth,
+    requireRole("OWNER", "OUTLET_MANAGER"),
+    resolveOutletContext,
+    async (req, res) => {
+      const idempotencyKey = requireBoundedHeader(req, res, "Idempotency-Key");
+      if (idempotencyKey === null) return;
+
+      const id = paramAsString(req.params.id);
+      const orderId = paramAsString(req.params.orderId);
+      if (!uuidSchema.safeParse(orderId).success) {
+        sendError(res, 400, "VALIDATION_ERROR", "orderId must be a valid UUID.");
+        return;
+      }
+      const parsed = contestCancellationSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "Invalid contest-cancellation payload.", parsed.error.issues);
+        return;
+      }
+
+      const listing = await loadListingInScope(req, res, id);
+      if (!listing) return;
+
+      try {
+        const dispute = await createDispute(db, {
+          aggregatorAccountId: id,
+          orderId,
+          disputeReason: parsed.data.dispute_reason as (typeof DISPUTE_REASON_CODES)[number],
+          evidenceNote: parsed.data.evidence_note ?? null,
+          idempotencyKey,
+          ...actorCtx(req),
+        });
+        res.status(201).json(toDisputeResponse(dispute));
+      } catch (err) {
+        handleServiceError(err, res);
+      }
+    },
+  );
+
+  // ── GET /order-disputes ─────────────────────────────────────────────────
+  // Mirrors GET /outbound-commands: the durable, queryable record of every
+  // contested cancel-after-accept order (site-visit finding N2 — foodpanda's
+  // own app purges order history in ~2 days; ORION does not).
+  router.get("/order-disputes", requireAuth, requireRole("OWNER", "OUTLET_MANAGER"), resolveOutletContext, async (req, res) => {
+    const parsed = listDisputesQuerySchema.safeParse(req.query ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid query parameters.", parsed.error.issues);
+      return;
+    }
+    const { listing_id, status, limit, offset } = parsed.data;
+
+    if (listing_id) {
+      const listing = await loadListingInScope(req, res, listing_id);
+      if (!listing) return;
+    } else if (req.outletContext && req.outletContext.scope !== "ALL" && req.outletContext.outletIds.length === 0) {
+      sendError(res, 403, "FORBIDDEN", "No outlet in your access scope.");
+      return;
+    }
+
+    const ctx = req.outletContext;
+    const allowedLocationIds = listing_id ? undefined : ctx && ctx.scope !== "ALL" ? ctx.outletIds : null;
+
+    const { items, total } = await listDisputes(db, {
+      ...(listing_id ? { aggregatorAccountId: listing_id } : {}),
+      ...(status ? { status: status as (typeof DISPUTE_STATUSES)[number] } : {}),
+      limit: limit ?? DEFAULT_LIMIT,
+      offset: offset ?? 0,
+      allowedLocationIds,
+    });
+    res.json({ items: items.map(toDisputeResponse), total, limit: limit ?? DEFAULT_LIMIT, offset: offset ?? 0 });
+  });
 
   // ── PATCH /channel-listings/:id/control-mode ────────────────────────────
   router.patch(

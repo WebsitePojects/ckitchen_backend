@@ -154,6 +154,8 @@ export interface IngestResult {
    * for pre-0022 legacy rows that somehow escaped the backfill).
    */
   order_code: string | null;
+  /** Migration 0036 (finding B) — null unless the listing is control_mode=API. */
+  accept_deadline_at: string | null;
   print_jobs: PrintJobSummary[];
   /** Present only on DUPLICATE_ORDER responses. */
   code?: "DUPLICATE_ORDER";
@@ -576,6 +578,19 @@ export async function ingestOrder(
 
   const placedAt = input.placed_at ? new Date(input.placed_at) : new Date();
 
+  // Migration 0036 (site-visit finding B, client-confirmed: "Accept your
+  // order within 5 minutes — orders that are ignored will expire and your
+  // store will be paused"). Only meaningful once ORION is authoritative for
+  // the listing (control_mode=API) — a DEVICE/SHADOW listing's merchant
+  // tablet/phone owns that SLA today, so accept_deadline_at stays null.
+  // account.accept_sla_seconds (aggregator_account) is the per-listing
+  // override; null falls back to the observed 300s (5 min) Grab default.
+  const DEFAULT_ACCEPT_SLA_SECONDS = 300;
+  const acceptDeadlineAt =
+    account.controlMode === "API"
+      ? new Date(placedAt.getTime() + (account.acceptSlaSeconds ?? DEFAULT_ACCEPT_SLA_SECONDS) * 1000)
+      : null;
+
   // W4 (spec section 10, gap B4): resolve + freeze the BASE + MARKETING
   // commercial-term snapshot at order-placement time. NEVER recomputed from
   // channel_commercial_term later -- reports read this snapshot, not live
@@ -766,6 +781,8 @@ export async function ingestOrder(
             // rate snapshot, resolved once above (outside this retry loop).
             commissionRateSnapshot: commercialTermSnapshot.commissionRateSnapshot,
             marketingRateSnapshot: commercialTermSnapshot.marketingRateSnapshot,
+            // Migration 0036 (finding B) — accept-SLA deadline, resolved once above.
+            acceptDeadlineAt,
           })
           .returning();
 
@@ -880,6 +897,7 @@ export async function ingestOrder(
     location_id: accountLocationId,
     status: createdOrderStatus,
     order_code: createdOrderCode,
+    accept_deadline_at: acceptDeadlineAt ? acceptDeadlineAt.toISOString() : null,
     print_jobs: createdPrintJobs,
   };
   if (shortfalls.length > 0) {
@@ -917,6 +935,7 @@ async function buildDuplicateResponse(
     location_id: existing.locationId,
     status: existing.status,
     order_code: existing.order_code,
+    accept_deadline_at: existing.acceptDeadlineAt ? existing.acceptDeadlineAt.toISOString() : null,
     print_jobs: existingJobs.map((j) => ({
       id: j.id,
       station: stationNameById.get(j.stationId) ?? j.stationId,

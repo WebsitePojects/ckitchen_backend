@@ -246,6 +246,14 @@ export const aggregatorAccounts = pgTable(
     controlMode: channelControlModeEnum("control_mode").notNull().default("DEVICE"),
     /** Grab merchantID / Delivery Hero (foodpanda) vendor id, once partner API access is issued. */
     apiMerchantId: text("api_merchant_id"),
+    /**
+     * Migration 0036 (site-visit finding B — "5-minute accept countdown +
+     * store auto-pauses if ignored"): per-listing override of the accept SLA
+     * window in seconds. NULL = use the 300s (5 min) fallback that matches
+     * the observed Grab merchant-app countdown. Only meaningful for
+     * control_mode=API listings (see orders.accept_deadline_at).
+     */
+    acceptSlaSeconds: integer("accept_sla_seconds"),
   },
   (table) => [
     index("aggregator_account_brand_id_idx").on(table.brandId),
@@ -598,6 +606,18 @@ export const orders = pgTable(
     commissionRateSnapshot: numeric("commission_rate_snapshot", { precision: 5, scale: 2 }),
     /** W4 (spec §10): the channel's MARKETING rate percent snapshot, same rules as above. */
     marketingRateSnapshot: numeric("marketing_rate_snapshot", { precision: 5, scale: 2 }),
+    /**
+     * Migration 0036 (site-visit finding B, client-confirmed: "Accept your
+     * order within 5 minutes — orders that are ignored will expire and your
+     * store will be paused"). Populated at ingest ONLY for control_mode=API
+     * listings: placed_at + (aggregator_account.accept_sla_seconds ?? 300).
+     * NULL for DEVICE/SHADOW listings (the merchant tablet/phone owns that
+     * SLA today; ORION has nothing to enforce until the listing cuts over).
+     * Informational only in this stream — no auto-pause/expiry job reads it
+     * yet; it exists so the merchant console can render the same countdown
+     * urgency the Grab app shows.
+     */
+    acceptDeadlineAt: timestamp("accept_deadline_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

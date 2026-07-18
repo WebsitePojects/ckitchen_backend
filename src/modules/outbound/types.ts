@@ -60,3 +60,31 @@ export interface AggregatorOutboundAdapter {
 }
 
 export type { AggregatorCommand };
+
+// ---------------------------------------------------------------------------
+// Migration 0036 additions
+// ---------------------------------------------------------------------------
+
+/**
+ * REJECT_ORDER controlled vocabulary (site-visit finding H: "aggregators
+ * require an enumerated reason list; free-text reason only" was a gap).
+ * OTHER requires a non-empty `note` (validated in service.ts); every other
+ * code's `note` is optional free text.
+ */
+export const REJECT_REASON_CODES = [
+  "OUT_OF_STOCK",
+  "KITCHEN_CLOSED",
+  "TOO_BUSY",
+  "CUSTOMER_REQUEST",
+  "INCORRECT_ORDER",
+  "OTHER",
+] as const;
+export type RejectReasonCode = (typeof REJECT_REASON_CODES)[number];
+
+/** order_dispute.reason / CONTEST_CANCELLATION payload dispute_reason (site-visit finding N2). */
+export const DISPUTE_REASON_CODES = ["SUSPECTED_FRAUD", "ALREADY_PREPARED", "RIDER_NO_SHOW", "OTHER"] as const;
+export type DisputeReasonCode = (typeof DISPUTE_REASON_CODES)[number];
+
+/** SET_ITEM_AVAILABILITY payload `scope` (site-visit finding F/G). Default ITEM for backward compat. */
+export const AVAILABILITY_SCOPES = ["ITEM", "OPTION_GROUP"] as const;
+export type AvailabilityScope = (typeof AVAILABILITY_SCOPES)[number];

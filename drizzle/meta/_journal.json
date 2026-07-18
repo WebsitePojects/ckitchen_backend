@@ -253,6 +253,13 @@
       "when": 1785300000000,
       "tag": "0035_outbound_commands",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1785400000000,
+      "tag": "0036_merchant_console_parity",
+      "breakpoints": true
     }
   ]
 }

@@ -13,7 +13,13 @@
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { menuItemOutlets, operationalFeatureFlags } from "../../db/enterprise-schema.js";
-import { aggregatorCommands, type AggregatorCommand } from "../../db/outbound-schema.js";
+import {
+  aggregatorCommands,
+  menuOptionGroups,
+  orderDisputes,
+  type AggregatorCommand,
+  type OrderDispute,
+} from "../../db/outbound-schema.js";
 import { aggregatorAccounts, auditLogs, brands, locations, menuItems, orders, type AggregatorAccount } from "../../db/schema.js";
 import { OutboundError } from "./errors.js";
 import {
@@ -23,7 +29,18 @@ import {
   OUTBOUND_COMMANDS_FLAG,
   SHADOW_MODE_ALLOWED_COMMAND_TYPES,
 } from "./policies.js";
-import type { OutboundCommandStatus, OutboundCommandType } from "./types.js";
+import {
+  AVAILABILITY_SCOPES,
+  DISPUTE_REASON_CODES,
+  REJECT_REASON_CODES,
+  type AvailabilityScope,
+  type DisputeReasonCode,
+  type OutboundCommandStatus,
+  type OutboundCommandType,
+  type RejectReasonCode,
+} from "./types.js";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -67,6 +84,83 @@ function assertControlModeAllows(listing: AggregatorAccount, commandType: Outbou
 
 function buildStoredKey(input: { aggregatorAccountId: string; orderId?: string | null; commandType: OutboundCommandType; idempotencyKey: string }): string {
   return `${input.aggregatorAccountId}:${input.orderId ?? "L"}:${input.commandType}:${input.idempotencyKey}`;
+}
+
+function asPayloadObject(payload: unknown): Record<string, unknown> {
+  return payload && typeof payload === "object" && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {};
+}
+
+/**
+ * Migration 0036 (finding H) — REJECT_ORDER's `reason` moves from free text
+ * to a controlled vocabulary. `reason_code` must be one of
+ * REJECT_REASON_CODES; `OTHER` additionally requires a non-empty `note`.
+ */
+function assertValidRejectReasonPayload(payload: unknown): void {
+  const p = asPayloadObject(payload);
+  const code = p["reason_code"];
+  if (typeof code !== "string" || !(REJECT_REASON_CODES as readonly string[]).includes(code)) {
+    throw new OutboundError(
+      "VALIDATION",
+      `REJECT_ORDER requires a valid "reason_code" (one of: ${REJECT_REASON_CODES.join(", ")}).`,
+      400,
+      { field: "reason_code" },
+    );
+  }
+  if ((code as RejectReasonCode) === "OTHER") {
+    const note = p["note"];
+    if (typeof note !== "string" || note.trim().length === 0) {
+      throw new OutboundError(
+        "VALIDATION",
+        `REJECT_ORDER reason_code "OTHER" requires a non-empty free-text "note".`,
+        400,
+        { field: "note" },
+      );
+    }
+  }
+}
+
+/**
+ * Migration 0036 (finding F/G) — SET_ITEM_AVAILABILITY additive payload
+ * fields: `scope` ("ITEM" default | "OPTION_GROUP"), `option_group_id`
+ * (required + validated when scope=OPTION_GROUP), `unavailable_until`
+ * (ISO date | null, foodpanda's yellow/grey snooze legend). A payload with
+ * none of these fields (the pre-0036 shape) validates unchanged as ITEM.
+ */
+async function assertValidItemAvailabilityPayload(db: DB, listing: AggregatorAccount, payload: unknown): Promise<void> {
+  const p = asPayloadObject(payload);
+  const scopeRaw = p["scope"];
+  const scope: AvailabilityScope = scopeRaw === undefined ? "ITEM" : (scopeRaw as AvailabilityScope);
+  if (!(AVAILABILITY_SCOPES as readonly string[]).includes(scope)) {
+    throw new OutboundError("VALIDATION", `SET_ITEM_AVAILABILITY "scope" must be one of: ${AVAILABILITY_SCOPES.join(", ")}.`, 400, {
+      field: "scope",
+    });
+  }
+
+  const optionGroupId = p["option_group_id"];
+  if (scope === "OPTION_GROUP") {
+    if (typeof optionGroupId !== "string" || !UUID_RE.test(optionGroupId)) {
+      throw new OutboundError("VALIDATION", `SET_ITEM_AVAILABILITY scope=OPTION_GROUP requires a valid "option_group_id".`, 400, {
+        field: "option_group_id",
+      });
+    }
+    const [group] = await db.select().from(menuOptionGroups).where(eq(menuOptionGroups.id, optionGroupId));
+    if (!group || group.brandId !== listing.brandId) {
+      throw new OutboundError("NOT_FOUND", `Option group ${optionGroupId} not found for this listing's brand.`, 404);
+    }
+  } else if (optionGroupId !== undefined) {
+    throw new OutboundError("VALIDATION", `"option_group_id" is only valid when scope=OPTION_GROUP.`, 400, {
+      field: "option_group_id",
+    });
+  }
+
+  const until = p["unavailable_until"];
+  if (until !== undefined && until !== null) {
+    if (typeof until !== "string" || Number.isNaN(Date.parse(until))) {
+      throw new OutboundError("VALIDATION", `"unavailable_until" must be a valid ISO date string or null.`, 400, {
+        field: "unavailable_until",
+      });
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +207,15 @@ export async function enqueueCommand(db: DB, input: EnqueueCommandInput): Promis
   }
 
   assertControlModeAllows(listing, input.commandType);
+
+  // Migration 0036 — per-command-type payload validation, centralized here so
+  // every caller (generic route, sugar routes, createDispute, the order-
+  // lifecycle hook) gets the same guarantees regardless of entry point.
+  if (input.commandType === "REJECT_ORDER") {
+    assertValidRejectReasonPayload(input.payload);
+  } else if (input.commandType === "SET_ITEM_AVAILABILITY") {
+    await assertValidItemAvailabilityPayload(db, listing, input.payload);
+  }
 
   if (ORDER_SCOPED_COMMAND_TYPES.has(input.commandType)) {
     if (!input.orderId) {
@@ -333,8 +436,16 @@ export async function listCommands(db: DB, input: ListCommandsInput): Promise<Li
     .orderBy(desc(aggregatorCommands.createdAt))
     .limit(input.limit)
     .offset(input.offset);
-  const totalRows = await db.select({ id: aggregatorCommands.id }).from(aggregatorCommands).where(whereClause);
-  return { items, total: totalRows.length };
+  // Migration 0036 (site-visit §7 scale note) — a SQL count(*) instead of a
+  // full-row select().length: the old shape read every matching row just to
+  // discard it for the count, which gets expensive as command/audit history
+  // grows past 50+ listings (aggregator_command_account_status_created_idx
+  // in outbound-schema.ts backs this same WHERE shape).
+  const [{ count }] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(aggregatorCommands)
+    .where(whereClause);
+  return { items, total: count };
 }
 
 export async function getCommandById(db: DB, id: string): Promise<AggregatorCommand | undefined> {
@@ -362,6 +473,8 @@ export interface ChannelListingView {
   merchantId: string | null;
   pausedReason: string | null;
   pausedUntil: string | null;
+  /** Migration 0036 (finding B) — per-listing accept-SLA override in seconds; null = 300s fallback. */
+  acceptSlaSeconds: number | null;
 }
 
 /**
@@ -388,6 +501,7 @@ export async function listChannelListings(
       controlMode: aggregatorAccounts.controlMode,
       apiMerchantId: aggregatorAccounts.apiMerchantId,
       externalMerchantId: aggregatorAccounts.externalMerchantId,
+      acceptSlaSeconds: aggregatorAccounts.acceptSlaSeconds,
       brandId: brands.id,
       brandName: brands.name,
       brandColor: brands.color,
@@ -409,6 +523,7 @@ export async function listChannelListings(
     merchantId: r.apiMerchantId ?? r.externalMerchantId ?? null,
     pausedReason: null,
     pausedUntil: null,
+    acceptSlaSeconds: r.acceptSlaSeconds ?? null,
   }));
 }
 
@@ -454,4 +569,243 @@ export async function listListingItems(
     price: i.price === null ? null : Number(i.price),
     available: (i.deploymentAvailability ?? i.itemAvailability) === "AVAILABLE",
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Dispute/contest workflow (migration 0036, site-visit finding N2)
+// ---------------------------------------------------------------------------
+
+export interface CreateDisputeInput {
+  aggregatorAccountId: string;
+  orderId: string;
+  disputeReason: DisputeReasonCode;
+  evidenceNote?: string | null;
+  idempotencyKey: string;
+  actorUserId?: string | null;
+  sessionId?: string | null;
+  actorName?: string | null;
+}
+
+/**
+ * Raises a contest against a cancel-after-accept order: validates the order
+ * is CANCELLED, enqueues a CONTEST_CANCELLATION aggregator_command (through
+ * the normal enqueueCommand gates — feature flag, control_mode, listing
+ * ownership), and records the durable order_dispute row linking to it.
+ *
+ * Idempotent two ways: (1) a repeat call for an order that ALREADY has a
+ * dispute returns the existing row without enqueueing a second command; (2)
+ * a race between two concurrent first-time calls is resolved by the
+ * order_dispute_order_id_unique constraint — the loser re-reads and returns
+ * the winner's row (FIX C style, mirrors enqueueCommand's own race handling).
+ */
+export async function createDispute(db: DB, input: CreateDisputeInput): Promise<OrderDispute> {
+  if (!(DISPUTE_REASON_CODES as readonly string[]).includes(input.disputeReason)) {
+    throw new OutboundError(
+      "VALIDATION",
+      `dispute_reason must be one of: ${DISPUTE_REASON_CODES.join(", ")}.`,
+      400,
+      { field: "dispute_reason" },
+    );
+  }
+
+  const [order] = await db
+    .select({
+      id: orders.id,
+      status: orders.status,
+      aggregatorAccountId: orders.aggregatorAccountId,
+      locationId: orders.locationId,
+    })
+    .from(orders)
+    .where(eq(orders.id, input.orderId));
+  if (!order) {
+    throw new OutboundError("NOT_FOUND", `Order ${input.orderId} not found.`, 404);
+  }
+  if (order.aggregatorAccountId !== input.aggregatorAccountId) {
+    throw new OutboundError(
+      "VALIDATION",
+      `Order ${input.orderId} does not belong to channel listing ${input.aggregatorAccountId}.`,
+      400,
+    );
+  }
+  // Site-visit N2: only a cancel-after-accept order is contestable — this is
+  // specifically the fraud pattern the client described ("biglang cancel...
+  // natanggap na niya... parang modus"), not a general refund action.
+  if (order.status !== "CANCELLED") {
+    throw new OutboundError(
+      "VALIDATION",
+      `Order ${input.orderId} is ${order.status}; only a CANCELLED order can be contested.`,
+      400,
+      { status: order.status },
+    );
+  }
+
+  const [existing] = await db.select().from(orderDisputes).where(eq(orderDisputes.orderId, input.orderId));
+  if (existing) return existing; // idempotent replay — no new command, no new row
+
+  const command = await enqueueCommand(db, {
+    aggregatorAccountId: input.aggregatorAccountId,
+    orderId: input.orderId,
+    commandType: "CONTEST_CANCELLATION",
+    payload: {
+      dispute_reason: input.disputeReason,
+      ...(input.evidenceNote ? { evidence_note: input.evidenceNote } : {}),
+    },
+    idempotencyKey: input.idempotencyKey,
+    actorUserId: input.actorUserId ?? null,
+    sessionId: input.sessionId ?? null,
+    actorName: input.actorName ?? null,
+  });
+
+  try {
+    return await db.transaction(async (tx) => {
+      // enqueueCommand is itself idempotent on the exact key — a replay of
+      // the SAME command may already have a dispute row linked to it.
+      const [already] = await tx.select().from(orderDisputes).where(eq(orderDisputes.aggregatorCommandId, command.id));
+      if (already) return already;
+
+      const [created] = await tx
+        .insert(orderDisputes)
+        .values({
+          orderId: input.orderId,
+          raisedBy: input.actorUserId ?? null,
+          reason: input.disputeReason,
+          status: "OPEN",
+          aggregatorCommandId: command.id,
+          evidenceNote: input.evidenceNote ?? null,
+        })
+        .returning();
+
+      await tx.insert(auditLogs).values({
+        actorUserId: input.actorUserId ?? null,
+        actorName: input.actorName ?? null,
+        sessionId: input.sessionId ?? null,
+        locationId: order.locationId,
+        action: "order_dispute.raised",
+        description: `Contested cancel-after-accept order ${input.orderId} (${input.disputeReason}).`,
+        entityType: "order_dispute",
+        entityId: created!.id,
+        metadata: { orderId: input.orderId, aggregatorCommandId: command.id, reason: input.disputeReason },
+      });
+
+      return created!;
+    });
+  } catch (err) {
+    // Race: two concurrent first-time contests for the same order — one
+    // INSERT wins, the other hits order_dispute_order_id_unique. A failed
+    // statement aborts the WHOLE transaction (Postgres: no further commands
+    // until ROLLBACK) — the recovery re-query MUST run after that
+    // transaction has unwound (via the outer `db`, not `tx`), never inside
+    // the same aborted transaction.
+    if (isUniqueViolation(err)) {
+      const [raceExisting] = await db.select().from(orderDisputes).where(eq(orderDisputes.orderId, input.orderId));
+      if (raceExisting) return raceExisting;
+    }
+    throw err;
+  }
+}
+
+export interface ResolveDisputeInput {
+  disputeId: string;
+  status: "CONTESTED" | "RESOLVED_MERCHANT_FAVOR" | "RESOLVED_AGGREGATOR_FAVOR" | "EXPIRED";
+  resolutionNote?: string | null;
+  actorUserId?: string | null;
+  sessionId?: string | null;
+  actorName?: string | null;
+}
+
+/**
+ * Internal reconciliation helper (no HTTP route in this stream — out of
+ * scope per the mission's minimal-additive brief). Moves a dispute forward
+ * in its lifecycle once the aggregator's own decision is known; a terminal
+ * status stamps resolved_at. Not itself idempotent-guarded beyond ordinary
+ * conditional semantics — callers are the future reconciliation job, not
+ * end users racing each other.
+ */
+export async function resolveDispute(db: DB, input: ResolveDisputeInput): Promise<OrderDispute> {
+  return db.transaction(async (tx) => {
+    const [dispute] = await tx.select().from(orderDisputes).where(eq(orderDisputes.id, input.disputeId));
+    if (!dispute) {
+      throw new OutboundError("NOT_FOUND", `Dispute ${input.disputeId} not found.`, 404);
+    }
+
+    const isTerminal = input.status !== "CONTESTED";
+    const [updated] = await tx
+      .update(orderDisputes)
+      .set({
+        status: input.status,
+        resolutionNote: input.resolutionNote ?? dispute.resolutionNote,
+        resolvedAt: isTerminal ? new Date() : dispute.resolvedAt,
+        updatedAt: new Date(),
+      })
+      .where(eq(orderDisputes.id, input.disputeId))
+      .returning();
+
+    await tx.insert(auditLogs).values({
+      actorUserId: input.actorUserId ?? null,
+      actorName: input.actorName ?? null,
+      sessionId: input.sessionId ?? null,
+      locationId: null,
+      action: "order_dispute.resolved",
+      description: `Dispute ${input.disputeId}: ${dispute.status} -> ${input.status}.`,
+      entityType: "order_dispute",
+      entityId: input.disputeId,
+      metadata: { from: dispute.status, to: input.status },
+    });
+
+    return updated!;
+  });
+}
+
+export interface ListDisputesInput {
+  aggregatorAccountId?: string;
+  status?: OrderDispute["status"];
+  limit: number;
+  offset: number;
+  /** undefined/null = ALL scope; array = restrict to disputes whose order is at these outlets. */
+  allowedLocationIds?: string[] | null;
+}
+
+export interface ListDisputesPage {
+  items: OrderDispute[];
+  total: number;
+}
+
+/**
+ * Monitoring list mirroring listCommands' shape (GET /order-disputes) — "the
+ * durable record of contested orders" the site-visit found ORION lacked.
+ * Scoped through orders (order_dispute has no aggregator_account_id/
+ * location_id of its own; the order's immutable outlet/listing snapshot is
+ * the source of truth, same as everywhere else in this module).
+ */
+export async function listDisputes(db: DB, input: ListDisputesInput): Promise<ListDisputesPage> {
+  const conditions = [];
+  if (input.aggregatorAccountId) conditions.push(eq(orders.aggregatorAccountId, input.aggregatorAccountId));
+  if (input.status) conditions.push(eq(orderDisputes.status, input.status));
+  if (input.allowedLocationIds !== undefined && input.allowedLocationIds !== null) {
+    conditions.push(
+      inArray(orders.locationId, input.allowedLocationIds.length > 0 ? input.allowedLocationIds : ["00000000-0000-0000-0000-000000000000"]),
+    );
+  }
+
+  const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+  const rows = await db
+    .select({ dispute: orderDisputes })
+    .from(orderDisputes)
+    .innerJoin(orders, eq(orderDisputes.orderId, orders.id))
+    .where(whereClause)
+    .orderBy(desc(orderDisputes.createdAt))
+    .limit(input.limit)
+    .offset(input.offset);
+  const [{ count }] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(orderDisputes)
+    .innerJoin(orders, eq(orderDisputes.orderId, orders.id))
+    .where(whereClause);
+
+  return { items: rows.map((r) => r.dispute), total: count };
+}
+
+export async function getDisputeById(db: DB, id: string): Promise<OrderDispute | undefined> {
+  const [row] = await db.select().from(orderDisputes).where(eq(orderDisputes.id, id));
+  return row;
 }

@@ -415,7 +415,7 @@ describe("outbound commands — out-of-order guard", () => {
       aggregatorAccountId: fixture.aggregatorAccountId,
       orderId,
       commandType: "REJECT_ORDER",
-      payload: { reason: "Out of stock" },
+      payload: { reason_code: "OUT_OF_STOCK" },
       idempotencyKey: randomUUID(),
     });
 
@@ -439,7 +439,7 @@ describe("outbound commands — out-of-order guard", () => {
       aggregatorAccountId: fixture.aggregatorAccountId,
       orderId,
       commandType: "REJECT_ORDER",
-      payload: {},
+      payload: { reason_code: "TOO_BUSY" },
       idempotencyKey: randomUUID(),
     });
 
@@ -470,7 +470,7 @@ describe("outbound commands — out-of-order guard", () => {
       aggregatorAccountId: fixture.aggregatorAccountId,
       orderId,
       commandType: "REJECT_ORDER",
-      payload: {},
+      payload: { reason_code: "CUSTOMER_REQUEST" },
       idempotencyKey: randomUUID(),
     });
     expect(reject.status).toBe("PENDING");

@@ -25,6 +25,10 @@ export const ORDER_SCOPED_COMMAND_TYPES: ReadonlySet<OutboundCommandType> = new 
   "REJECT_ORDER",
   "MARK_READY",
   "UPDATE_READY_TIME",
+  // Migration 0036 (finding N2) — a contest is always raised against one
+  // cancelled order. Only enqueued via service.ts createDispute(); the
+  // generic POST /commands route refuses this command_type (routes.ts).
+  "CONTEST_CANCELLATION",
 ]);
 
 /** Listing-scoped command types — order_id must be absent. */

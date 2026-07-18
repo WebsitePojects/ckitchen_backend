@@ -265,11 +265,11 @@ export async function enqueueCommand(db: DB, input: EnqueueCommandInput): Promis
 
   const storedKey = buildStoredKey(input);
 
-  return db.transaction(async (tx) => {
-    const [existing] = await tx.select().from(aggregatorCommands).where(eq(aggregatorCommands.idempotencyKey, storedKey));
-    if (existing) return existing; // idempotent replay — no new row, no new audit entry
+  try {
+    return await db.transaction(async (tx) => {
+      const [existing] = await tx.select().from(aggregatorCommands).where(eq(aggregatorCommands.idempotencyKey, storedKey));
+      if (existing) return existing; // idempotent replay — no new row, no new audit entry
 
-    try {
       const [created] = await tx
         .insert(aggregatorCommands)
         .values({
@@ -299,17 +299,23 @@ export async function enqueueCommand(db: DB, input: EnqueueCommandInput): Promis
       });
 
       return created!;
-    } catch (err) {
-      // Two concurrent enqueues racing on the SAME stored key: one INSERT
-      // wins, the other hits the idempotency_key unique violation. Return
-      // the winner's row instead of a 500 (mirrors orders/service.ts FIX C).
-      if (isUniqueViolation(err)) {
-        const [raceExisting] = await tx.select().from(aggregatorCommands).where(eq(aggregatorCommands.idempotencyKey, storedKey));
-        if (raceExisting) return raceExisting;
-      }
-      throw err;
+    });
+  } catch (err) {
+    // Two concurrent enqueues racing on the SAME stored key: one INSERT
+    // wins, the other hits the idempotency_key unique violation. A failed
+    // statement aborts the WHOLE transaction (Postgres: no further commands
+    // until ROLLBACK) — the recovery re-query MUST run after that
+    // transaction has unwound (via the outer `db`, not `tx`), never inside
+    // the same aborted transaction. (This mirrors createDispute()'s
+    // corrected pattern below — this call site previously ran the recovery
+    // query on `tx` inside the same try/catch as the insert, which is the
+    // exact "recovery inside the aborted transaction" pitfall.)
+    if (isUniqueViolation(err)) {
+      const [raceExisting] = await db.select().from(aggregatorCommands).where(eq(aggregatorCommands.idempotencyKey, storedKey));
+      if (raceExisting) return raceExisting;
     }
-  });
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------

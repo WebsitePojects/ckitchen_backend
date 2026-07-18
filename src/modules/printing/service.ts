@@ -16,7 +16,7 @@
  * without an extra DB round-trip.
  */
 import { randomBytes } from "node:crypto";
-import { and, asc, eq, getTableColumns, inArray, isNull, lte, or } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, isNull, lte, or } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
   kitchenStations,
@@ -400,25 +400,56 @@ export async function listPrintJobs(
  * Business Rule #7: reprintable always — so we allow reprinting from any status,
  * not just FAILED (e.g., admin may want to reprint a PRINTED ticket).
  */
+/** Double-submit guard for reprintJob: a repeat reprint within this window reuses the still-unresolved clone instead of minting a second physical print job. */
+const REPRINT_DUPLICATE_LOOKBACK_MS = 30_000;
+
 export async function reprintJob(db: DB, originalJobId: string): Promise<PrintJob> {
-  const [original] = await db
-    .select()
-    .from(printJobs)
-    .where(eq(printJobs.id, originalJobId));
+  return db.transaction(async (tx) => {
+    // Lock the ORIGINAL job row FOR UPDATE first so a truly concurrent
+    // duplicate reprint request serializes behind this one.
+    const [original] = await tx
+      .select()
+      .from(printJobs)
+      .where(eq(printJobs.id, originalJobId))
+      .for("update");
 
-  if (!original) throw new PrintNotFoundError(`Print job ${originalJobId} not found.`);
+    if (!original) throw new PrintNotFoundError(`Print job ${originalJobId} not found.`);
 
-  // Clone into a NEW PENDING job
-  const [newJob] = await db
-    .insert(printJobs)
-    .values({
-      orderId: original.orderId,
-      stationId: original.stationId,
-      printerId: original.printerId,
-      payload: original.payload,
-      status: "PENDING",
-    })
-    .returning();
+    // Double-submit guard: reprintJob has no client-supplied idempotency key
+    // and unconditionally INSERTs a clone, so a double-click/retry on
+    // POST /print-jobs/:id/reprint would otherwise mint TWO new PENDING jobs
+    // — both get claimed and physically printed (a real duplicate KOT print,
+    // not just a duplicate DB row). `reprint_of_id` (schema column, unused
+    // until now) links a clone back to the job it was reprinted from — if an
+    // unresolved clone of THIS original already exists (status stays PENDING
+    // even while claimed/leased by an agent — see service-v2.ts's
+    // claimJobs/ackJobV2, which never set a separate "CLAIMED" status; only
+    // PRINTED/FAILED are terminal) within REPRINT_DUPLICATE_LOOKBACK_MS,
+    // treat this call as a replay of that reprint instead of minting another
+    // one. Once a reprint resolves (or the window elapses), a fresh reprint
+    // is legitimately allowed again (Business Rule #7: reprintable always).
+    const since = new Date(Date.now() - REPRINT_DUPLICATE_LOOKBACK_MS);
+    const [duplicate] = await tx
+      .select()
+      .from(printJobs)
+      .where(and(eq(printJobs.reprintOfId, originalJobId), eq(printJobs.status, "PENDING")))
+      .orderBy(desc(printJobs.createdAt))
+      .limit(1);
+    if (duplicate && duplicate.createdAt >= since) return duplicate;
 
-  return newJob;
+    // Clone into a NEW PENDING job
+    const [newJob] = await tx
+      .insert(printJobs)
+      .values({
+        orderId: original.orderId,
+        stationId: original.stationId,
+        printerId: original.printerId,
+        payload: original.payload,
+        status: "PENDING",
+        reprintOfId: originalJobId,
+      })
+      .returning();
+
+    return newJob;
+  });
 }

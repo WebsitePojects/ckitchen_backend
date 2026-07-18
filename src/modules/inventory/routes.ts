@@ -47,6 +47,7 @@ import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
 import { docNo } from "../purchasing/doc-no.js";
 import { postLedger } from "./ledger.js";
+import { findDuplicateReceivingReport } from "./receive-dedupe.js";
 
 // ---------------------------------------------------------------------------
 // RBAC role sets (§1 role matrix)
@@ -737,8 +738,32 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       // ledger's RR enrichment (GET /stock-ledger source_ref) covers both paths.
       const rrNo = docNo("RR");
       let rr!: typeof receivingReports.$inferSelect;
+      let replay = false;
 
       await db.transaction(async (tx) => {
+        // Double-submit guard: lock the destination warehouse row FOR UPDATE
+        // FIRST so a truly concurrent duplicate request serializes behind
+        // this one instead of racing it, then check whether the same actor
+        // already created an identical RR (same warehouse/supplier/
+        // reference + exact same ingredient/quantity lines) in the last
+        // DUPLICATE_LOOKBACK_MS — rrNo is fresh-random per call so it cannot
+        // dedupe this on its own. See receive-dedupe.ts for the full
+        // rationale.
+        await tx.select({ id: warehouses.id }).from(warehouses).where(eq(warehouses.id, mainWarehouse.id)).for("update");
+
+        const duplicateId = await findDuplicateReceivingReport(
+          tx,
+          { poId: null, warehouseId: mainWarehouse.id, supplierId: parsed.data.supplier_id ?? null, reference: parsed.data.reference ?? null },
+          req.user!.id,
+          parsed.data.items.map((item) => ({ key: item.ingredient_id, quantity: item.quantity })),
+        );
+        if (duplicateId) {
+          const [existing] = await tx.select().from(receivingReports).where(eq(receivingReports.id, duplicateId));
+          rr = existing!;
+          replay = true;
+          return;
+        }
+
         [rr] = await tx
           .insert(receivingReports)
           .values({
@@ -810,8 +835,13 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         }
       });
 
-      // Every existing field kept; `rr` is additive (0024).
+      // Every existing field kept; `rr` is additive (0024). A replay (duplicate
+      // submission) still returns 201 with the ORIGINAL rr — same response
+      // shape the client already expects, no contract change, but stock/ledger
+      // were not touched a second time.
       res.status(201).json({ ok: true, rr: { id: rr.id, rrNo: rr.rrNo } });
+
+      if (replay) return;
 
       // EMS: audit inventory.receive (non-blocking)
       void audit(db, {
@@ -819,10 +849,10 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         actorName: req.user?.name ?? null,
         sessionId: req.user?.sessionId ?? null,
         action: "inventory.receive",
-        description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse → ${rrNo}`,
+        description: `received ${parsed.data.items.length} ingredient(s) into MAIN warehouse → ${rr.rrNo}`,
         entityType: "receiving_report",
         entityId: rr.id,
-        metadata: { items: parsed.data.items, rr_no: rrNo },
+        metadata: { items: parsed.data.items, rr_no: rr.rrNo },
       });
 
       // Task 8: emit stock.updated for each received ingredient (MAIN warehouse)
@@ -1073,9 +1103,35 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       const items = await db.select().from(itoItems).where(eq(itoItems.itoId, id));
 
       let confirmedIto: typeof itos.$inferSelect | undefined;
+      let conflict = false;
 
       // ATOMIC transaction (Cardinal Rule #4) — all steps succeed or all roll back
+      //
+      // Double-submit guard: the REQUESTED status check above is only a fast-path
+      // 400 (read outside any transaction, so two concurrent confirms can both
+      // pass it). The mutation that actually matters is this conditional UPDATE,
+      // done FIRST inside the transaction with `AND status = 'REQUESTED'` — only
+      // the request that wins this compare-and-swap proceeds to move stock.
+      // A losing concurrent/replayed request gets `updatedRows.length === 0` and
+      // the transaction returns without touching inventory_stock at all (mirrors
+      // the FIX A pattern in adjustments.ts's approve/reject handlers).
       await db.transaction(async (tx) => {
+        const updatedRows = await tx
+          .update(itos)
+          .set({
+            status: "CONFIRMED",
+            confirmedBy: req.user!.id,
+            confirmedAt: new Date(),
+          })
+          .where(and(eq(itos.id, id), eq(itos.status, "REQUESTED")))
+          .returning();
+
+        if (updatedRows.length === 0) {
+          conflict = true;
+          return;
+        }
+        confirmedIto = updatedRows[0];
+
         for (const item of items) {
           // Step 1: decrement MAIN
           await tx
@@ -1128,18 +1184,14 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
             encoderUserId: req.user?.id ?? null,
           });
         }
-
-        // Step 3: mark ITO CONFIRMED with audit fields
-        [confirmedIto] = await tx
-          .update(itos)
-          .set({
-            status: "CONFIRMED",
-            confirmedBy: req.user!.id,
-            confirmedAt: new Date(),
-          })
-          .where(eq(itos.id, id))
-          .returning();
+        // Status was already flipped to CONFIRMED by the compare-and-swap
+        // UPDATE above (before this loop) — that row IS confirmedIto.
       });
+
+      if (conflict) {
+        sendError(res, 409, "CONFLICT", "ITO was already confirmed by a concurrent request and cannot be confirmed again.");
+        return;
+      }
 
       res.json(confirmedIto!);
 

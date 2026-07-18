@@ -34,6 +34,7 @@ import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { audit } from "../ems/audit.js";
 import { postLedger } from "../inventory/ledger.js";
+import { findDuplicateReceivingReport } from "../inventory/receive-dedupe.js";
 import { docNo } from "./doc-no.js";
 import {
   BUDGET_ENFORCEMENT,
@@ -192,6 +193,11 @@ export function createPurchasingRouter(db: DB): Router {
         sendError(res, 409, "CONFLICT", `Purchase request is ${pr.status}; expected ${from}.`);
         return;
       }
+      // Double-submit guard: the status check above was read outside any
+      // lock, so two concurrent identical requests could otherwise both pass
+      // it and both write (double audit row, and a REJECTED could silently
+      // flip back to APPROVED or vice versa on the loser's write ordering).
+      // `AND status = from` makes only the first writer win.
       const [updated] = await db
         .update(purchaseRequests)
         .set({
@@ -199,8 +205,12 @@ export function createPurchasingRouter(db: DB): Router {
           updatedAt: new Date(),
           ...(setApprover ? { approvedByUserId: req.user!.id } : {}),
         })
-        .where(eq(purchaseRequests.id, id))
+        .where(and(eq(purchaseRequests.id, id), eq(purchaseRequests.status, from)))
         .returning();
+      if (!updated) {
+        sendError(res, 409, "CONFLICT", `Purchase request was already moved out of ${from} by a concurrent request.`);
+        return;
+      }
       void audit(db, {
         actorUserId: req.user!.id,
         actorName: req.user!.name ?? null,
@@ -249,11 +259,17 @@ export function createPurchasingRouter(db: DB): Router {
       const period = toPeriod(pr.createdAt);
       const committedBefore = await computeCommitted(db, pr.department, period);
 
+      // Double-submit guard: `AND status = 'DRAFT'` — see prTransition()'s
+      // identical fix above for the race this closes.
       const [updated] = await db
         .update(purchaseRequests)
         .set({ status: "SUBMITTED", updatedAt: new Date() })
-        .where(eq(purchaseRequests.id, id))
+        .where(and(eq(purchaseRequests.id, id), eq(purchaseRequests.status, "DRAFT")))
         .returning();
+      if (!updated) {
+        sendError(res, 409, "CONFLICT", "Purchase request was already submitted by a concurrent request.");
+        return;
+      }
 
       void audit(db, {
         actorUserId: req.user!.id,
@@ -455,11 +471,17 @@ export function createPurchasingRouter(db: DB): Router {
       sendError(res, 409, "CONFLICT", `Purchase order is ${po.status}; expected DRAFT.`);
       return;
     }
+    // Double-submit guard: `AND status = 'DRAFT'` closes the same TOCTOU
+    // window fixed on the PR transitions above.
     const [updated] = await db
       .update(purchaseOrders)
       .set({ status: "SENT", updatedAt: new Date() })
-      .where(eq(purchaseOrders.id, id))
+      .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.status, "DRAFT")))
       .returning();
+    if (!updated) {
+      sendError(res, 409, "CONFLICT", "Purchase order was already sent by a concurrent request.");
+      return;
+    }
     void audit(db, {
       actorUserId: req.user!.id,
       actorName: req.user!.name ?? null,
@@ -495,7 +517,10 @@ export function createPurchasingRouter(db: DB): Router {
     const poLines = await db.select().from(purchaseOrderLines).where(eq(purchaseOrderLines.poId, id));
     const lineById = new Map(poLines.map((l) => [l.id, l]));
 
-    // Validate each receive line: belongs to this PO + does not over-receive.
+    // Fast-path validation (pre-transaction, UX only — belonging-to-this-PO is
+    // stable so this check can't go stale, but the qty/over-receive check is
+    // re-run below on a lock-consistent read since concurrent receives can
+    // change `qtyReceived` between this read and the transaction).
     for (const rl of parsed.data.lines) {
       const poLine = lineById.get(rl.po_line_id);
       if (!poLine) {
@@ -530,8 +555,46 @@ export function createPurchasingRouter(db: DB): Router {
 
     const rrNo = docNo("RR");
     let rr!: typeof receivingReports.$inferSelect;
+    let replay = false;
+    let overReceive: { poLineId: string; remaining: number } | null = null;
 
     await db.transaction(async (tx) => {
+      // Double-submit guard: lock the PO row FOR UPDATE first so a truly
+      // concurrent duplicate request serializes behind this one, then check
+      // whether the same actor already recorded an RR against this exact PO
+      // with the exact same (po_line_id, qty_received) set in the last
+      // DUPLICATE_LOOKBACK_MS. rrNo is fresh-random per call, so it can never
+      // dedupe this on its own — see receive-dedupe.ts.
+      await tx.select({ id: purchaseOrders.id }).from(purchaseOrders).where(eq(purchaseOrders.id, id)).for("update");
+
+      const duplicateId = await findDuplicateReceivingReport(
+        tx,
+        { poId: id, warehouseId: mainWarehouse.id },
+        req.user!.id,
+        parsed.data.lines.map((rl) => ({ key: rl.po_line_id, quantity: rl.qty_received })),
+      );
+      if (duplicateId) {
+        const [existing] = await tx.select().from(receivingReports).where(eq(receivingReports.id, duplicateId));
+        rr = existing!;
+        replay = true;
+        return;
+      }
+
+      // Re-validate over-receipt against a lock-consistent read: the pre-tx
+      // check above can be stale under concurrency (a different, legitimate
+      // concurrent receive against the same PO may have already consumed the
+      // remaining quantity).
+      const freshLines = await tx.select().from(purchaseOrderLines).where(eq(purchaseOrderLines.poId, id));
+      const freshById = new Map(freshLines.map((l) => [l.id, l]));
+      for (const rl of parsed.data.lines) {
+        const poLine = freshById.get(rl.po_line_id)!;
+        const remaining = Number(poLine.quantity) - Number(poLine.qtyReceived);
+        if (rl.qty_received > remaining + 1e-9) {
+          overReceive = { poLineId: rl.po_line_id, remaining };
+          return;
+        }
+      }
+
       [rr] = await tx
         .insert(receivingReports)
         .values({
@@ -544,7 +607,7 @@ export function createPurchasingRouter(db: DB): Router {
         .returning();
 
       for (const rl of parsed.data.lines) {
-        const poLine = lineById.get(rl.po_line_id)!;
+        const poLine = freshById.get(rl.po_line_id)!;
 
         await tx.insert(receivingReportLines).values({
           rrId: rr.id,
@@ -610,17 +673,27 @@ export function createPurchasingRouter(db: DB): Router {
         .where(eq(purchaseOrders.id, id));
     });
 
+    if (overReceive) {
+      const { poLineId, remaining } = overReceive as { poLineId: string; remaining: number };
+      sendError(res, 409, "CONFLICT", `Cannot receive; only ${remaining} remaining on line ${poLineId}.`);
+      return;
+    }
+
+    // A replay (duplicate submission) still returns 201 with the ORIGINAL rr
+    // — same response shape the client already expects, no contract change,
+    // but stock/ledger/qtyReceived were not touched a second time.
+    res.status(201).json(rr);
+    if (replay) return;
+
     void audit(db, {
       actorUserId: req.user!.id,
       actorName: req.user!.name ?? null,
       sessionId: req.user!.sessionId ?? null,
       action: "purchase_order.receive",
-      description: `Received against ${po.poNo} → ${rrNo}`,
+      description: `Received against ${po.poNo} → ${rr.rrNo}`,
       entityType: "receiving_report",
       entityId: rr.id,
     });
-
-    res.status(201).json(rr);
   });
 
   // 0024: enrich each RR with its supplier (direct receipts carry supplier_id

@@ -352,10 +352,13 @@ export function createOutboundRouter(db: DB): Router {
   );
 
   // ── POST /channel-listings/:id/items/:itemId/availability ──────────────
+  // BRAND_MANAGER added (2026-07-18 RBAC alignment): the merchant-console
+  // frontend already offers this control to brand managers; the server is
+  // the authority, so it must actually allow the role it's advertised to.
   router.post(
     "/channel-listings/:id/items/:itemId/availability",
     requireAuth,
-    requireRole("OWNER", "OUTLET_MANAGER"),
+    requireRole("OWNER", "OUTLET_MANAGER", "BRAND_MANAGER"),
     resolveOutletContext,
     async (req, res) => {
       const idempotencyKey = requireBoundedHeader(req, res, "Idempotency-Key");

@@ -1,18 +1,27 @@
 import { Router } from "express";
-import { and, asc, eq, gte, lt, lte, ne, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, lt, lte, ne, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
   aggregatorAccounts,
   aggregatorEnum,
+  availabilityEnum,
   brandActivityLog,
   brandOutlet,
   brands,
+  discounts,
+  listingMappingStatusEnum,
   locations,
+  menuItems,
+  orderItems,
   orders,
+  recipeLines,
+  userBrands,
 } from "../../db/schema.js";
+import { menuOptionGroups } from "../../db/outbound-schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
+import { audit } from "../ems/audit.js";
 import { paramAsString, sendError } from "../http-errors.js";
 
 const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
@@ -49,12 +58,68 @@ const createAccountSchema = z.object({
   aggregator: z.enum(aggregatorEnum.enumValues),
   external_merchant_id: z.string().min(1),
   credential_ref: z.string().min(1),
+  // Physical outlet this channel listing belongs to (D39/business-rules #7).
+  // Optional + backward compatible: omitted = null, unchanged from before.
+  location_id: z.string().uuid().optional(),
+});
+
+const updateAccountSchema = z
+  .object({
+    // Closest "display" field the table has (there is no separate merchant_name
+    // column — external_merchant_id IS the merchant-facing listing identifier).
+    external_merchant_id: z.string().min(1).optional(),
+    commission_rate: z.union([z.string().min(1), z.number()]).nullable().optional(),
+    // Maps to aggregator_account.mapping_status (RESOLVED | MAPPING_REQUIRED |
+    // DISABLED) — the field that actually reads as a listing's "status".
+    status: z.enum(listingMappingStatusEnum.enumValues).optional(),
+    location_id: z.string().uuid().nullable().optional(),
+    // credential_ref/credentialRef are deliberately NOT accepted here (security.md).
+  })
+  .refine((body) => Object.keys(body).some((k) => body[k as keyof typeof body] !== undefined), {
+    message: "At least one field is required.",
+  });
+
+const bulkAvailabilitySchema = z.object({
+  availability: z.enum(availabilityEnum.enumValues),
 });
 
 /** Strips `credentialRef` before an aggregator account ever reaches an API response (security.md). */
 function toPublicAccount(account: typeof aggregatorAccounts.$inferSelect) {
   const { credentialRef, ...publicAccount } = account;
   return publicAccount;
+}
+
+/**
+ * Shared location_id validation for creating/patching a channel listing
+ * (D39): the outlet must exist, AND the brand must actually be deployed
+ * there (an active brand_outlet row) — otherwise a listing could be pinned
+ * to an outlet the brand never operates in, silently breaking order
+ * routing/stock/RBAC (business-rules #7).
+ */
+async function assertBrandDeployedAtLocation(
+  db: DB,
+  brandId: string,
+  locationId: string,
+): Promise<{ ok: true } | { ok: false; status: number; code: string; message: string }> {
+  const [location] = await db.select({ id: locations.id }).from(locations).where(eq(locations.id, locationId));
+  if (!location) {
+    return { ok: false, status: 404, code: "NOT_FOUND", message: "Outlet not found." };
+  }
+
+  const [deployment] = await db
+    .select({ brandId: brandOutlet.brandId })
+    .from(brandOutlet)
+    .where(and(eq(brandOutlet.brandId, brandId), eq(brandOutlet.locationId, locationId), eq(brandOutlet.isActive, true)));
+  if (!deployment) {
+    return {
+      ok: false,
+      status: 422,
+      code: "NOT_DEPLOYED",
+      message: "Brand is not deployed to that outlet. Deploy it first via POST /brands/:id/outlets.",
+    };
+  }
+
+  return { ok: true };
 }
 
 export function createBrandsRouter(db: DB): Router {
@@ -150,6 +215,173 @@ export function createBrandsRouter(db: DB): Router {
     }
 
     res.json(updated);
+  });
+
+  // -------------------------------------------------------------------------
+  // DELETE /brands/:id — hard delete. OWNER only.
+  //
+  // Allowed only when the brand has NEVER been advertised (zero aggregator_
+  // account rows -> 409 HAS_LISTINGS) and none of its menu items have ever
+  // been ordered (409 HAS_ORDERS — same check as menu/routes.ts's DELETE
+  // /menu/:id). Both errors point the caller at PATCH is_active:false instead
+  // of deletion, mirroring that route's own guidance.
+  //
+  // On success, deletes (one transaction): recipe lines + item-scoped
+  // discounts for the brand's menu items, brand-scoped discounts, menu option
+  // groups (cascades their item links), menu items (cascades menu_item_
+  // outlet), user_brand grants, brand_activity_log rows, brand_outlet
+  // deployments, then the brand row itself. A residual FK race (a listing/
+  // order slipping in between the precheck and the delete) surfaces as the
+  // same 409 via the caught 23503 — same pattern as menu/routes.ts.
+  // -------------------------------------------------------------------------
+  router.delete("/brands/:id", requireAuth, requireRole("OWNER"), async (req, res) => {
+    const id = paramAsString(req.params.id);
+
+    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+    if (!brand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const [listing] = await db
+      .select({ id: aggregatorAccounts.id })
+      .from(aggregatorAccounts)
+      .where(eq(aggregatorAccounts.brandId, id))
+      .limit(1);
+    if (listing) {
+      sendError(
+        res,
+        409,
+        "HAS_LISTINGS",
+        "This brand has channel listings (Foodpanda/GrabFood accounts) and cannot be deleted. Set is_active:false to deactivate it instead.",
+      );
+      return;
+    }
+
+    const [ordered] = await db
+      .select({ id: orderItems.id })
+      .from(orderItems)
+      .innerJoin(menuItems, eq(orderItems.menuItemId, menuItems.id))
+      .where(eq(menuItems.brandId, id))
+      .limit(1);
+    if (ordered) {
+      sendError(
+        res,
+        409,
+        "HAS_ORDERS",
+        "This brand's menu has been ordered and cannot be deleted. Set is_active:false to deactivate it instead.",
+      );
+      return;
+    }
+
+    let deletedBrand: typeof brands.$inferSelect | null;
+
+    try {
+      deletedBrand = await db.transaction(async (tx) => {
+        // Lock the brand row first so two concurrent deletes serialize
+        // instead of both observing "brand exists" and racing the cascade.
+        const locked = await tx.select({ id: brands.id }).from(brands).where(eq(brands.id, id)).for("update");
+        if (locked.length === 0) {
+          return null;
+        }
+
+        const brandMenuItems = await tx
+          .select({ id: menuItems.id })
+          .from(menuItems)
+          .where(eq(menuItems.brandId, id));
+        const menuItemIds = brandMenuItems.map((m) => m.id);
+
+        if (menuItemIds.length > 0) {
+          await tx.delete(recipeLines).where(inArray(recipeLines.menuItemId, menuItemIds));
+          await tx.delete(discounts).where(inArray(discounts.menuItemId, menuItemIds));
+        }
+        await tx.delete(discounts).where(eq(discounts.brandId, id));
+        await tx.delete(menuOptionGroups).where(eq(menuOptionGroups.brandId, id));
+        await tx.delete(menuItems).where(eq(menuItems.brandId, id));
+        await tx.delete(userBrands).where(eq(userBrands.brandId, id));
+        await tx.delete(brandActivityLog).where(eq(brandActivityLog.brandId, id));
+        await tx.delete(brandOutlet).where(eq(brandOutlet.brandId, id));
+
+        const [deleted] = await tx.delete(brands).where(eq(brands.id, id)).returning();
+        return deleted ?? null;
+      });
+    } catch (err) {
+      // Residual FK race (23503): a listing/order was created between the
+      // precheck and the delete — same answer as the prechecks above.
+      const code =
+        err && typeof err === "object"
+          ? ((err as Record<string, unknown>)["code"] ??
+            ((err as { cause?: Record<string, unknown> }).cause?.["code"]))
+          : undefined;
+      if (code === "23503") {
+        sendError(
+          res,
+          409,
+          "HAS_LISTINGS",
+          "This brand is still referenced by a channel listing or order and cannot be deleted. Set is_active:false to deactivate it instead.",
+        );
+        return;
+      }
+      throw err;
+    }
+
+    if (!deletedBrand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const deletedName = deletedBrand.name;
+    res.json({ ok: true });
+
+    void audit(db, {
+      actorUserId: req.user?.id ?? null,
+      actorName: req.user?.name ?? null,
+      sessionId: req.user?.sessionId ?? null,
+      action: "brand.delete",
+      description: `deleted brand "${deletedName}"`,
+      entityType: "brand",
+      entityId: id,
+      metadata: { name: deletedName },
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // POST /brands/:id/availability — bulk-set availability across every menu
+  // item owned by the brand (one UPDATE; idempotent by nature — re-running
+  // with the same value converges to the same state, never duplicates rows).
+  // -------------------------------------------------------------------------
+  router.post("/brands/:id/availability", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
+    const id = paramAsString(req.params.id);
+    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
+    if (!brand) {
+      sendError(res, 404, "NOT_FOUND", "Brand not found.");
+      return;
+    }
+
+    const parsed = bulkAvailabilitySchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid availability payload.", parsed.error.issues);
+      return;
+    }
+
+    const updated = await db
+      .update(menuItems)
+      .set({ availability: parsed.data.availability })
+      .where(eq(menuItems.brandId, id))
+      .returning({ id: menuItems.id });
+
+    res.json({ updated: updated.length });
+
+    void audit(db, {
+      actorUserId: req.user?.id ?? null,
+      actorName: req.user?.name ?? null,
+      sessionId: req.user?.sessionId ?? null,
+      action: "brand.bulk_availability",
+      description: `set availability=${parsed.data.availability} on ${updated.length} menu item(s) for brand ${id}`,
+      entityType: "brand",
+      entityId: id,
+      metadata: { availability: parsed.data.availability, updated: updated.length },
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -314,10 +546,21 @@ export function createBrandsRouter(db: DB): Router {
         return;
       }
 
+      let locationId: string | undefined;
+      if (parsed.data.location_id) {
+        const check = await assertBrandDeployedAtLocation(db, id, parsed.data.location_id);
+        if (!check.ok) {
+          sendError(res, check.status, check.code, check.message);
+          return;
+        }
+        locationId = parsed.data.location_id;
+      }
+
       const [account] = await db
         .insert(aggregatorAccounts)
         .values({
           brandId: id,
+          locationId,
           aggregator: parsed.data.aggregator,
           externalMerchantId: parsed.data.external_merchant_id,
           credentialRef: parsed.data.credential_ref,
@@ -327,6 +570,75 @@ export function createBrandsRouter(db: DB): Router {
       res.status(201).json(toPublicAccount(account));
     },
   );
+
+  // -------------------------------------------------------------------------
+  // PATCH /accounts/:id — update a channel listing's non-credential fields.
+  // Never accepts credential_ref (security.md); audit records only the
+  // CHANGED KEYS, never values (commission_rate/location_id may be sensitive
+  // business terms).
+  // -------------------------------------------------------------------------
+  router.patch("/accounts/:id", requireAuth, requireRole("OWNER", "BRAND_MANAGER"), async (req, res) => {
+    const id = paramAsString(req.params.id);
+    const [existing] = await db.select().from(aggregatorAccounts).where(eq(aggregatorAccounts.id, id));
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", "Aggregator account not found.");
+      return;
+    }
+
+    const parsed = updateAccountSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid aggregator account payload.", parsed.error.issues);
+      return;
+    }
+
+    const updates: Partial<typeof aggregatorAccounts.$inferInsert> = {};
+    const changedKeys: string[] = [];
+
+    if (parsed.data.external_merchant_id !== undefined) {
+      updates.externalMerchantId = parsed.data.external_merchant_id;
+      changedKeys.push("external_merchant_id");
+    }
+    if (parsed.data.commission_rate !== undefined) {
+      updates.commissionRate = parsed.data.commission_rate === null ? null : String(parsed.data.commission_rate);
+      changedKeys.push("commission_rate");
+    }
+    if (parsed.data.status !== undefined) {
+      updates.mappingStatus = parsed.data.status;
+      changedKeys.push("status");
+    }
+    if (parsed.data.location_id !== undefined) {
+      if (parsed.data.location_id === null) {
+        updates.locationId = null;
+      } else {
+        const check = await assertBrandDeployedAtLocation(db, existing.brandId, parsed.data.location_id);
+        if (!check.ok) {
+          sendError(res, check.status, check.code, check.message);
+          return;
+        }
+        updates.locationId = parsed.data.location_id;
+      }
+      changedKeys.push("location_id");
+    }
+
+    const [updated] = await db
+      .update(aggregatorAccounts)
+      .set(updates)
+      .where(eq(aggregatorAccounts.id, id))
+      .returning();
+
+    res.json(toPublicAccount(updated));
+
+    void audit(db, {
+      actorUserId: req.user?.id ?? null,
+      actorName: req.user?.name ?? null,
+      sessionId: req.user?.sessionId ?? null,
+      action: "aggregator_account.update",
+      description: `updated aggregator account ${id}: ${changedKeys.join(", ") || "(no-op)"}`,
+      entityType: "aggregator_account",
+      entityId: id,
+      metadata: { changed_keys: changedKeys },
+    });
+  });
 
   router.delete("/accounts/:id", requireAuth, requireRole(...WRITE_ROLES), async (req, res) => {
     const id = paramAsString(req.params.id);

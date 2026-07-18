@@ -30,7 +30,7 @@
  *       otherwise                                                 → ADMIN       (needs OWNER)
  */
 import { Router } from "express";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNull } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -84,6 +84,14 @@ function omitEvidenceRef<T extends { evidenceRef?: unknown }>(row: T): Omit<T, "
 // APPROVAL_THRESHOLDS — PH defaults, first cut. CLIENT TO CONFIRM exact
 // percentages/peso caps before this ships to production (MOTM 2026-07-01 2c).
 // ---------------------------------------------------------------------------
+// Double-submit guard for POST /orders/:id/discounts (see the transaction in
+// that handler): a double-click or client retry with the exact same payload
+// within this window is treated as a replay of the first apply, not a second
+// discount. No client-supplied idempotency key exists on this route and the
+// mission forbids adding a required one, so the dedupe key is derived from
+// the request content itself instead.
+const DUPLICATE_LOOKBACK_MS = 30_000;
+
 const APPROVAL_THRESHOLDS = {
   /** Statutory senior-citizen / PWD discount default (RA 9994 / RA 10754 style — client to confirm). */
   SENIOR_PWD_DEFAULT_PERCENT: 20,
@@ -578,35 +586,78 @@ export function createDiscountsRouter(db: DB): Router {
     const { level, autoApprove } = routeApproval(type, amount, percentOfOrder, strict);
     const status = autoApprove ? "APPROVED" : "PENDING";
     const now = new Date();
+    const amountStr = amount.toFixed(2);
 
-    const [row] = await db
-      .insert(orderDiscounts)
-      .values({
-        orderId,
-        discountId,
-        type,
-        label,
-        amount: amount.toFixed(2),
-        approvalLevel: level,
-        status,
-        reason: body.reason,
-        idNote: body.id_note ?? null,
-        evidenceRef,
-        requestedBy: req.user!.id,
-        approvedBy: autoApprove ? req.user!.id : null,
-        approvedAt: autoApprove ? now : null,
-      })
-      .returning();
+    // Double-submit guard: lock the order row FOR UPDATE so a truly
+    // concurrent duplicate serializes behind this request, then look back
+    // for an order_discount this same actor already applied to this order
+    // with the exact same content within DUPLICATE_LOOKBACK_MS. There is no
+    // client-supplied idempotency key on this route (and the mission forbids
+    // requiring one), so a plain unconditional INSERT would otherwise apply
+    // the discount twice on a double-click/retry, doubling the peso amount
+    // subtracted from the order's effective total.
+    let replay = false;
+    let row!: typeof orderDiscounts.$inferSelect;
+    await db.transaction(async (tx) => {
+      await tx.select({ id: orders.id }).from(orders).where(eq(orders.id, orderId)).for("update");
 
-    void audit(db, {
-      actorUserId: req.user!.id,
-      actorName: req.user!.name ?? null,
-      sessionId: req.user!.sessionId ?? null,
-      action: "order_discount.apply",
-      description: `Applied "${label}" (${type}) to order ${orderId} — ₱${amount.toFixed(2)}, level ${level}, status ${status}`,
-      entityType: "order_discount",
-      entityId: row.id,
+      const since = new Date(Date.now() - DUPLICATE_LOOKBACK_MS);
+      const candidates = await tx
+        .select()
+        .from(orderDiscounts)
+        .where(
+          and(
+            eq(orderDiscounts.orderId, orderId),
+            eq(orderDiscounts.requestedBy, req.user!.id),
+            eq(orderDiscounts.type, type),
+            eq(orderDiscounts.label, label),
+            eq(orderDiscounts.reason, body.reason),
+            eq(orderDiscounts.amount, amountStr),
+            gte(orderDiscounts.createdAt, since),
+            discountId ? eq(orderDiscounts.discountId, discountId) : isNull(orderDiscounts.discountId),
+            body.id_note ? eq(orderDiscounts.idNote, body.id_note) : isNull(orderDiscounts.idNote),
+          ),
+        )
+        .orderBy(desc(orderDiscounts.createdAt))
+        .limit(1);
+
+      if (candidates[0]) {
+        row = candidates[0];
+        replay = true;
+        return;
+      }
+
+      [row] = await tx
+        .insert(orderDiscounts)
+        .values({
+          orderId,
+          discountId,
+          type,
+          label,
+          amount: amountStr,
+          approvalLevel: level,
+          status,
+          reason: body.reason,
+          idNote: body.id_note ?? null,
+          evidenceRef,
+          requestedBy: req.user!.id,
+          approvedBy: autoApprove ? req.user!.id : null,
+          approvedAt: autoApprove ? now : null,
+        })
+        .returning();
     });
+
+    if (!replay) {
+      void audit(db, {
+        actorUserId: req.user!.id,
+        actorName: req.user!.name ?? null,
+        sessionId: req.user!.sessionId ?? null,
+        action: "order_discount.apply",
+        description: `Applied "${label}" (${type}) to order ${orderId} — ₱${amountStr}, level ${level}, status ${status}`,
+        entityType: "order_discount",
+        entityId: row.id,
+      });
+    }
 
     const allRows = await db.select().from(orderDiscounts).where(eq(orderDiscounts.orderId, orderId));
     const totals = computeOrderTotals(order.total, allRows);
@@ -652,6 +703,11 @@ export function createDiscountsRouter(db: DB): Router {
       }
 
       const newStatus = action === "approve" ? "APPROVED" : "REJECTED";
+      // Double-submit guard: conditional UPDATE on the PENDING status just
+      // re-verified above (which was read outside any lock, so two
+      // concurrent approve/reject calls could otherwise both pass it and
+      // both write). `AND status = 'PENDING'` makes only the first writer
+      // win; a losing concurrent/replayed request gets zero rows back.
       const [updated] = await db
         .update(orderDiscounts)
         .set({
@@ -659,8 +715,12 @@ export function createDiscountsRouter(db: DB): Router {
           approvedBy: req.user!.id,
           approvedAt: new Date(),
         })
-        .where(eq(orderDiscounts.id, id))
+        .where(and(eq(orderDiscounts.id, id), eq(orderDiscounts.status, "PENDING")))
         .returning();
+      if (!updated) {
+        sendError(res, 409, "CONFLICT", "Discount request was already decided by a concurrent request.");
+        return;
+      }
 
       void audit(db, {
         actorUserId: req.user!.id,

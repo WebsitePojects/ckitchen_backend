@@ -447,34 +447,81 @@ describe("Ledger: cancel after PREPARING posts RESTOCK IN rows", () => {
 
 // ---------------------------------------------------------------------------
 // 5. Idempotency: re-posting the same (module, doc, line) is a no-op
+//
+// Receive dedup (src/modules/inventory/receive-dedupe.ts): a POST
+// /inventory/receive that matches a prior RR within DUPLICATE_LOOKBACK_MS
+// (30s) — same actor, same warehouse/supplier/reference scope, and the exact
+// same (ingredient, qty) line set — is treated as a REPLAY of that RR: the
+// endpoint returns the SAME rr and posts NO second RECEIVE ledger row. Any
+// difference (different qty, different ingredient set, different reference,
+// or landing outside the lookback window) still creates a brand new RR +
+// RECEIVE row.
 // ---------------------------------------------------------------------------
 
 describe("Ledger idempotency: duplicate (module, doc, line) is a no-op", () => {
-  it("receiving the same ingredient twice posts two RECEIVE rows (unique doc per call)", async () => {
+  it("an identical duplicate receive replays the prior RR (one RECEIVE row, same rr id)", async () => {
     // Create a fresh ingredient
     const ingRes = await request(app)
       .post("/api/v1/ingredients")
       .set("Authorization", `Bearer ${adminToken}`)
-      .send({ name: "LedgerIdempotent", unit: "kg", unit_cost: "10.00", low_stock_threshold: "1" });
+      .send({ name: "LedgerIdempotentReplay", unit: "kg", unit_cost: "10.00", low_stock_threshold: "1" });
     const ingredientId = ingRes.body.id as string;
 
-    // Receive twice — each receive call generates its own document ref so both should be recorded
-    await request(app)
+    // First receive: creates a new RR.
+    const first = await request(app)
       .post("/api/v1/inventory/receive")
       .set("Authorization", `Bearer ${warehouseToken}`)
       .send({ items: [{ ingredient_id: ingredientId, quantity: 5 }] });
+    expect(first.status).toBe(201);
 
-    await request(app)
+    // Second receive: identical actor/warehouse/lines within the lookback
+    // window → replay of the same RR, no second ledger row.
+    const second = await request(app)
       .post("/api/v1/inventory/receive")
       .set("Authorization", `Bearer ${warehouseToken}`)
       .send({ items: [{ ingredient_id: ingredientId, quantity: 5 }] });
+    expect(second.status).toBe(201);
+    expect(second.body.rr.id).toBe(first.body.rr.id);
+    expect(second.body.rr.rrNo).toBe(first.body.rr.rrNo);
 
     const res = await request(app)
       .get(`/api/v1/stock-ledger?ingredient_id=${ingredientId}&source_module=RECEIVE`)
       .set("Authorization", `Bearer ${adminToken}`);
 
-    // Both receives should produce ledger rows (they have distinct doc refs)
-    expect(res.body.length).toBeGreaterThanOrEqual(2);
+    // The replay posted no second ledger row — still exactly one.
+    expect(res.body.length).toBe(1);
+  });
+
+  it("a distinct second receive (different quantity) creates a new RR + RECEIVE row", async () => {
+    // Create a fresh ingredient
+    const ingRes = await request(app)
+      .post("/api/v1/ingredients")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "LedgerIdempotentDistinct", unit: "kg", unit_cost: "10.00", low_stock_threshold: "1" });
+    const ingredientId = ingRes.body.id as string;
+
+    // First receive: 5 kg.
+    const first = await request(app)
+      .post("/api/v1/inventory/receive")
+      .set("Authorization", `Bearer ${warehouseToken}`)
+      .send({ items: [{ ingredient_id: ingredientId, quantity: 5 }] });
+    expect(first.status).toBe(201);
+
+    // Second receive: different quantity (7 kg, not 5) → not a replay, even
+    // though it lands inside the same lookback window.
+    const second = await request(app)
+      .post("/api/v1/inventory/receive")
+      .set("Authorization", `Bearer ${warehouseToken}`)
+      .send({ items: [{ ingredient_id: ingredientId, quantity: 7 }] });
+    expect(second.status).toBe(201);
+    expect(second.body.rr.id).not.toBe(first.body.rr.id);
+
+    const res = await request(app)
+      .get(`/api/v1/stock-ledger?ingredient_id=${ingredientId}&source_module=RECEIVE`)
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    // Both distinct receives produced their own ledger row.
+    expect(res.body.length).toBe(2);
   });
 });
 

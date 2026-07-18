@@ -21,11 +21,15 @@ import {
   brands,
   discounts,
   ingredients,
+  kitchenStations,
+  locations,
   menuItems,
   orderItems,
   recipeLines,
 } from "../../db/schema.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { menuItemOutlets } from "../../db/enterprise-schema.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { isOutletInScope } from "../auth/outlet-scope.js";
 import { audit } from "../ems/audit.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { uploadMenuPhoto, ConfigError } from "../ems/cloudinary.js";
@@ -97,6 +101,16 @@ const recipeLineSchema = z.object({
 
 const putRecipeSchema = z.object({
   lines: z.array(recipeLineSchema),
+});
+
+const putMenuItemOutletSchema = z.object({
+  station_id: z.string().uuid(),
+  availability: z.enum(availabilityEnum.enumValues).optional(),
+  is_active: z.boolean().optional(),
+});
+
+const bulkAvailabilitySchema = z.object({
+  availability: z.enum(availabilityEnum.enumValues),
 });
 
 // ---------------------------------------------------------------------------
@@ -363,10 +377,21 @@ export function createMenuRouter(db: DB): Router {
       }
     }
 
-    // Transactional REPLACE: delete existing lines, insert the new set atomically
+    // Transactional REPLACE: delete existing lines, insert the new set atomically.
+    //
+    // Double-submit guard: lock the menu item row FOR UPDATE FIRST, before the
+    // delete+insert. Without this, two concurrent identical PUTs can each
+    // read/plan against a pre-delete snapshot, and under READ COMMITTED the
+    // second transaction's DELETE can miss rows the first transaction just
+    // inserted after it started — leaving duplicate recipe_line rows for the
+    // same ingredient, which silently doubles that ingredient's deduction at
+    // order time. The lock serializes the two transactions so the second one
+    // always deletes/replaces the first one's committed result.
     let newLines: (typeof recipeLines.$inferSelect)[] = [];
 
     await db.transaction(async (tx) => {
+      await tx.select({ id: menuItems.id }).from(menuItems).where(eq(menuItems.id, id)).for("update");
+
       await tx.delete(recipeLines).where(eq(recipeLines.menuItemId, id));
 
       if (parsed.data.lines.length > 0) {
@@ -386,6 +411,223 @@ export function createMenuRouter(db: DB): Router {
 
     res.json(newLines);
   });
+
+  // -------------------------------------------------------------------------
+  // menu_item_outlet — per-outlet deployment of a global menu item (D30/D39:
+  // one brand may operate in several outlets; a menu item needs its own
+  // station + availability at EACH outlet, not one global station).
+  // -------------------------------------------------------------------------
+
+  // GET /menu/:id/outlets — every outlet this item is deployed to (active + inactive).
+  router.get("/menu/:id/outlets", requireAuth, async (req, res) => {
+    const id = paramAsString(req.params.id);
+    const [item] = await db.select({ id: menuItems.id }).from(menuItems).where(eq(menuItems.id, id));
+    if (!item) {
+      sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+      return;
+    }
+
+    const rows = await db
+      .select({
+        locationId: menuItemOutlets.locationId,
+        stationId: menuItemOutlets.stationId,
+        availability: menuItemOutlets.availability,
+        isActive: menuItemOutlets.isActive,
+      })
+      .from(menuItemOutlets)
+      .where(eq(menuItemOutlets.menuItemId, id));
+
+    res.json(rows);
+  });
+
+  // PUT /menu/:id/outlets/:locationId — UPSERT the item's deployment at one
+  // outlet. Idempotent by construction: ON CONFLICT on the (menu_item_id,
+  // location_id) unique key means re-sending the same PUT never creates a
+  // second row, sequential or concurrent (idempotency-concurrency.md 5c).
+  router.put(
+    "/menu/:id/outlets/:locationId",
+    requireAuth,
+    requireRole("OWNER", "OUTLET_MANAGER", "BRAND_MANAGER"),
+    resolveOutletContext,
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const locationId = paramAsString(req.params.locationId);
+
+      const [item] = await db.select({ id: menuItems.id }).from(menuItems).where(eq(menuItems.id, id));
+      if (!item) {
+        sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+        return;
+      }
+
+      const [location] = await db.select({ id: locations.id }).from(locations).where(eq(locations.id, locationId));
+      if (!location) {
+        sendError(res, 404, "NOT_FOUND", "Outlet not found.");
+        return;
+      }
+
+      if (!isOutletInScope(req.outletContext, locationId)) {
+        sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+        return;
+      }
+
+      const parsed = putMenuItemOutletSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "Invalid menu_item_outlet payload.", parsed.error.issues);
+        return;
+      }
+
+      // The station must belong to THIS outlet — a station from a different
+      // outlet would silently mis-route KOTs (business-rules #2/#7).
+      const [station] = await db
+        .select({ id: kitchenStations.id })
+        .from(kitchenStations)
+        .where(and(eq(kitchenStations.id, parsed.data.station_id), eq(kitchenStations.locationId, locationId)));
+      if (!station) {
+        sendError(res, 422, "STATION_NOT_IN_OUTLET", "station_id does not belong to that outlet.");
+        return;
+      }
+
+      const [row] = await db
+        .insert(menuItemOutlets)
+        .values({
+          menuItemId: id,
+          locationId,
+          stationId: parsed.data.station_id,
+          availability: parsed.data.availability ?? "AVAILABLE",
+          isActive: parsed.data.is_active ?? true,
+        })
+        .onConflictDoUpdate({
+          target: [menuItemOutlets.menuItemId, menuItemOutlets.locationId],
+          set: {
+            stationId: parsed.data.station_id,
+            ...(parsed.data.availability !== undefined ? { availability: parsed.data.availability } : {}),
+            ...(parsed.data.is_active !== undefined ? { isActive: parsed.data.is_active } : {}),
+            updatedAt: new Date(),
+          },
+        })
+        .returning();
+
+      res.status(200).json(row);
+
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        actorName: req.user?.name ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "menu_item_outlet.upsert",
+        description: `deployed menu item ${id} to outlet ${locationId} (station ${parsed.data.station_id})`,
+        entityType: "menu_item_outlet",
+        entityId: row.id,
+        metadata: { menu_item_id: id, location_id: locationId, station_id: parsed.data.station_id },
+      });
+    },
+  );
+
+  // DELETE /menu/:id/outlets/:locationId — soft-undeploy (is_active=false).
+  // Idempotent: already-inactive or re-deleting returns 200, never re-fires
+  // a second business effect.
+  router.delete(
+    "/menu/:id/outlets/:locationId",
+    requireAuth,
+    requireRole("OWNER", "OUTLET_MANAGER", "BRAND_MANAGER"),
+    resolveOutletContext,
+    async (req, res) => {
+      const id = paramAsString(req.params.id);
+      const locationId = paramAsString(req.params.locationId);
+
+      const [item] = await db.select({ id: menuItems.id }).from(menuItems).where(eq(menuItems.id, id));
+      if (!item) {
+        sendError(res, 404, "NOT_FOUND", "Menu item not found.");
+        return;
+      }
+
+      if (!isOutletInScope(req.outletContext, locationId)) {
+        sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+        return;
+      }
+
+      const [existing] = await db
+        .select()
+        .from(menuItemOutlets)
+        .where(and(eq(menuItemOutlets.menuItemId, id), eq(menuItemOutlets.locationId, locationId)));
+      if (!existing) {
+        sendError(res, 404, "NOT_FOUND", "Menu item is not deployed to that outlet.");
+        return;
+      }
+
+      const [updated] = await db
+        .update(menuItemOutlets)
+        .set({ isActive: false, updatedAt: new Date() })
+        .where(and(eq(menuItemOutlets.menuItemId, id), eq(menuItemOutlets.locationId, locationId)))
+        .returning();
+
+      res.status(200).json({ ok: true, deployment: updated });
+
+      if (existing.isActive) {
+        // Only log a real state flip — mirrors brands/routes.ts's brand_activity_log convention.
+        void audit(db, {
+          actorUserId: req.user?.id ?? null,
+          actorName: req.user?.name ?? null,
+          sessionId: req.user?.sessionId ?? null,
+          action: "menu_item_outlet.undeploy",
+          description: `undeployed menu item ${id} from outlet ${locationId}`,
+          entityType: "menu_item_outlet",
+          entityId: updated!.id,
+          metadata: { menu_item_id: id, location_id: locationId },
+        });
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // POST /outlets/:locationId/menu-availability — bulk-set availability for
+  // every ACTIVE menu_item_outlet row at one outlet (one UPDATE; idempotent
+  // by nature, same convention as POST /brands/:id/availability).
+  // -------------------------------------------------------------------------
+  router.post(
+    "/outlets/:locationId/menu-availability",
+    requireAuth,
+    requireRole("OWNER", "OUTLET_MANAGER"),
+    resolveOutletContext,
+    async (req, res) => {
+      const locationId = paramAsString(req.params.locationId);
+
+      const [location] = await db.select({ id: locations.id }).from(locations).where(eq(locations.id, locationId));
+      if (!location) {
+        sendError(res, 404, "NOT_FOUND", "Outlet not found.");
+        return;
+      }
+
+      if (!isOutletInScope(req.outletContext, locationId)) {
+        sendError(res, 403, "FORBIDDEN", "Outlet not in your access scope.");
+        return;
+      }
+
+      const parsed = bulkAvailabilitySchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "Invalid availability payload.", parsed.error.issues);
+        return;
+      }
+
+      const updated = await db
+        .update(menuItemOutlets)
+        .set({ availability: parsed.data.availability, updatedAt: new Date() })
+        .where(and(eq(menuItemOutlets.locationId, locationId), eq(menuItemOutlets.isActive, true)))
+        .returning({ id: menuItemOutlets.id });
+
+      res.json({ updated: updated.length });
+
+      void audit(db, {
+        actorUserId: req.user?.id ?? null,
+        actorName: req.user?.name ?? null,
+        sessionId: req.user?.sessionId ?? null,
+        action: "menu_item_outlet.bulk_availability",
+        description: `set availability=${parsed.data.availability} on ${updated.length} menu item(s) at outlet ${locationId}`,
+        entityType: "location",
+        entityId: locationId,
+        metadata: { availability: parsed.data.availability, updated: updated.length },
+      });
+    },
+  );
 
   return router;
 }

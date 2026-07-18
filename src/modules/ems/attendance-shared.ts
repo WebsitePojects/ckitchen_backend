@@ -147,82 +147,97 @@ export async function recordAttendancePunch(
     return { ok: false, status: 400, code: "PAYLOAD_TOO_LARGE", message: "Attendance photo exceeds the 8 MB limit." };
   }
 
-  const [emp] = await db.select().from(employees).where(eq(employees.id, input.employeeId));
-  if (!emp) {
-    return { ok: false, status: 404, code: "NOT_FOUND", message: `Employee ${input.employeeId} not found.` };
-  }
-  if (emp.status !== "ACTIVE") {
-    return { ok: false, status: 400, code: "VALIDATION_ERROR", message: `Employee ${emp.fullName} is not ACTIVE.` };
-  }
+  // Double-submit guard: the whole gate-check → upload → insert sequence
+  // runs inside one transaction, locking the employee row FOR UPDATE FIRST.
+  // Without this, two concurrent identical punches (double-tap on a kiosk,
+  // or a client retry after a dropped response) can both read `hasIn=false`
+  // before either has inserted — the SELECT-then-INSERT gate below is a
+  // plain read, not atomic — and both then independently await the
+  // Cloudinary upload (widening the window further) and both insert a
+  // TIME_IN (or TIME_IN+TIME_OUT) row, corrupting DTR pairing and
+  // worked-minutes math. The lock is intentionally held across the
+  // Cloudinary upload rather than split into prepare/upload/finalize phases
+  // (contrast fulfillCustomerOrder) — attendance punches are low-volume and
+  // per-employee, so the extra lock duration is an acceptable trade for a
+  // simple, unambiguously-correct fix; a different employee's punch is never
+  // blocked by this lock.
+  return db.transaction(async (tx) => {
+    const [emp] = await tx.select().from(employees).where(eq(employees.id, input.employeeId)).for("update");
+    if (!emp) {
+      return { ok: false, status: 404, code: "NOT_FOUND", message: `Employee ${input.employeeId} not found.` };
+    }
+    if (emp.status !== "ACTIVE") {
+      return { ok: false, status: 400, code: "VALIDATION_ERROR", message: `Employee ${emp.fullName} is not ACTIVE.` };
+    }
 
-  // ── Punch gate (client review 2026-07-08): server-enforced, no exceptions ──
-  // The sequence within one day is strictly TIME_IN → TIME_OUT. Enforced HERE
-  // in the shared core so the authed route (including the OWNER kiosk
-  // override) and the public kiosk can never drift:
-  //   TIME_IN  while a TIME_IN exists today          → 409 ALREADY_TIMED_IN
-  //   TIME_OUT with no TIME_IN today                 → 409 NOT_TIMED_IN
-  //   TIME_OUT while a TIME_OUT exists today         → 409 ALREADY_TIMED_OUT
-  // Day-scoped on UTC day boundaries — the same window /ems/attendance/self/
-  // today uses (Manila-day boundaries are the same documented follow-up), so a
-  // forfeited/unclosed yesterday never blocks today's TIME_IN. Checked BEFORE
-  // the Cloudinary upload so a rejected punch costs no network round-trip.
-  const now = new Date();
-  const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-  const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
-  const todays = await db
-    .select({ type: attendanceRecords.type })
-    .from(attendanceRecords)
-    .where(
-      and(
-        eq(attendanceRecords.employeeId, input.employeeId),
-        gte(attendanceRecords.capturedAt, startOfDay),
-        lte(attendanceRecords.capturedAt, endOfDay),
-      ),
-    );
-  const hasIn = todays.some((r) => r.type === "TIME_IN");
-  const hasOut = todays.some((r) => r.type === "TIME_OUT");
-  if (input.type === "TIME_IN" && hasIn) {
-    return { ok: false, status: 409, code: "ALREADY_TIMED_IN", message: `${emp.fullName} already timed in today.` };
-  }
-  if (input.type === "TIME_OUT" && !hasIn) {
-    return { ok: false, status: 409, code: "NOT_TIMED_IN", message: `${emp.fullName} has not timed in today.` };
-  }
-  if (input.type === "TIME_OUT" && hasOut) {
-    return { ok: false, status: 409, code: "ALREADY_TIMED_OUT", message: `${emp.fullName} already timed out today.` };
-  }
+    // ── Punch gate (client review 2026-07-08): server-enforced, no exceptions ──
+    // The sequence within one day is strictly TIME_IN → TIME_OUT. Enforced HERE
+    // in the shared core so the authed route (including the OWNER kiosk
+    // override) and the public kiosk can never drift:
+    //   TIME_IN  while a TIME_IN exists today          → 409 ALREADY_TIMED_IN
+    //   TIME_OUT with no TIME_IN today                 → 409 NOT_TIMED_IN
+    //   TIME_OUT while a TIME_OUT exists today         → 409 ALREADY_TIMED_OUT
+    // Day-scoped on UTC day boundaries — the same window /ems/attendance/self/
+    // today uses (Manila-day boundaries are the same documented follow-up), so a
+    // forfeited/unclosed yesterday never blocks today's TIME_IN.
+    const now = new Date();
+    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+    const todays = await tx
+      .select({ type: attendanceRecords.type })
+      .from(attendanceRecords)
+      .where(
+        and(
+          eq(attendanceRecords.employeeId, input.employeeId),
+          gte(attendanceRecords.capturedAt, startOfDay),
+          lte(attendanceRecords.capturedAt, endOfDay),
+        ),
+      );
+    const hasIn = todays.some((r) => r.type === "TIME_IN");
+    const hasOut = todays.some((r) => r.type === "TIME_OUT");
+    if (input.type === "TIME_IN" && hasIn) {
+      return { ok: false, status: 409, code: "ALREADY_TIMED_IN", message: `${emp.fullName} already timed in today.` };
+    }
+    if (input.type === "TIME_OUT" && !hasIn) {
+      return { ok: false, status: 409, code: "NOT_TIMED_IN", message: `${emp.fullName} has not timed in today.` };
+    }
+    if (input.type === "TIME_OUT" && hasOut) {
+      return { ok: false, status: 409, code: "ALREADY_TIMED_OUT", message: `${emp.fullName} already timed out today.` };
+    }
 
-  let uploaded: { url: string; publicId: string };
-  try {
-    uploaded = await uploadAttendancePhoto(input.photo);
-  } catch {
-    // Never leak Cloudinary config/secret detail to the caller.
-    return { ok: false, status: 502, code: "UPLOAD_FAILED", message: "Failed to upload attendance photo." };
-  }
+    let uploaded: { url: string; publicId: string };
+    try {
+      uploaded = await uploadAttendancePhoto(input.photo);
+    } catch {
+      // Never leak Cloudinary config/secret detail to the caller.
+      return { ok: false, status: 502, code: "UPLOAD_FAILED", message: "Failed to upload attendance photo." };
+    }
 
-  const [record] = await db
-    .insert(attendanceRecords)
-    .values({
-      employeeId: input.employeeId,
-      type: input.type,
-      photoUrl: uploaded.url,
-      photoPublicId: uploaded.publicId,
-      recordedByUserId: actor.recordedByUserId,
+    const [record] = await tx
+      .insert(attendanceRecords)
+      .values({
+        employeeId: input.employeeId,
+        type: input.type,
+        photoUrl: uploaded.url,
+        photoPublicId: uploaded.publicId,
+        recordedByUserId: actor.recordedByUserId,
+        sessionId: actor.sessionId,
+        note: input.note ?? null,
+      })
+      .returning();
+
+    const via = actor.source === "public_kiosk" ? " via public kiosk" : "";
+    void audit(db, {
+      actorUserId: actor.auditActorUserId,
+      actorName: actor.auditActorName,
       sessionId: actor.sessionId,
-      note: input.note ?? null,
-    })
-    .returning();
+      action: input.type === "TIME_IN" ? "attendance.time_in" : "attendance.time_out",
+      description: `${input.type} for ${emp.fullName} (${emp.employeeNo})${via}`,
+      entityType: "attendance_record",
+      entityId: record!.id,
+      metadata: actor.source ? { source: actor.source } : null,
+    });
 
-  const via = actor.source === "public_kiosk" ? " via public kiosk" : "";
-  void audit(db, {
-    actorUserId: actor.auditActorUserId,
-    actorName: actor.auditActorName,
-    sessionId: actor.sessionId,
-    action: input.type === "TIME_IN" ? "attendance.time_in" : "attendance.time_out",
-    description: `${input.type} for ${emp.fullName} (${emp.employeeNo})${via}`,
-    entityType: "attendance_record",
-    entityId: record!.id,
-    metadata: actor.source ? { source: actor.source } : null,
+    return { ok: true, record: record! };
   });
-
-  return { ok: true, record: record! };
 }

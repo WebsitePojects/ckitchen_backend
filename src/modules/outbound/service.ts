@@ -10,11 +10,11 @@
  * module only ever writes PENDING rows plus the control-mode/audit side
  * effects; it never talks to an adapter.
  */
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
-import { operationalFeatureFlags } from "../../db/enterprise-schema.js";
+import { menuItemOutlets, operationalFeatureFlags } from "../../db/enterprise-schema.js";
 import { aggregatorCommands, type AggregatorCommand } from "../../db/outbound-schema.js";
-import { aggregatorAccounts, auditLogs, orders, type AggregatorAccount } from "../../db/schema.js";
+import { aggregatorAccounts, auditLogs, brands, locations, menuItems, orders, type AggregatorAccount } from "../../db/schema.js";
 import { OutboundError } from "./errors.js";
 import {
   BLOCKED_AFTER_REJECT,
@@ -345,4 +345,113 @@ export async function getCommandById(db: DB, id: string): Promise<AggregatorComm
 export async function getListingById(db: DB, id: string): Promise<AggregatorAccount | undefined> {
   const [row] = await db.select().from(aggregatorAccounts).where(eq(aggregatorAccounts.id, id));
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// Merchant-console read side (shapes mirror ckitchen_frontend
+// src/lib/merchant-console-api.ts — ChannelListing / ChannelListingItem).
+// ---------------------------------------------------------------------------
+
+export interface ChannelListingView {
+  id: string;
+  brand: { id: string; name: string; color: string };
+  outlet: { id: string; name: string };
+  aggregator: string;
+  status: "ACTIVE" | "PAUSED" | "INACTIVE";
+  controlMode: string;
+  merchantId: string | null;
+  pausedReason: string | null;
+  pausedUntil: string | null;
+}
+
+/**
+ * Lists channel listings joined to brand + physical outlet. `scopeLocationIds`
+ * null = unscoped (ALL-outlet roles); otherwise only listings at those outlets.
+ * Listing pause state is not yet persisted locally (a PAUSE_STORE command is
+ * queued to the aggregator; store-status read-back arrives with the real
+ * adapter), so status derives from is_active and paused fields stay null.
+ */
+export async function listChannelListings(
+  db: DB,
+  scopeLocationIds: string[] | null,
+): Promise<ChannelListingView[]> {
+  const where = scopeLocationIds === null
+    ? undefined
+    : scopeLocationIds.length === 0
+      ? sql`false`
+      : inArray(aggregatorAccounts.locationId, scopeLocationIds);
+  const rows = await db
+    .select({
+      id: aggregatorAccounts.id,
+      aggregator: aggregatorAccounts.aggregator,
+      isActive: aggregatorAccounts.isActive,
+      controlMode: aggregatorAccounts.controlMode,
+      apiMerchantId: aggregatorAccounts.apiMerchantId,
+      externalMerchantId: aggregatorAccounts.externalMerchantId,
+      brandId: brands.id,
+      brandName: brands.name,
+      brandColor: brands.color,
+      outletId: locations.id,
+      outletName: locations.name,
+    })
+    .from(aggregatorAccounts)
+    .innerJoin(brands, eq(aggregatorAccounts.brandId, brands.id))
+    .innerJoin(locations, eq(aggregatorAccounts.locationId, locations.id))
+    .where(where)
+    .orderBy(brands.name, aggregatorAccounts.aggregator);
+  return rows.map((r) => ({
+    id: r.id,
+    brand: { id: r.brandId, name: r.brandName, color: r.brandColor },
+    outlet: { id: r.outletId, name: r.outletName },
+    aggregator: r.aggregator,
+    status: r.isActive ? ("ACTIVE" as const) : ("INACTIVE" as const),
+    controlMode: r.controlMode,
+    merchantId: r.apiMerchantId ?? r.externalMerchantId ?? null,
+    pausedReason: null,
+    pausedUntil: null,
+  }));
+}
+
+export interface ChannelListingItemView {
+  id: string;
+  name: string;
+  category: string | null;
+  price: number | null;
+  available: boolean;
+}
+
+/**
+ * Menu items for the listing's brand with availability resolved the same way
+ * order ingestion resolves it (orders/service.ts ~530): the per-outlet
+ * deployment row overrides the item-level value when present.
+ */
+export async function listListingItems(
+  db: DB,
+  listing: AggregatorAccount,
+): Promise<ChannelListingItemView[]> {
+  const items = await db
+    .select({
+      id: menuItems.id,
+      name: menuItems.name,
+      price: menuItems.price,
+      itemAvailability: menuItems.availability,
+      deploymentAvailability: menuItemOutlets.availability,
+    })
+    .from(menuItems)
+    .leftJoin(
+      menuItemOutlets,
+      and(
+        eq(menuItemOutlets.menuItemId, menuItems.id),
+        listing.locationId ? eq(menuItemOutlets.locationId, listing.locationId) : sql`false`,
+      ),
+    )
+    .where(eq(menuItems.brandId, listing.brandId))
+    .orderBy(menuItems.name);
+  return items.map((i) => ({
+    id: i.id,
+    name: i.name,
+    category: null,
+    price: i.price === null ? null : Number(i.price),
+    available: (i.deploymentAvailability ?? i.itemAvailability) === "AVAILABLE",
+  }));
 }

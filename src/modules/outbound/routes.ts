@@ -43,12 +43,12 @@ import type { DB } from "../../db/client.js";
 import { aggregatorCommandStatusEnum, aggregatorCommandTypeEnum } from "../../db/outbound-schema.js";
 import { channelControlModeEnum } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
-import { isOutletInScope } from "../auth/outlet-scope.js";
+import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
 import { normalizeRole } from "../auth/roles.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { OutboundError } from "./errors.js";
 import { KITCHEN_CREW_ALLOWED_COMMAND_TYPES } from "./policies.js";
-import { enqueueCommand, getListingById, listCommands, updateControlMode } from "./service.js";
+import { enqueueCommand, getListingById, listChannelListings, listCommands, listListingItems, updateControlMode } from "./service.js";
 import type { OutboundCommandType } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -397,6 +397,30 @@ export function createOutboundRouter(db: DB): Router {
       allowedLocationIds,
     });
     res.json({ items: items.map(toCommandResponse), total, limit: limit ?? DEFAULT_LIMIT, offset: offset ?? 0 });
+  });
+
+  // ── Merchant-console read side ──
+  // GET /channel-listings — every listing the caller may act on. Read roles are
+  // the merchant-console page set (frontend PAGE_ROLES): OWNER + OUTLET_MANAGER +
+  // BRAND_MANAGER + KITCHEN_CREW; ALL-outlet roles see everything, outlet-scoped
+  // roles only their outlets' listings (server-side scoping, never the client's).
+  router.get("/channel-listings", requireAuth, requireRole("OWNER", "OUTLET_MANAGER", "BRAND_MANAGER", "KITCHEN_CREW"), resolveOutletContext, async (req: Request, res: Response) => {
+    try {
+      const scope = listScopeLocationIds(req.outletContext);
+      res.json(await listChannelListings(db, scope));
+    } catch (err) { handleServiceError(err, res); }
+  });
+
+  router.get("/channel-listings/:id/items", requireAuth, requireRole("OWNER", "OUTLET_MANAGER", "BRAND_MANAGER", "KITCHEN_CREW"), resolveOutletContext, async (req: Request, res: Response) => {
+    try {
+      const listing = await getListingById(db, paramAsString(req.params.id));
+      if (!listing) return sendError(res, 404, "NOT_FOUND", "Channel listing not found.");
+      const scope = listScopeLocationIds(req.outletContext);
+      if (scope !== null && (!listing.locationId || !scope.includes(listing.locationId))) {
+        return sendError(res, 403, "UNAUTHORIZED", "Listing outside your outlet scope.");
+      }
+      res.json(await listListingItems(db, listing));
+    } catch (err) { handleServiceError(err, res); }
   });
 
   return router;

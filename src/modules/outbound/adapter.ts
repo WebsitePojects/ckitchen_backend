@@ -9,6 +9,7 @@
  * A future live Grab/foodpanda adapter implements the same interface 1:1
  * from spec §1's endpoint table — nothing in service.ts or worker.ts changes.
  */
+import { DeliverectOutboundAdapter } from "./deliverect-adapter.js";
 import type { AggregatorOutboundAdapter, OutboundCommandRequest, OutboundSendResult } from "./types.js";
 
 export interface DummyOutboundAdapterOptions {
@@ -46,4 +47,23 @@ export class DummyOutboundAdapter implements AggregatorOutboundAdapter {
     if (this.forcedResult) return this.forcedResult;
     return { ok: true, providerRef: `DUMMY-${cmd.commandId}-${cmd.attempt}` };
   }
+}
+
+/**
+ * Outbound adapter registry (mirrors src/modules/middleware/adapter.ts's
+ * getMiddlewareAdapter for the inbound side). NOT wired to processCommands
+ * automatically — no scheduler exists yet (worker.ts's file header: "this
+ * stream wires no scheduler ... out of scope"), so a future scheduler (or an
+ * ad-hoc admin trigger) picks the adapter via this function and passes the
+ * single instance into processCommands(db, adapter, opts) itself.
+ */
+const OUTBOUND_ADAPTERS: Record<string, () => AggregatorOutboundAdapter> = {
+  DUMMY: () => new DummyOutboundAdapter(),
+  DELIVERECT: () => new DeliverectOutboundAdapter(),
+};
+
+/** Resolves the outbound adapter instance for a provider name; null when unregistered. */
+export function getOutboundAdapter(provider: string): AggregatorOutboundAdapter | null {
+  const factory = OUTBOUND_ADAPTERS[provider];
+  return factory ? factory() : null;
 }

@@ -12,6 +12,7 @@
  */
 import { z } from "zod";
 import { MiddlewareError } from "./errors.js";
+import { DeliverectProviderAdapter } from "./deliverect-adapter.js";
 import { verifyHmacSignature } from "./signature.js";
 import type {
   MiddlewareAdapter,
@@ -101,6 +102,11 @@ export class DummyProviderAdapter implements MiddlewareAdapter {
 
 const PROVIDER_ADAPTERS: Record<string, MiddlewareAdapter> = {
   DUMMY: new DummyProviderAdapter(),
+  // Deliverect (chosen middleware, D9/D28) — ships inert until
+  // DELIVERECT_HMAC_SECRET is set (see deliverect-secrets.ts); routes.ts
+  // special-cases this provider's header extraction (its HMAC scheme has no
+  // timestamp/key-id, unlike the DUMMY scheme above).
+  DELIVERECT: new DeliverectProviderAdapter(),
 };
 
 /** Resolves the adapter for a provider name; null when unregistered. */

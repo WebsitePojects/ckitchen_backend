@@ -29,11 +29,26 @@ import type { ProviderEvent } from "../../db/middleware-schema.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { getMiddlewareAdapter } from "./adapter.js";
+import { loadDeliverectHmacSecrets } from "./deliverect-secrets.js";
 import { MiddlewareError } from "./errors.js";
 import { processEvent } from "./processor.js";
 import { loadKnownKeyIds, loadWebhookSecrets } from "./secrets.js";
 import { isTimestampFresh } from "./signature.js";
 import { getEventById, intakeEvent, listEvents, sha256Hex } from "./service.js";
+import type { WebhookHeaders, WebhookSecrets } from "./types.js";
+
+/**
+ * Providers whose HMAC scheme has no timestamp/key-id concept (currently
+ * just Deliverect — see deliverect-adapter.ts's file header). For these,
+ * skip the generic X-Middleware-Timestamp / X-Middleware-Key-Id / known-key-id
+ * / timestamp-freshness checks below (they're ORION's own DUMMY-provider
+ * scheme, not a Deliverect requirement) and read the provider's own signature
+ * header directly.
+ */
+const RAW_SIGNATURE_HEADER_BY_PROVIDER: Record<string, string> = {
+  // CONFIRM EXACT HEADER NAME WITH DELIVERECT STAGING (see deliverect-adapter.ts).
+  DELIVERECT: "X-Deliverect-Hmac-Sha256",
+};
 
 const MAX_HEADER_LEN = 200;
 const DEFAULT_TIMESTAMP_SKEW_SECONDS = 300;
@@ -113,12 +128,6 @@ export function createMiddlewareRouter(db: DB): Router {
       return;
     }
 
-    const timestamp = requireBoundedHeader(req, res, "X-Middleware-Timestamp");
-    if (timestamp === null) return;
-    const keyId = requireBoundedHeader(req, res, "X-Middleware-Key-Id");
-    if (keyId === null) return;
-    const signature = requireBoundedHeader(req, res, "X-Middleware-Signature");
-    if (signature === null) return;
     const providerHeader = req.header("X-Middleware-Provider");
     const provider = typeof providerHeader === "string" && providerHeader.trim() ? providerHeader.trim() : "DUMMY";
 
@@ -128,29 +137,63 @@ export function createMiddlewareRouter(db: DB): Router {
       return;
     }
 
-    let knownKeyIds: ReadonlySet<string>;
-    let secrets: ReturnType<typeof loadWebhookSecrets>;
-    try {
-      knownKeyIds = loadKnownKeyIds();
-      secrets = loadWebhookSecrets();
-    } catch (err) {
-      console.error("[middleware] secret configuration error", err);
-      sendError(res, 500, "INTERNAL_ERROR", "Internal server error.");
-      return;
+    const rawSignatureHeader = RAW_SIGNATURE_HEADER_BY_PROVIDER[provider];
+    let headers: WebhookHeaders;
+    let secrets: WebhookSecrets;
+
+    if (rawSignatureHeader) {
+      // Deliverect-style scheme: no X-Middleware-Timestamp/Key-Id, no known-
+      // key-id allowlist, no timestamp-freshness window — the provider's own
+      // HMAC header is the entire signature contract (see adapter.ts's file
+      // header). `timestamp`/`keyId` are unused placeholders for this branch.
+      const signature = requireBoundedHeader(req, res, rawSignatureHeader);
+      if (signature === null) return;
+
+      const deliverectSecrets = loadDeliverectHmacSecrets();
+      if (!deliverectSecrets) {
+        // Fail closed: unconfigured secret is a rejection, never an "accept
+        // unsigned" fallback (idempotency-concurrency.md rule 14).
+        console.error(`[middleware] ${provider} webhook received but its HMAC secret is not configured`);
+        sendError(res, 503, "FEATURE_DISABLED", `${provider} is not configured — paste its HMAC secret into env.`);
+        return;
+      }
+      headers = { timestamp: "", keyId: "", signature };
+      secrets = deliverectSecrets;
+    } else {
+      const timestamp = requireBoundedHeader(req, res, "X-Middleware-Timestamp");
+      if (timestamp === null) return;
+      const keyId = requireBoundedHeader(req, res, "X-Middleware-Key-Id");
+      if (keyId === null) return;
+      const signature = requireBoundedHeader(req, res, "X-Middleware-Signature");
+      if (signature === null) return;
+
+      let knownKeyIds: ReadonlySet<string>;
+      let genericSecrets: ReturnType<typeof loadWebhookSecrets>;
+      try {
+        knownKeyIds = loadKnownKeyIds();
+        genericSecrets = loadWebhookSecrets();
+      } catch (err) {
+        console.error("[middleware] secret configuration error", err);
+        sendError(res, 500, "INTERNAL_ERROR", "Internal server error.");
+        return;
+      }
+
+      // Order matters (spec §11): key id, then timestamp freshness, then
+      // signature — ALL evaluated against the exact raw bytes, before any
+      // JSON parsing is attempted.
+      if (!knownKeyIds.has(keyId)) {
+        sendError(res, 401, "UNKNOWN_KEY_ID", "Unrecognized signing key id.");
+        return;
+      }
+      if (!isTimestampFresh(timestamp, DEFAULT_TIMESTAMP_SKEW_SECONDS)) {
+        sendError(res, 401, "INVALID_TIMESTAMP", "Webhook timestamp is outside the accepted skew window.");
+        return;
+      }
+      headers = { timestamp, keyId, signature };
+      secrets = genericSecrets;
     }
 
-    // Order matters (spec §11): key id, then timestamp freshness, then
-    // signature — ALL evaluated against the exact raw bytes, before any
-    // JSON parsing is attempted.
-    if (!knownKeyIds.has(keyId)) {
-      sendError(res, 401, "UNKNOWN_KEY_ID", "Unrecognized signing key id.");
-      return;
-    }
-    if (!isTimestampFresh(timestamp, DEFAULT_TIMESTAMP_SKEW_SECONDS)) {
-      sendError(res, 401, "INVALID_TIMESTAMP", "Webhook timestamp is outside the accepted skew window.");
-      return;
-    }
-    if (!adapter.verifySignature(rawBody, { timestamp, keyId, signature }, secrets)) {
+    if (!adapter.verifySignature(rawBody, headers, secrets)) {
       sendError(res, 401, "INVALID_SIGNATURE", "Webhook signature verification failed.");
       return;
     }
@@ -164,7 +207,7 @@ export function createMiddlewareRouter(db: DB): Router {
     }
 
     const rawHash = sha256Hex(rawBody);
-    const { event, outcome } = await intakeEvent(db, { provider, normalized, rawHash, keyId });
+    const { event, outcome } = await intakeEvent(db, { provider, normalized, rawHash, keyId: headers.keyId });
 
     const statusByOutcome = { CREATED: 202, DUPLICATE: 200, QUARANTINED: 200 } as const;
     res.status(statusByOutcome[outcome]).json({ status: outcome, event: toEventResponse(event) });

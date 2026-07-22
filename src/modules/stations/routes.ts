@@ -9,6 +9,16 @@ import { sendError } from "../http-errors.js";
 
 const WRITE_ROLES = ["OWNER"] as const;
 
+// Outlet-scoping leak fix (M6): additive-only filter for GET /stations.
+// Omitted = unchanged platform-wide behavior; supplied = only that outlet's
+// stations. NOTE: `printer` has no location_id column of its own (a printer's
+// outlet is only implied transitively via whichever station(s) reference it
+// as default_printer_id), so GET /printers is NOT filterable the same way —
+// see the audit note on that route below.
+const stationListQuerySchema = z.object({
+  location_id: z.string().uuid().optional(),
+});
+
 const createStationSchema = z.object({
   name: z.string().min(1),
   default_printer_id: z.string().uuid().optional(),
@@ -37,8 +47,16 @@ const updatePrinterSchema = z
 export function createStationsRouter(db: DB): Router {
   const router = Router();
 
-  router.get("/stations", requireAuth, async (_req, res) => {
-    const stations = await db.select().from(kitchenStations);
+  router.get("/stations", requireAuth, async (req, res) => {
+    const queryParsed = stationListQuerySchema.safeParse(req.query);
+    if (!queryParsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "'location_id' must be a UUID.", queryParsed.error.issues);
+      return;
+    }
+
+    const stations = queryParsed.data.location_id
+      ? await db.select().from(kitchenStations).where(eq(kitchenStations.locationId, queryParsed.data.location_id))
+      : await db.select().from(kitchenStations);
     const allPrinters = await db.select().from(printers);
     const printersById = new Map(allPrinters.map((p) => [p.id, p]));
 
@@ -85,6 +103,14 @@ export function createStationsRouter(db: DB): Router {
     res.status(201).json(station);
   });
 
+  // Outlet-scoping audit (M6): `printer` has NO location_id column — a
+  // printer's outlet is only implied transitively via kitchen_station.
+  // default_printer_id, and that is not a 1:1 relation (a printer could in
+  // theory be referenced by stations at different outlets), so an optional
+  // ?location_id= filter cannot be added here with the same safe, direct
+  // pattern used for /brands and /stations. Left unfiltered; documented for
+  // the frontend and for a future fix if printer-per-outlet ownership becomes
+  // an explicit column.
   router.get("/printers", requireAuth, async (_req, res) => {
     const rows = await db.select().from(printers);
     res.json(rows);

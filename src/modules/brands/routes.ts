@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, asc, eq, gte, inArray, lt, lte, ne, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, lt, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -27,6 +27,14 @@ import { paramAsString, sendError } from "../http-errors.js";
 const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 /** Deploying a brand to an outlet / deactivating it is an OWNER (HQ) action. */
 const DEPLOY_ROLES = ["OWNER"] as const;
+
+// Outlet-scoping leak fix (M6): additive-only filter for GET /brands. Omitted =
+// unchanged platform-wide behavior (Merchant Management needs the full list);
+// supplied = only brands whose HOME outlet is location_id OR that have an
+// active brand_outlet deployment there (D30 many-to-many).
+const brandListQuerySchema = z.object({
+  location_id: z.string().uuid().optional(),
+});
 
 const createBrandSchema = z.object({
   name: z.string().min(1),
@@ -126,10 +134,33 @@ export function createBrandsRouter(db: DB): Router {
   const router = Router();
 
   router.get("/brands", requireAuth, async (req, res) => {
+    const queryParsed = brandListQuerySchema.safeParse(req.query);
+    if (!queryParsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "'location_id' must be a UUID.", queryParsed.error.issues);
+      return;
+    }
+
     const isActiveParam = req.query.is_active;
     const conditions = [];
     if (isActiveParam === "true") conditions.push(eq(brands.isActive, true));
     if (isActiveParam === "false") conditions.push(eq(brands.isActive, false));
+
+    if (queryParsed.data.location_id) {
+      const locationId = queryParsed.data.location_id;
+      // Brands actively deployed to this outlet (D30) — a brand's HOME outlet
+      // (brand.location_id) covers the common case, so this only needs to add
+      // brands deployed there from elsewhere.
+      const deployed = await db
+        .select({ brandId: brandOutlet.brandId })
+        .from(brandOutlet)
+        .where(and(eq(brandOutlet.locationId, locationId), eq(brandOutlet.isActive, true)));
+      const deployedIds = deployed.map((d) => d.brandId);
+      conditions.push(
+        deployedIds.length > 0
+          ? or(eq(brands.locationId, locationId), inArray(brands.id, deployedIds))!
+          : eq(brands.locationId, locationId),
+      );
+    }
 
     const rows =
       conditions.length > 0
@@ -520,10 +551,24 @@ export function createBrandsRouter(db: DB): Router {
       return;
     }
 
+    // Outlet-scoping leak fix (M6): additive-only filter. Omitted = unchanged
+    // (every channel listing for the brand, across every outlet it operates
+    // in); supplied = only listings pinned to that outlet (D39).
+    const queryParsed = brandListQuerySchema.safeParse(req.query);
+    if (!queryParsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "'location_id' must be a UUID.", queryParsed.error.issues);
+      return;
+    }
+
+    const conditions = [eq(aggregatorAccounts.brandId, id)];
+    if (queryParsed.data.location_id) {
+      conditions.push(eq(aggregatorAccounts.locationId, queryParsed.data.location_id));
+    }
+
     const rows = await db
       .select()
       .from(aggregatorAccounts)
-      .where(eq(aggregatorAccounts.brandId, id));
+      .where(and(...conditions));
 
     res.json(rows.map(toPublicAccount));
   });

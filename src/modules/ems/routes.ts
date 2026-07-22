@@ -15,7 +15,7 @@
  *   GET  /ems/attendance/dtr                 — paired DTR view with worked_minutes
  */
 import { Router, type Request, type Response } from "express";
-import { and, asc, count, desc, eq, gte, inArray, lte, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, inArray, isNull, lte, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -26,14 +26,54 @@ import {
   employeeStatusEnum,
   employees,
   locations,
+  roleEnum,
   userSessions,
   users,
 } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope, listScopeLocationIds, resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { normalizeRole } from "../auth/roles.js";
+import { hashPassword } from "../auth/service.js";
 import { sendError } from "../http-errors.js";
 import { pairDtrEntries, recordAttendancePunch, type DtrEntry } from "./attendance-shared.js";
+
+// ---------------------------------------------------------------------------
+// Unified employee + login-account creation (client-critical)
+// ---------------------------------------------------------------------------
+
+/**
+ * Detects a PostgreSQL unique-violation (23505) surfaced through PGlite/
+ * postgres-js/drizzle error wrapping — same helper shape used in
+ * orders/service.ts, customer-orders/service.ts, production/service.ts.
+ */
+function isUniqueViolation(err: unknown): boolean {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    if (e["code"] === "23505") return true;
+    if (e["cause"] && typeof e["cause"] === "object") {
+      const cause = e["cause"] as Record<string, unknown>;
+      if (cause["code"] === "23505") return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Internal-only signal thrown inside the POST /employees/:id/account
+ * transaction when the conditional UPDATE (`WHERE id=? AND user_id IS NULL`)
+ * affects 0 rows — i.e. this request lost a concurrent double-fire race. The
+ * throw aborts the whole transaction (rolling back this request's own just-
+ * inserted `users` row too), so exactly one user ends up linked.
+ */
+class EmployeeAccountRaceLostError extends Error {}
+
+/** Shared { email, password, role } payload for both account-creation routes. */
+const accountInputSchema = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  password: z.string().min(8),
+  // Fail closed: validated against the actual DB role enum (v1 aliases + v2).
+  role: z.enum(roleEnum.enumValues),
+});
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -95,23 +135,33 @@ const hiredAtInput = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "hired_at must be Y
 // unassigned; omitted leaves the current assignment untouched (PATCH only).
 const locationIdInput = z.string().uuid().nullable();
 
-const createEmployeeSchema = z.object({
-  user_id: z.string().uuid().optional(),
-  employee_no: z.string().min(1),
-  full_name: z.string().min(1),
-  department: z.enum(departmentEnum.enumValues),
-  position: z.string().optional(),
-  photo_url: z.string().url().optional(),
-  status: z.enum(employeeStatusEnum.enumValues).optional(),
-  work_days: workDaysInput.optional(),
-  hired_at: hiredAtInput.optional(),
-  location_id: locationIdInput.optional(),
-  // Client-confirmed (2026-07-10, §10): explicit per-employee override — owner
-  // role alone is not the historical source of an employee's attendance policy
-  // (e.g. an Accounting Head stays Required; an Owner may be Exempt). Omitted
-  // on create -> DB default (true) applies; omitted on update -> unchanged.
-  attendance_required: z.boolean().optional(),
-});
+const createEmployeeSchema = z
+  .object({
+    user_id: z.string().uuid().optional(),
+    employee_no: z.string().min(1),
+    full_name: z.string().min(1),
+    department: z.enum(departmentEnum.enumValues),
+    position: z.string().optional(),
+    photo_url: z.string().url().optional(),
+    status: z.enum(employeeStatusEnum.enumValues).optional(),
+    work_days: workDaysInput.optional(),
+    hired_at: hiredAtInput.optional(),
+    location_id: locationIdInput.optional(),
+    // Client-confirmed (2026-07-10, §10): explicit per-employee override — owner
+    // role alone is not the historical source of an employee's attendance policy
+    // (e.g. an Accounting Head stays Required; an Owner may be Exempt). Omitted
+    // on create -> DB default (true) applies; omitted on update -> unchanged.
+    attendance_required: z.boolean().optional(),
+    // Unified employee + login-account creation (client-critical): when
+    // present, POST /employees atomically creates a `users` row too and links
+    // it via employee.user_id. Mutually exclusive with `user_id` (which links
+    // to an EXISTING login instead).
+    account: accountInputSchema.optional(),
+  })
+  .refine((body) => !(body.account && body.user_id), {
+    message: "Provide either 'user_id' (link an existing login) or 'account' (create a new one), not both.",
+    path: ["account"],
+  });
 
 // PATCH: every field optional (partial update). Unknown keys from old clients are
 // stripped by zod (default z.object behavior) so they can never break the update.
@@ -216,11 +266,21 @@ export function createEmsRouter(db: DB): Router {
     if (statusParam) conditions.push(eq(employees.status, statusParam as typeof employeeStatusEnum.enumValues[number]));
     if (departmentParam) conditions.push(eq(employees.department, departmentParam as typeof departmentEnum.enumValues[number]));
 
-    const rows = conditions.length
-      ? await db.select().from(employees).where(and(...conditions))
-      : await db.select().from(employees);
+    // Left-joined so every row carries hasLogin/userEmail (unified employee +
+    // login-account creation, client-critical) without an N+1 lookup.
+    const rows = await db
+      .select({ employee: employees, userEmail: users.email })
+      .from(employees)
+      .leftJoin(users, eq(employees.userId, users.id))
+      .where(conditions.length ? and(...conditions) : undefined);
 
-    res.json(rows.map(serializeEmployee));
+    res.json(
+      rows.map((r) => ({
+        ...serializeEmployee(r.employee),
+        hasLogin: r.userEmail !== null,
+        userEmail: r.userEmail ?? null,
+      })),
+    );
   });
 
   // ── POST /employees ───────────────────────────────────────────────────────
@@ -259,30 +319,147 @@ export function createEmsRouter(db: DB): Router {
         if (!locationId) return;
       }
 
-      const [employee] = await db
-        .insert(employees)
-        .values({
-          userId: parsed.data.user_id ?? null,
-          employeeNo: parsed.data.employee_no,
-          fullName: parsed.data.full_name,
-          department: parsed.data.department,
-          position: parsed.data.position ?? null,
-          photoUrl: parsed.data.photo_url ?? null,
-          status: parsed.data.status ?? "ACTIVE",
-          // Omit work_days when not supplied so the DB column default (the 5-day
-          // week) applies; store the canonical CSV when supplied.
-          ...(parsed.data.work_days ? { workDays: canonicalWorkDaysCsv(parsed.data.work_days) } : {}),
-          hiredAt: parsed.data.hired_at ?? null,
-          locationId,
-          ...(parsed.data.attendance_required !== undefined
-            ? { attendanceRequired: parsed.data.attendance_required }
-            : {}),
-        })
-        .returning();
+      const employeeValues = {
+        userId: parsed.data.user_id ?? null,
+        employeeNo: parsed.data.employee_no,
+        fullName: parsed.data.full_name,
+        department: parsed.data.department,
+        position: parsed.data.position ?? null,
+        photoUrl: parsed.data.photo_url ?? null,
+        status: parsed.data.status ?? "ACTIVE",
+        // Omit work_days when not supplied so the DB column default (the 5-day
+        // week) applies; store the canonical CSV when supplied.
+        ...(parsed.data.work_days ? { workDays: canonicalWorkDaysCsv(parsed.data.work_days) } : {}),
+        hiredAt: parsed.data.hired_at ?? null,
+        locationId,
+        ...(parsed.data.attendance_required !== undefined
+          ? { attendanceRequired: parsed.data.attendance_required }
+          : {}),
+      };
+
+      // Unified employee + login-account creation: `account` atomically
+      // creates the `users` row (bcrypt-hashed password, never logged) AND the
+      // employee row, linked via employee.user_id, in ONE transaction.
+      if (parsed.data.account) {
+        const { email, password, role } = parsed.data.account;
+        try {
+          let createdUser!: typeof users.$inferSelect;
+          let createdEmployee!: typeof employees.$inferSelect;
+
+          await db.transaction(async (tx) => {
+            const passwordHash = await hashPassword(password);
+            const [user] = await tx.insert(users).values({ name: parsed.data.full_name, email, passwordHash, role }).returning();
+            createdUser = user!;
+
+            const [employee] = await tx
+              .insert(employees)
+              .values({ ...employeeValues, userId: user!.id })
+              .returning();
+            createdEmployee = employee!;
+          });
+
+          res.status(201).json({
+            ...serializeEmployee(createdEmployee),
+            user: { id: createdUser.id, email: createdUser.email, role: createdUser.role },
+          });
+        } catch (err) {
+          if (isUniqueViolation(err)) {
+            // Recovery re-query MUST run outside the aborted transaction
+            // (Postgres aborts the whole tx on error) — hence `db`, not `tx`.
+            const [existingUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
+            if (existingUser) {
+              sendError(res, 409, "EMAIL_TAKEN", `Email ${email} is already registered.`);
+              return;
+            }
+          }
+          throw err;
+        }
+        return;
+      }
+
+      const [employee] = await db.insert(employees).values(employeeValues).returning();
 
       res.status(201).json(serializeEmployee(employee!));
     },
   );
+
+  // ── POST /employees/:id/account ───────────────────────────────────────────
+  // Creates a login (`users` row) for an EXISTING employee that has none yet.
+  // OWNER-only. Idempotency/concurrency (rules #2, #7): the conditional
+  // UPDATE `WHERE id=? AND user_id IS NULL` runs in the SAME transaction as
+  // the `users` insert, so a concurrent double-fire has exactly one winner —
+  // the loser's UPDATE affects 0 rows, EmployeeAccountRaceLostError aborts
+  // that whole transaction (rolling back its own just-inserted user row too),
+  // and it replies 409 ALREADY_LINKED. Exactly one user ends up linked either
+  // way, sequential or concurrent.
+  router.post("/employees/:id/account", requireAuth, requireRole("OWNER"), async (req, res) => {
+    const id = req.params.id as string;
+    if (!UUID_RE.test(id)) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+      return;
+    }
+
+    const parsed = accountInputSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid account payload.", parsed.error.issues);
+      return;
+    }
+
+    const [existing] = await db
+      .select({ id: employees.id, userId: employees.userId, fullName: employees.fullName })
+      .from(employees)
+      .where(eq(employees.id, id));
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
+      return;
+    }
+    if (existing.userId) {
+      sendError(res, 409, "ALREADY_LINKED", "This employee already has a login account.");
+      return;
+    }
+
+    const { email, password, role } = parsed.data;
+
+    try {
+      let createdUser!: typeof users.$inferSelect;
+      let linkedEmployee!: typeof employees.$inferSelect;
+
+      await db.transaction(async (tx) => {
+        const passwordHash = await hashPassword(password);
+        const [user] = await tx.insert(users).values({ name: existing.fullName, email, passwordHash, role }).returning();
+        createdUser = user!;
+
+        const updated = await tx
+          .update(employees)
+          .set({ userId: user!.id, updatedAt: new Date() })
+          .where(and(eq(employees.id, id), isNull(employees.userId)))
+          .returning();
+        if (updated.length === 0) {
+          throw new EmployeeAccountRaceLostError();
+        }
+        linkedEmployee = updated[0]!;
+      });
+
+      res.status(201).json({
+        ...serializeEmployee(linkedEmployee),
+        user: { id: createdUser.id, email: createdUser.email, role: createdUser.role },
+      });
+    } catch (err) {
+      if (err instanceof EmployeeAccountRaceLostError) {
+        sendError(res, 409, "ALREADY_LINKED", "This employee already has a login account.");
+        return;
+      }
+      if (isUniqueViolation(err)) {
+        // Recovery re-query MUST run outside the aborted transaction.
+        const [existingUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
+        if (existingUser) {
+          sendError(res, 409, "EMAIL_TAKEN", `Email ${email} is already registered.`);
+          return;
+        }
+      }
+      throw err;
+    }
+  });
 
   // ── PATCH /employees/:id ──────────────────────────────────────────────────
   // Partial update; same OWNER/OUTLET_MANAGER gating as create (see

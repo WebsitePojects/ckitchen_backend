@@ -5,6 +5,7 @@ import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
 import { orders } from "../src/db/schema.js";
+import { randomUUID } from "node:crypto";
 
 let app: Express;
 let db: DB;
@@ -496,5 +497,222 @@ describe("Stations & printers", () => {
     expect(patchRes.status).toBe(200);
     expect(patchRes.body.connection).toBe("NETWORK");
     expect(patchRes.body.address).toBe("192.168.1.99:9100");
+  });
+
+  describe("GET /api/v1/stations?location_id= (outlet-scoping leak fix)", () => {
+    let outletBId: string;
+
+    beforeAll(async () => {
+      const outletRes = await request(app)
+        .post("/api/v1/outlets")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ code: `STA-${Date.now()}`, name: "Stations Second Outlet" });
+      expect(outletRes.status).toBe(201);
+      outletBId = outletRes.body.id as string;
+
+      const createRes = await request(app)
+        .post("/api/v1/stations")
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ name: "Outlet B Only Station", location_id: outletBId });
+      expect(createRes.status).toBe(201);
+    });
+
+    it("omitting location_id keeps the unfiltered platform-wide list (unchanged default)", async () => {
+      const unfiltered = await request(app).get("/api/v1/stations").set("Authorization", `Bearer ${adminToken}`);
+      expect(unfiltered.status).toBe(200);
+      expect(unfiltered.body.some((s: { name: string }) => s.name === "Grill")).toBe(true);
+      expect(unfiltered.body.some((s: { name: string }) => s.name === "Outlet B Only Station")).toBe(true);
+    });
+
+    it("filters stations to the given outlet only", async () => {
+      const filtered = await request(app)
+        .get(`/api/v1/stations?location_id=${outletBId}`)
+        .set("Authorization", `Bearer ${adminToken}`);
+      expect(filtered.status).toBe(200);
+      const names = filtered.body.map((s: { name: string }) => s.name);
+      expect(names).toContain("Outlet B Only Station");
+      expect(names).not.toContain("Grill"); // Grill lives at the seeded CK1 outlet
+    });
+
+    it("a malformed location_id → 400 VALIDATION_ERROR", async () => {
+      const res = await request(app)
+        .get("/api/v1/stations?location_id=not-a-uuid")
+        .set("Authorization", `Bearer ${adminToken}`);
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe("VALIDATION_ERROR");
+    });
+  });
+});
+
+describe("GET /api/v1/brands?location_id= (outlet-scoping leak fix)", () => {
+  let outletBId: string;
+  let homeBrandId: string; // home = outlet B
+  let deployedBrandId: string; // home = CK1 (default), deployed to outlet B
+  let unrelatedBrandId: string; // home = CK1, never touches outlet B
+
+  beforeAll(async () => {
+    const outletRes = await request(app)
+      .post("/api/v1/outlets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: `BRD-${Date.now()}`, name: "Brands Filter Second Outlet" });
+    expect(outletRes.status).toBe(201);
+    outletBId = outletRes.body.id as string;
+
+    const home = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: `Home At B ${Date.now()}`, color: "#101010", location_id: outletBId });
+    expect(home.status).toBe(201);
+    homeBrandId = home.body.id as string;
+
+    const deployed = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: `Deployed To B ${Date.now()}`, color: "#202020" });
+    expect(deployed.status).toBe(201);
+    deployedBrandId = deployed.body.id as string;
+    const deploy = await request(app)
+      .post(`/api/v1/brands/${deployedBrandId}/outlets`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ location_id: outletBId });
+    expect(deploy.status).toBe(201);
+
+    const unrelated = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: `Unrelated To B ${Date.now()}`, color: "#303030" });
+    expect(unrelated.status).toBe(201);
+    unrelatedBrandId = unrelated.body.id as string;
+  });
+
+  it("omitting location_id keeps the unfiltered platform-wide list (unchanged default — Merchant Management needs it)", async () => {
+    const res = await request(app).get("/api/v1/brands").set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.map((b: { id: string }) => b.id);
+    expect(ids).toContain(homeBrandId);
+    expect(ids).toContain(deployedBrandId);
+    expect(ids).toContain(unrelatedBrandId);
+  });
+
+  it("filters to brands whose HOME is that outlet OR that have an active deployment there", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands?location_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.map((b: { id: string }) => b.id);
+    expect(ids).toContain(homeBrandId);
+    expect(ids).toContain(deployedBrandId);
+    expect(ids).not.toContain(unrelatedBrandId);
+  });
+
+  it("deactivating the deployment removes the brand from the outlet's filtered list", async () => {
+    const del = await request(app)
+      .delete(`/api/v1/brands/${deployedBrandId}/outlets/${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(del.status).toBe(200);
+
+    const res = await request(app)
+      .get(`/api/v1/brands?location_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.map((b: { id: string }) => b.id);
+    expect(ids).toContain(homeBrandId); // home brand still shows regardless
+    expect(ids).not.toContain(deployedBrandId); // deactivated deployment excluded
+  });
+
+  it("combines with ?is_active= filtering", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands?location_id=${outletBId}&is_active=true`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.every((b: { isActive: boolean }) => b.isActive === true)).toBe(true);
+  });
+
+  it("a malformed location_id → 400 VALIDATION_ERROR", async () => {
+    const res = await request(app)
+      .get("/api/v1/brands?location_id=not-a-uuid")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("an unknown-but-valid-shape location_id returns an empty (or home-only) list, never an error", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands?location_id=${randomUUID()}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+  });
+});
+
+describe("GET /api/v1/brands/{id}/accounts?location_id= (outlet-scoping leak fix)", () => {
+  let brandId: string;
+  let outletBId: string;
+  let ckAccountId: string;
+  let outletBAccountId: string;
+
+  beforeAll(async () => {
+    const brandRes = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: `Accounts Filter Brand ${Date.now()}`, color: "#444444" });
+    expect(brandRes.status).toBe(201);
+    brandId = brandRes.body.id as string;
+    const ckLocationId = brandRes.body.locationId as string;
+
+    const outletRes = await request(app)
+      .post("/api/v1/outlets")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ code: `ACC-${Date.now()}`, name: "Accounts Filter Second Outlet" });
+    expect(outletRes.status).toBe(201);
+    outletBId = outletRes.body.id as string;
+
+    const deploy = await request(app)
+      .post(`/api/v1/brands/${brandId}/outlets`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ location_id: outletBId });
+    expect(deploy.status).toBe(201);
+
+    const ckAcc = await request(app)
+      .post(`/api/v1/brands/${brandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "FOODPANDA", external_merchant_id: "FP-CK", credential_ref: "ref-ck", location_id: ckLocationId });
+    expect(ckAcc.status).toBe(201);
+    ckAccountId = ckAcc.body.id as string;
+
+    const bAcc = await request(app)
+      .post(`/api/v1/brands/${brandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ aggregator: "GRABFOOD", external_merchant_id: "GF-B", credential_ref: "ref-b", location_id: outletBId });
+    expect(bAcc.status).toBe(201);
+    outletBAccountId = bAcc.body.id as string;
+  });
+
+  it("omitting location_id returns every listing for the brand (unchanged default)", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/accounts`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.map((a: { id: string }) => a.id);
+    expect(ids).toContain(ckAccountId);
+    expect(ids).toContain(outletBAccountId);
+  });
+
+  it("filters to only listings pinned to that outlet", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/accounts?location_id=${outletBId}`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    const ids = res.body.map((a: { id: string }) => a.id);
+    expect(ids).toContain(outletBAccountId);
+    expect(ids).not.toContain(ckAccountId);
+  });
+
+  it("a malformed location_id → 400 VALIDATION_ERROR", async () => {
+    const res = await request(app)
+      .get(`/api/v1/brands/${brandId}/accounts?location_id=not-a-uuid`)
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe("VALIDATION_ERROR");
   });
 });

@@ -10,6 +10,7 @@
  * from spec §1's endpoint table — nothing in service.ts or worker.ts changes.
  */
 import { DeliverectOutboundAdapter } from "./deliverect-adapter.js";
+import { FoodpandaOutboundAdapter } from "./foodpanda-adapter.js";
 import type { AggregatorOutboundAdapter, OutboundCommandRequest, OutboundSendResult } from "./types.js";
 
 export interface DummyOutboundAdapterOptions {
@@ -60,6 +61,7 @@ export class DummyOutboundAdapter implements AggregatorOutboundAdapter {
 const OUTBOUND_ADAPTERS: Record<string, () => AggregatorOutboundAdapter> = {
   DUMMY: () => new DummyOutboundAdapter(),
   DELIVERECT: () => new DeliverectOutboundAdapter(),
+  FOODPANDA: () => new FoodpandaOutboundAdapter(),
 };
 
 /** Resolves the outbound adapter instance for a provider name; null when unregistered. */

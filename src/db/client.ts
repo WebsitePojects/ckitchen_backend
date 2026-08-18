@@ -17,6 +17,7 @@ import * as transferOrdersSchema from "./transfer-orders-schema.js";
 import * as w4Schema from "./w4-schema.js";
 import * as middlewareSchema from "./middleware-schema.js";
 import * as outboundSchema from "./outbound-schema.js";
+import * as foodpandaPluginSchema from "./foodpanda-plugin-schema.js";
 
 // Drizzle receives all bounded schema modules. The legacy module remains the
 // compatibility surface; enterprise-schema owns D35-D46 core stock tables;
@@ -40,6 +41,7 @@ const schema = {
   ...w4Schema,
   ...middlewareSchema,
   ...outboundSchema,
+  ...foodpandaPluginSchema,
 };
 
 // PGlite contrib extension required by migration 0032's `channel_commercial_term`

@@ -459,9 +459,12 @@ describe("transfer order lifecycle: FEFO and stock effects", () => {
     await setTransfersEnabled(true);
     const fx = await hqToOutletFixture("0.000000");
     // fx.lotId has no balance seeded; create three lots with different expiries.
-    const soon = await makeLot(fx.itemId, { expiresAt: "2026-08-01" });
-    const later = await makeLot(fx.itemId, { expiresAt: "2026-12-01" });
-    const expired = await makeLot(fx.itemId, { expiresAt: "2020-01-01" });
+    // Relative to today so the FEFO eligibility filter (expires_at >= today)
+    // keeps behaving the same as the calendar moves.
+    const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
+    const soon = await makeLot(fx.itemId, { expiresAt: day(30) });
+    const later = await makeLot(fx.itemId, { expiresAt: day(180) });
+    const expired = await makeLot(fx.itemId, { expiresAt: day(-100) });
     await setBalance(fx.sourceWarehouseId, soon.id, "10.000000");
     await setBalance(fx.sourceWarehouseId, later.id, "10.000000");
     await setBalance(fx.sourceWarehouseId, expired.id, "10.000000");
@@ -482,8 +485,10 @@ describe("transfer order lifecycle: FEFO and stock effects", () => {
   it("uses a caller-pinned lot as-is at dispatch, skipping FEFO", async () => {
     await setTransfersEnabled(true);
     const fx = await hqToOutletFixture("0.000000");
-    const pinned = await makeLot(fx.itemId, { expiresAt: "2026-12-01" });
-    const earlier = await makeLot(fx.itemId, { expiresAt: "2026-01-01" });
+    // Both eligible (unexpired) so this test isolates pinning from the expiry filter.
+    const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
+    const pinned = await makeLot(fx.itemId, { expiresAt: day(180) });
+    const earlier = await makeLot(fx.itemId, { expiresAt: day(30) });
     await setBalance(fx.sourceWarehouseId, pinned.id, "10.000000");
     await setBalance(fx.sourceWarehouseId, earlier.id, "10.000000");
 

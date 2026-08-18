@@ -32,6 +32,8 @@ import { createTransfersRouter } from "./modules/transfers/routes.js";
 import { createQaReleasesRouter } from "./modules/qa-releases/routes.js";
 import { createMiddlewareRouter } from "./modules/middleware/routes.js";
 import { createOutboundRouter } from "./modules/outbound/routes.js";
+import { getFoodpandaPluginBasePath } from "./modules/foodpanda/config.js";
+import { createFoodpandaPluginRouter } from "./modules/foodpanda/routes.js";
 import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 
 /**
@@ -92,6 +94,11 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   // Middleware webhook needs the EXACT raw bytes for signature verification (spec §11) —
   // scope a raw parser to that one path BEFORE the json parser consumes the stream.
   app.use("/api/v1/middleware/webhook", express.raw({ type: () => true, limit: "2mb" }));
+  // Foodpanda plugin bodies are orders (~4 KB in Delivery Hero's own reference example), never
+  // uploads. Scope a tighter json parser to that base path BEFORE the 12 MB global one below, so
+  // an oversized body is 413'd at the parser instead of being persisted verbatim into
+  // foodpanda_plugin_receipt.raw_payload. Same pattern as the webhook raw parser above.
+  app.use(getFoodpandaPluginBasePath(), express.json({ limit: "1mb" }));
   app.use(express.json({ limit: "12mb" })); // base64 attendance photos (≤8 MB) must reach the handler, not be 413'd by the parser
   app.set("db", db);
 
@@ -126,6 +133,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.use("/api/v1", createQaReleasesRouter(db, hub));
   app.use("/api/v1", createMiddlewareRouter(db));
   app.use("/api/v1", createOutboundRouter(db));
+  app.use(getFoodpandaPluginBasePath(), createFoodpandaPluginRouter(db));
 
   // Safety net — unmatched routes → 404; anything thrown/rejected in a handler
   // is normalized here so internals (stack/SQL) never leak to the client.

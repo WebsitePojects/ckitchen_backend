@@ -11,6 +11,8 @@ export default defineConfig({
     "./src/db/transfer-orders-schema.ts",
     "./src/db/w4-schema.ts",
     "./src/db/outbound-schema.ts",
+    "./src/db/middleware-schema.ts",
+    "./src/db/foodpanda-plugin-schema.ts",
   ],
   out: "./drizzle",
 });

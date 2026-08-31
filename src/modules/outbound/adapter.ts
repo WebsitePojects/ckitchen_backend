@@ -11,6 +11,7 @@
  */
 import { DeliverectOutboundAdapter } from "./deliverect-adapter.js";
 import { FoodpandaOutboundAdapter } from "./foodpanda-adapter.js";
+import { GrabOutboundAdapter } from "./grab-adapter.js";
 import type { AggregatorOutboundAdapter, OutboundCommandRequest, OutboundSendResult } from "./types.js";
 
 export interface DummyOutboundAdapterOptions {
@@ -62,6 +63,7 @@ const OUTBOUND_ADAPTERS: Record<string, () => AggregatorOutboundAdapter> = {
   DUMMY: () => new DummyOutboundAdapter(),
   DELIVERECT: () => new DeliverectOutboundAdapter(),
   FOODPANDA: () => new FoodpandaOutboundAdapter(),
+  GRABFOOD: () => new GrabOutboundAdapter(),
 };
 
 /** Resolves the outbound adapter instance for a provider name; null when unregistered. */

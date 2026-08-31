@@ -13,6 +13,7 @@ export default defineConfig({
     "./src/db/outbound-schema.ts",
     "./src/db/middleware-schema.ts",
     "./src/db/foodpanda-plugin-schema.ts",
+    "./src/db/grab-schema.ts",
   ],
   out: "./drizzle",
 });

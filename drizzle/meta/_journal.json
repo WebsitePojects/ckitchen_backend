@@ -274,6 +274,13 @@
       "when": 1785500100000,
       "tag": "0038_grab_partner_inbound",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1785500200000,
+      "tag": "0039_security_hardening",
+      "breakpoints": true
     }
   ]
 }

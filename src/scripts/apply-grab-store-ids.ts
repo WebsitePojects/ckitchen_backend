@@ -44,14 +44,16 @@ const CK1_CODE = "CK1";
 
 /** The base seed stores this placeholder; only a placeholder may be replaced with the real address. */
 const CK1_PLACEHOLDER_ADDRESS = "Prototype HQ";
-const CK1_REAL_ADDRESS = "34 Matapang St";
+// Addresses are copied verbatim from the client's GrabMerchant app screenshots
+// (Sir BJ, 2026-08-31; Documents/GRAB_STORE_ROSTER_VERIFIED.md in the parent repo).
+const CK1_REAL_ADDRESS = "34 Matapang Street, Barangay Pinyahan, Quezon City";
 
-// PLACEHOLDER — confirm with client before --apply
 // Bowlfully Greens is a separate physical site (D48 #4: Grab lists it at Matalino St,
-// not 34 Matapang St), so it needs its own outlet and its own warehouses (cardinal rule 2).
+// not 34 Matapang Street), so it needs its own outlet and its own warehouses (cardinal
+// rule 2). The client gave no site name or code; MTL_CODE / MTL_NAME are ORION-internal.
 const MTL_CODE = "MTL";
 const MTL_NAME = "Matalino Street";
-const MTL_ADDRESS = "Matalino St cnr Malakas St, Central District, Quezon City";
+const MTL_ADDRESS = "Matalino Street Corner Malakas Street, Central District 4, Quezon City";
 
 /**
  * `store -> brand -> home outlet` as agreed in the client's ORION_STORE_ID_MATRIX

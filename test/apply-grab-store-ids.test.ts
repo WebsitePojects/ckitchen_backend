@@ -123,7 +123,7 @@ describe("applyGrabStoreIds", () => {
     ]);
 
     const [ck1] = await db.select().from(locations).where(eq(locations.id, ck1Id));
-    expect(ck1?.address).toBe("34 Matapang St");
+    expect(ck1?.address).toBe("34 Matapang Street, Barangay Pinyahan, Quezon City");
   });
 
   it("does not overwrite a real CK1 address", async () => {

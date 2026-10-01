@@ -259,6 +259,10 @@ export const aggregatorAccounts = pgTable(
     index("aggregator_account_brand_id_idx").on(table.brandId),
     index("aggregator_account_location_id_idx").on(table.locationId),
     index("aggregator_account_mapping_status_idx").on(table.mappingStatus),
+    // Inbound routing needs exactly one active listing per (aggregator, id) — migration 0040.
+    uniqueIndex("aggregator_account_active_external_id_unique")
+      .on(table.aggregator, table.externalMerchantId)
+      .where(sql`${table.isActive} = true`),
   ],
 ).enableRLS();
 

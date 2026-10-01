@@ -1,0 +1,17 @@
+-- ============================================================================
+-- Migration 0040 -- at most ONE active channel listing per (aggregator, external id).
+--
+-- WHY: inbound order routing (resolveGrabListing, the foodpanda resolver) maps an
+-- aggregator-supplied merchant id to a listing and rejects the order unless it
+-- finds EXACTLY ONE active match. Nothing in the schema enforced that, so a
+-- duplicate active row would silently turn every order for that store into a 404.
+-- This makes the invariant a database guarantee instead of a convention.
+--
+-- Partial on is_active = true: deactivated rows are history (never deleted -- orders
+-- FK to them) and must not block re-using an id on a new listing. The same id under
+-- a different aggregator is allowed because `aggregator` is part of the key.
+--
+-- Additive / reversible (DROP INDEX). Live data was checked beforehand: zero
+-- duplicates among the active rows, so the build cannot fail on existing data.
+-- ============================================================================
+CREATE UNIQUE INDEX IF NOT EXISTS "aggregator_account_active_external_id_unique" ON "aggregator_account" USING btree ("aggregator","external_merchant_id") WHERE "aggregator_account"."is_active" = true;

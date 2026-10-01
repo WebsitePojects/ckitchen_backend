@@ -223,30 +223,41 @@ describe("middleware event processing", () => {
     expect((await db.select({ id: orders.id }).from(orders)).length).toBe(beforeOrders);
   });
 
-  it("parks MAPPING_REQUIRED when more than one RESOLVED listing matches the same (aggregator, merchant_ref)", async () => {
+  it("makes a second active listing for the same (aggregator, merchant_ref) impossible, so the event resolves to the single listing", async () => {
     await setProcessingEnabled(true);
-    const s = suffix();
-    const [location1] = await db.insert(locations).values({ code: `MWP-AMB1-${s}`, name: `MW Amb1 ${s}` }).returning();
-    const [location2] = await db.insert(locations).values({ code: `MWP-AMB2-${s}`, name: `MW Amb2 ${s}` }).returning();
-    const [brand] = await db.insert(brands).values({ locationId: location1!.id, name: `MW Amb Brand ${s}`, color: "#445566", salesPerfId: `mw-amb-${s}` }).returning();
-    const sharedMerchantRef = `FP-AMBIGUOUS-${s}`;
-    await db.insert(aggregatorAccounts).values([
-      { brandId: brand!.id, locationId: location1!.id, mappingStatus: "RESOLVED", aggregator: "FOODPANDA", externalMerchantId: sharedMerchantRef },
-      { brandId: brand!.id, locationId: location2!.id, mappingStatus: "RESOLVED", aggregator: "FOODPANDA", externalMerchantId: sharedMerchantRef },
-    ]);
+    const fixture = await orderFixture();
+    const [otherLocation] = await db.insert(locations).values({ code: `MWP-AMB2-${suffix()}`, name: "MW Amb2" }).returning();
 
-    const eventId = randomUUID();
-    const normalized: NormalizedProviderEvent = {
-      providerEventId: eventId,
-      occurredAt: new Date().toISOString(),
-      kind: "ORDER_CREATED",
+    // Since migration 0040 the DB refuses a 2nd active (aggregator, external_merchant_id) row. The
+    // processor's `resolved.length !== 1` guard is kept as defense-in-depth but is unreachable via
+    // external_merchant_id.
+    const duplicateInsert = db.insert(aggregatorAccounts).values({
+      brandId: fixture.brandId,
+      locationId: otherLocation!.id,
+      mappingStatus: "RESOLVED",
       aggregator: "FOODPANDA",
-      merchantRef: sharedMerchantRef,
-      orderPayload: { external_ref: `EXT-${randomUUID()}`, items: [{ menu_item_id: randomUUID(), qty: 1 }] },
-    };
-    const { event } = await intakeEvent(db, { provider: "DUMMY", normalized, rawHash: "cafebabe".repeat(8), keyId: TEST_KEY_ID });
-    const processed = await processEvent(db, event.id);
-    expect(processed.state).toBe("MAPPING_REQUIRED");
+      externalMerchantId: fixture.merchantRef,
+    });
+    const rejection = await duplicateInsert.then(
+      () => null,
+      (e: unknown) => e as { message?: string; cause?: { code?: string; constraint?: string } },
+    );
+    expect(rejection, "duplicate active listing must be rejected").not.toBeNull();
+    expect(rejection!.cause?.code).toBe("23505");
+    expect(rejection!.cause?.constraint).toBe("aggregator_account_active_external_id_unique");
+
+    const { status, body } = await postWebhook({
+      event_id: randomUUID(),
+      event_type: "ORDER_CREATED",
+      merchant_id: fixture.merchantRef,
+      external_ref: `EXT-${randomUUID()}`,
+      items: [{ menu_item_id: fixture.menuItemId, qty: 1 }],
+    });
+    expect(status).toBe(202);
+    const processed = await processEvent(db, body.event.id, { force: true });
+    expect(processed.state).toBe("PROCESSED");
+    const [order] = await db.select().from(orders).where(eq(orders.id, processed.orderId!));
+    expect(order!.aggregatorAccountId).toBe(fixture.aggregatorAccountId);
   });
 
   it("processes a valid DUMMY event end-to-end into an order snapshotted to the listing's outlet", async () => {

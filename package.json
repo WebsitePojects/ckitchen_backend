@@ -13,6 +13,7 @@
     "seed:pilot": "tsx src/db/seed-pilot.ts",
     "seed:merchants": "tsx src/db/seed-merchants.ts",
     "seed:real-brands": "tsx src/scripts/seed-real-brands.ts",
+    "grab:store-ids": "tsx src/scripts/apply-grab-store-ids.ts",
     "agent:mock": "tsx agent-mock/index.ts",
     "db:generate": "drizzle-kit generate"
   },

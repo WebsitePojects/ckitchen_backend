@@ -281,6 +281,13 @@
       "when": 1785500200000,
       "tag": "0039_security_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1785500300000,
+      "tag": "0040_aggregator_account_active_external_id_unique",
+      "breakpoints": true
     }
   ]
 }

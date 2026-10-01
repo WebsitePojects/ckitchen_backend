@@ -3,7 +3,7 @@
  * the abortable loop, log hygiene, and per-aggregator command routing.
  */
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { closeDb, createDb, type DB } from "../src/db/client.js";
 import { runMigrations } from "../src/db/migrate.js";
@@ -59,6 +59,24 @@ const idleWorker = (name: string, onRun?: () => void): NamedWorker => ({
     onRun?.();
     return { claimed: 0 };
   },
+});
+
+describe("module import", () => {
+  it("has no side effects: no startup line, no signal handlers, no loop (PM2 runs it via workers-main, not argv detection)", async () => {
+    vi.resetModules();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const sigintBefore = process.listenerCount("SIGINT");
+    const sigtermBefore = process.listenerCount("SIGTERM");
+    try {
+      const fresh = await import("../src/scripts/run-workers.js");
+      expect(typeof fresh.main).toBe("function");
+      expect(logSpy).not.toHaveBeenCalled();
+      expect(process.listenerCount("SIGINT")).toBe(sigintBefore);
+      expect(process.listenerCount("SIGTERM")).toBe(sigtermBefore);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
 
 describe("runWorkerTick", () => {

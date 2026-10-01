@@ -8,7 +8,7 @@
     "build": "tsc",
     "start": "tsx src/server.ts",
     "start:prod": "node dist/server.js",
-    "workers": "node dist/scripts/run-workers.js",
+    "workers": "node dist/scripts/workers-main.js",
     "test": "vitest run",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",

@@ -1,5 +1,5 @@
 /**
- * Background worker runner — `npm run workers` (compiled: `node dist/scripts/run-workers.js`).
+ * Background worker runner library — started by `npm run workers` (compiled: `node dist/scripts/workers-main.js`).
  *
  * Inbound GrabFood/foodpanda orders are persisted and acknowledged by the API, but the
  * follow-up work (ingest the order, notify the aggregator, send queued outbound commands)
@@ -14,8 +14,6 @@
  * Logging rule: worker name, counts and error MESSAGES only. Never payloads, order
  * contents, customer data, tokens or credentials (raw_payload holds PII; adapters hold secrets).
  */
-import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { eq } from "drizzle-orm";
 import type { DB } from "../db/client.js";
@@ -242,9 +240,12 @@ export async function runWorkerLoop(opts: WorkerLoopOptions): Promise<void> {
   }
 }
 
-// `npm run workers` / `node dist/scripts/run-workers.js`. Only runs as the entrypoint so tests can import this module.
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
-if (isMain) {
+/**
+ * CLI routine: connects, starts the loop, and resolves after a graceful shutdown. Invoked by
+ * `workers-main.ts`; kept out of this module's top level so importing the library (tests) has
+ * no side effects. config/db are imported lazily because config.ts loads `.env` on import.
+ */
+export async function main(): Promise<void> {
   const { createDb, closeDb } = await import("../db/client.js");
   const { loadConfig, isPostgresUrl } = await import("../config.js");
   const config = loadConfig();
@@ -277,5 +278,4 @@ if (isMain) {
 
   await closeDb(client); // GOTCHA: a postgres-js pool / file-backed PGlite keeps the event loop alive — close or the process hangs.
   consoleLogger.info("stopped");
-  process.exit(0);
 }

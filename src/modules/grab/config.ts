@@ -1,3 +1,5 @@
+import { MAX_CREDENTIAL_LEN } from "./validation.js";
+
 const DEFAULT_BASE_PATH = "/api/v1/grab";
 // Grab's own GetPartnerAccessToken sample response uses expires_in = 604799 (~7 days).
 const DEFAULT_TOKEN_TTL_SECONDS = 604_799;
@@ -45,14 +47,37 @@ export function getGrabPartnerTokenTtlSeconds(): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_TOKEN_TTL_SECONDS;
 }
 
+const CREDENTIAL_ENV_VARS = ["GRAB_PARTNER_CLIENT_ID", "GRAB_PARTNER_CLIENT_SECRET"] as const;
+
+/**
+ * Detects a Grab credential that can never authenticate: the token request
+ * body schema (validation.ts) caps client_id/client_secret at
+ * MAX_CREDENTIAL_LEN, so a longer env value could never be echoed back by
+ * Grab and every login would fail with a misleading 400 VALIDATION_ERROR
+ * (production incident 2026-10-01: a 64-char secret). Returns a message that
+ * names the variable and the limit — never the value, which is a secret.
+ */
+export function getGrabPartnerConfigProblem(): string | null {
+  const tooLong = CREDENTIAL_ENV_VARS.filter((name) => (trimmedEnv(name)?.length ?? 0) > MAX_CREDENTIAL_LEN);
+  if (tooLong.length === 0) return null;
+  return `${tooLong.join(" and ")} exceed${tooLong.length === 1 ? "s" : ""} the ${MAX_CREDENTIAL_LEN}-character limit of Grab's GetPartnerAccessToken; Grab integration is DISABLED until fixed.`;
+}
+
 /**
  * Fail-closed module gate (rule 3/14): every inbound GrabFood Partner API
  * route, INCLUDING token issuance itself, is inert (503 FEATURE_DISABLED)
  * unless all three secrets are configured. There is no partial-configuration
- * state — an operator sets up the whole module or none of it.
+ * state — an operator sets up the whole module or none of it. A credential
+ * that can never pass token validation counts as NOT configured, so the
+ * operator sees an honest 503 instead of a misleading 400.
  */
 export function isGrabPartnerConfigured(): boolean {
-  return getGrabPartnerClientId() !== null && getGrabPartnerClientSecret() !== null && getGrabPartnerTokenSecret() !== null;
+  return (
+    getGrabPartnerClientId() !== null &&
+    getGrabPartnerClientSecret() !== null &&
+    getGrabPartnerTokenSecret() !== null &&
+    getGrabPartnerConfigProblem() === null
+  );
 }
 
 export interface GrabPartnerRateLimitConfig {

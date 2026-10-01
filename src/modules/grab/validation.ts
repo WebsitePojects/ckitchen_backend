@@ -13,7 +13,7 @@ import { z } from "zod";
 const MAX_SHORT_ID_LEN = 128;
 const MAX_TEXT_LEN = 500;
 // GetPartnerAccessToken: "client_id (<=32 chars, required), client_secret (<=32 chars, required)".
-const MAX_CREDENTIAL_LEN = 32;
+export const MAX_CREDENTIAL_LEN = 32;
 
 export const boundedId = z.string().trim().min(1).max(MAX_SHORT_ID_LEN);
 export const isoDateString = z.string().refine((value) => !Number.isNaN(Date.parse(value)), "Must be a valid RFC3339 date-time string.");

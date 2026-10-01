@@ -2,7 +2,7 @@ import { Router, type Response } from "express";
 import type { ZodError } from "zod";
 import type { DB } from "../../db/client.js";
 import { sendError } from "../http-errors.js";
-import { createGrabPartnerOauthRateLimiter, GrabPartnerAuthError, issueGrabPartnerToken, requireGrabPartnerBearer } from "./auth.js";
+import { assertGrabPartnerConfigured, createGrabPartnerOauthRateLimiter, GrabPartnerAuthError, issueGrabPartnerToken, requireGrabPartnerBearer } from "./auth.js";
 import {
   GrabPartnerServiceError,
   getMerchantMenu,
@@ -58,6 +58,10 @@ export function createGrabPartnerRouter(db: DB): Router {
 
   router.post("/oauth/token", createGrabPartnerOauthRateLimiter(), (req, res) => {
     try {
+      // Gate BEFORE body validation (the rate limiter above still runs first): an
+      // unconfigured/misconfigured integration must answer 503 whatever the caller
+      // sends, never a 400 that blames the caller for our env-var mistake.
+      assertGrabPartnerConfigured();
       const body = grabOauthTokenBodySchema.parse(req.body);
       const token = issueGrabPartnerToken(body);
       res.status(200).json(token);

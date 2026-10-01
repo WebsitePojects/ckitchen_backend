@@ -22,8 +22,14 @@ import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
 import { createDb } from "./db/client.js";
 import { runMigrations } from "./db/migrate.js";
 import { createSocketHub } from "./realtime/hub.js";
+import { getGrabPartnerConfigProblem } from "./modules/grab/config.js";
 
 const config = loadConfig();
+
+// A Grab misconfig disables only the Grab routes (503), so warn loudly but keep the dashboard API up.
+const grabConfigProblem = getGrabPartnerConfigProblem();
+if (grabConfigProblem) console.error(`[grab] CONFIG ERROR: ${grabConfigProblem}`);
+
 const { db } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUrl });
 
 // DB target banner — make it impossible to miss WHICH database this process talks to.

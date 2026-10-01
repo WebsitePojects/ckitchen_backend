@@ -32,6 +32,17 @@ export class GrabPartnerAuthError extends Error {
   }
 }
 
+/**
+ * Single source of the fail-closed 503, shared by the route (which must answer
+ * it BEFORE body validation) and issueGrabPartnerToken (defense in depth for
+ * any other caller).
+ */
+export function assertGrabPartnerConfigured(): void {
+  if (!isGrabPartnerConfigured()) {
+    throw new GrabPartnerAuthError(503, "FEATURE_DISABLED", "GrabFood Partner API inbound is not configured.");
+  }
+}
+
 const REQUIRED_GRANT_TYPE = "client_credentials";
 const REQUIRED_SCOPE = "food.partner_api";
 
@@ -67,9 +78,7 @@ export interface GrabPartnerTokenResponse {
  * neither client_secret nor the signed token is ever logged.
  */
 export function issueGrabPartnerToken(body: GrabOauthTokenBody): GrabPartnerTokenResponse {
-  if (!isGrabPartnerConfigured()) {
-    throw new GrabPartnerAuthError(503, "FEATURE_DISABLED", "GrabFood Partner API inbound is not configured.");
-  }
+  assertGrabPartnerConfigured();
 
   const configuredClientId = getGrabPartnerClientId()!;
   const configuredClientSecret = getGrabPartnerClientSecret()!;

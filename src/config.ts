@@ -18,6 +18,8 @@ export interface LoginRateLimitConfig {
 
 export interface Config {
   port: number;
+  /** Optional bind address from `HOST` (e.g. 127.0.0.1 behind nginx); undefined => listen on all interfaces. */
+  host: string | undefined;
   jwtSecret: string;
   agentToken: string;
   dbPath: string | undefined;
@@ -49,6 +51,7 @@ function requireSecret(envVar: string, testDefault: string): string {
 /** Loads runtime config from environment variables with sane local defaults. */
 export function loadConfig(): Config {
   const port = Number(process.env.PORT ?? 4000);
+  const host = process.env.HOST?.trim() || undefined;
   const jwtSecret = requireSecret("JWT_SECRET", "test-jwt-secret");
   const agentToken = requireSecret("AGENT_TOKEN", "test-agent-token");
   const url = process.env.DATABASE_URL;
@@ -79,5 +82,5 @@ export function loadConfig(): Config {
     max: Number(process.env.LOGIN_RATE_LIMIT_MAX ?? (isTest ? 100_000 : 10)),
   };
 
-  return { port, jwtSecret, agentToken, dbPath, databaseUrl: url, corsOrigins, loginRateLimit };
+  return { port, host, jwtSecret, agentToken, dbPath, databaseUrl: url, corsOrigins, loginRateLimit };
 }

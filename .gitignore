@@ -24,3 +24,6 @@ prisma/*.db
 
 # Discount evidence (private, gitignored - src/modules/discounts/evidence.ts LocalFsProvider)
 .evidence/
+
+# local knowledge-graph output (graphify)
+graphify-out/

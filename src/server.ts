@@ -68,8 +68,11 @@ const app = createApp(db, hub);
 httpServer.on("request", app);
 
 // 6. Listen — one port for both REST and WebSocket
-httpServer.listen(config.port, () => {
+const onListening = () => {
   console.log(`CloudKitchen backend listening on http://localhost:${config.port}`);
   console.log("  REST  → http://localhost:" + config.port + "/api/v1");
   console.log("  WS    → ws://localhost:" + config.port + " (Socket.IO)");
-});
+};
+// HOST (e.g. 127.0.0.1 behind nginx) pins the bind address; unset keeps the all-interfaces default.
+if (config.host) httpServer.listen(config.port, config.host, onListening);
+else httpServer.listen(config.port, onListening);

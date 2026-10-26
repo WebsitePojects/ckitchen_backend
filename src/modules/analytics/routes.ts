@@ -19,7 +19,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { requireAuth, requireRole } from "../auth/middleware.js";
-import { sendError } from "../http-errors.js";
+import { sendError, sendInternalError } from "../http-errors.js";
 import {
   getAggregatorsAnalytics,
   getBrandsAnalytics,
@@ -71,8 +71,7 @@ export function createAnalyticsRouter(db: DB): Router {
         const data = await getBrandsAnalytics(db, parsed.data.from, parsed.data.to);
         res.json(data);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "analytics");
       }
     },
   );
@@ -99,8 +98,7 @@ export function createAnalyticsRouter(db: DB): Router {
         const data = await getOrdersByHour(db, parsed.data.date);
         res.json(data);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "analytics");
       }
     },
   );
@@ -130,8 +128,7 @@ export function createAnalyticsRouter(db: DB): Router {
         const data = await getOrdersByHourByBrand(db, parsed.data.date);
         res.json(data);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "analytics");
       }
     },
   );
@@ -152,8 +149,7 @@ export function createAnalyticsRouter(db: DB): Router {
         const data = await getAggregatorsAnalytics(db, parsed.data.from, parsed.data.to);
         res.json(data);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "analytics");
       }
     },
   );
@@ -174,8 +170,7 @@ export function createAnalyticsRouter(db: DB): Router {
         const data = await getMarginsAnalytics(db, parsed.data.from, parsed.data.to);
         res.json(data);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "analytics");
       }
     },
   );
@@ -197,8 +192,7 @@ export function createAnalyticsRouter(db: DB): Router {
         const data = await getProductPerformance(db, parsed.data.from, parsed.data.to);
         res.json(data);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "analytics");
       }
     },
   );

@@ -15,7 +15,7 @@ import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { parseRangeBoundary } from "../date-range.js";
-import { sendError } from "../http-errors.js";
+import { sendError, sendInternalError } from "../http-errors.js";
 import { getSalesReport, type OutletFilter, type SalesGroupBy } from "./service.js";
 import { buildSalesReportPdf, buildSalesReportXlsx } from "./export.js";
 
@@ -127,8 +127,7 @@ export function createReportsRouter(db: DB): Router {
         });
         res.json(report);
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "reports");
       }
     },
   );
@@ -174,8 +173,7 @@ export function createReportsRouter(db: DB): Router {
           res.send(buffer);
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Internal server error.";
-        sendError(res, 500, "INTERNAL_ERROR", message);
+        sendInternalError(res, err, "reports");
       }
     },
   );

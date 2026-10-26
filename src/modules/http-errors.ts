@@ -16,6 +16,23 @@ export function paramAsString(value: string | string[] | undefined): string {
   return value ?? "";
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True for a canonical UUID. Route ids are uuid columns; anything else can never match a row. */
+export function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/**
+ * Answers an unexpected failure with a generic 500 and logs the real error server-side.
+ * Never echo `err.message` to the client: database driver errors carry the SQL text and
+ * parameters (seen in production-like testing: a malformed id returned the full query).
+ */
+export function sendInternalError(res: Response, err: unknown, context: string): void {
+  console.error(`[${context}]`, err);
+  sendError(res, 500, "INTERNAL_ERROR", "Internal server error.");
+}
+
 /** Sends the standard `{ error: { code, message, details? } }` shape (CK1-API-003 §1). */
 export function sendError(
   res: Response,

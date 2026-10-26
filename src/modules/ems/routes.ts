@@ -211,7 +211,7 @@ export function createEmsRouter(db: DB): Router {
     }
 
     const [emp] = await db
-      .select({ id: employees.id, locationId: employees.locationId })
+      .select({ id: employees.id, locationId: employees.locationId, userId: employees.userId })
       .from(employees)
       .where(eq(employees.id, employeeId));
     if (!emp) {
@@ -219,7 +219,11 @@ export function createEmsRouter(db: DB): Router {
       return null;
     }
 
-    if (req.outletContext?.scope !== "ALL" && !isOutletInScope(req.outletContext, emp.locationId)) {
+    // A person may always read their own record (e.g. a cook's own punches on the Attendance
+    // page). Without this, an employee with no outlet set (location_id null) was outside
+    // everyone's scope except OWNER, including their own.
+    const isSelf = emp.userId !== null && emp.userId === req.user!.id;
+    if (!isSelf && req.outletContext?.scope !== "ALL" && !isOutletInScope(req.outletContext, emp.locationId)) {
       sendError(res, 403, "FORBIDDEN", "Employee is outside your access scope.");
       return null;
     }
@@ -724,6 +728,9 @@ export function createEmsRouter(db: DB): Router {
         department: emp.department,
         photoUrl: emp.photoUrl,
       },
+      // The gate must honour the per-employee setting; without it the admin's
+      // "attendance required: off" switch had no effect on the clock-in gate.
+      attendance_required: emp.attendanceRequired,
       clocked_in: todays.some((r) => r.type === "TIME_IN"),
       clocked_out: todays.some((r) => r.type === "TIME_OUT"),
       last_type: todays.length ? todays[0]!.type : null,

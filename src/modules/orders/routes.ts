@@ -40,7 +40,7 @@ import type { DB } from "../../db/client.js";
 import { aggregatorEnum, brands, orderStatusEnum, orders } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
-import { paramAsString, sendError } from "../http-errors.js";
+import { isUuid, paramAsString, sendError, sendInternalError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
 import {
@@ -112,8 +112,7 @@ function handleServiceError(err: unknown, res: Response): void {
   } else if (err instanceof ServiceError) {
     sendError(res, err.code === "FORBIDDEN" ? 403 : 409, err.code, err.message);
   } else {
-    const message = err instanceof Error ? err.message : "Internal server error.";
-    sendError(res, 500, "INTERNAL_ERROR", message);
+    sendInternalError(res, err, "orders");
   }
 }
 
@@ -314,6 +313,11 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
   // with inventory's membership 403). Order-not-found still returns 404.
   router.get("/orders/:id", requireAuth, resolveOutletContext, async (req, res) => {
     const id = paramAsString(req.params.id);
+    // A non-uuid can never match a row; answer 404 here instead of letting the uuid column cast fail.
+    if (!isUuid(id)) {
+      sendError(res, 404, "NOT_FOUND", "Order not found.");
+      return;
+    }
 
     try {
       const orderLocationId = await getLocationIdForOrder(db, id);
@@ -349,6 +353,11 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     resolveOutletContext,
     async (req, res) => {
       const id = paramAsString(req.params.id);
+      // A non-uuid can never match a row; answer 404 here instead of letting the uuid column cast fail.
+      if (!isUuid(id)) {
+        sendError(res, 404, "NOT_FOUND", "Order not found.");
+        return;
+      }
 
       try {
         // H2: block cross-outlet advance BEFORE the service runs — advancing
@@ -416,6 +425,11 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
     resolveOutletContext,
     async (req, res) => {
       const id = paramAsString(req.params.id);
+      // A non-uuid can never match a row; answer 404 here instead of letting the uuid column cast fail.
+      if (!isUuid(id)) {
+        sendError(res, 404, "NOT_FOUND", "Order not found.");
+        return;
+      }
       const reason = typeof req.body?.reason === "string" ? req.body.reason : "";
 
       try {

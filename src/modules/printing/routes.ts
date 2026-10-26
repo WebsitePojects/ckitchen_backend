@@ -34,7 +34,7 @@ import type { DB } from "../../db/client.js";
 import { locations, kitchenStations, printJobs } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope, listScopeLocationIds } from "../auth/outlet-scope.js";
-import { paramAsString, sendError } from "../http-errors.js";
+import { paramAsString, sendError, sendInternalError } from "../http-errors.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { requireAgentToken, requireBootstrapToken } from "./agent-auth.js";
 import { ackJobV2, claimJobs, isSpoolingEnabled, processVirtualSpool, renewLease } from "./service-v2.js";
@@ -91,8 +91,7 @@ function handleServiceError(err: unknown, res: Response): void {
   } else if (err instanceof PrintValidationError) {
     sendError(res, 400, err.code, err.message);
   } else {
-    const message = err instanceof Error ? err.message : "Internal server error.";
-    sendError(res, 500, "INTERNAL_ERROR", message);
+    sendInternalError(res, err, "printing");
   }
 }
 

@@ -56,37 +56,33 @@ function clerk(settings: ClerkSettings): ClerkClient {
 
 /**
  * Verifies a Clerk session token and returns the Clerk user id, or null if the token is
- * not a valid Clerk session for one of our frontends. Never throws for a bad token.
+ * not a valid, ACTIVE Clerk session for one of our frontends. Never throws for a bad token.
  *
- * Note: @clerk/backend v2's verifyToken RETURNS `{ data } | { errors }` instead of throwing,
- * so the result must be checked explicitly (a try/catch alone would accept bad tokens).
+ * The `verifyToken` exported by @clerk/backend (2.x) returns the JWT payload and THROWS on
+ * any failure (it is wrapped in `withLegacyReturn`). It never returns `{ data, errors }`;
+ * treating it that way rejected every valid token in production (2026-10-27).
  */
 export async function verifyClerkSessionToken(token: string, settings: ClerkSettings): Promise<string | null> {
   if (clerkConfigProblem(settings)) return null;
   try {
-    const result = await verifyToken(token, {
+    const payload = await verifyToken(token, {
       secretKey: settings.secretKey,
       jwtKey: settings.jwtKey,
       authorizedParties: settings.authorizedParties,
     });
-    if (result.errors || !result.data) {
-      // Log why (reason code, else message) plus non-secret token facts, never the token, so a
-      // sign-in that keeps failing can be diagnosed from the server log.
-      const detail = ([] as unknown[])
-        .concat(result.errors ?? [])
-        .map((e) => {
-          const err = e as { reason?: string; message?: string };
-          return err.reason ?? err.message ?? String(e);
-        })
-        .join("; ");
-      console.warn(`[auth] Clerk session token rejected: ${detail || "no error detail"} | ${describeToken(token)}`);
+    // A pending session still has a Clerk step to finish (choose an organization, set up MFA).
+    // Fail closed, as Clerk's own middleware does by default.
+    if ((payload as { sts?: unknown }).sts === "pending") {
+      console.warn(`[auth] Clerk session token rejected: session pending | ${describeToken(token)}`);
       return null;
     }
-    // `sub` is the standard JWT subject (the Clerk user id); checked at runtime below.
-    const sub = (result.data as { sub?: unknown }).sub;
+    const sub = payload.sub;
     return typeof sub === "string" && sub.length > 0 ? sub : null;
   } catch (err) {
-    console.warn(`[auth] Clerk session token verification failed: ${err instanceof Error ? err.message : String(err)} | ${describeToken(token)}`);
+    // Log why (Clerk's reason code, else the message) plus non-secret token facts, never the
+    // token, so a sign-in that keeps failing can be diagnosed from the server log.
+    const failure = err as { reason?: string; message?: string };
+    console.warn(`[auth] Clerk session token rejected: ${failure.reason ?? failure.message ?? String(err)} | ${describeToken(token)}`);
     return null;
   }
 }

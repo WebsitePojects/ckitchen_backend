@@ -583,6 +583,38 @@ export const tenantSettings = pgTable("tenant_settings", {
 
 export type TenantSettings = typeof tenantSettings.$inferSelect;
 
+/**
+ * One-time link an owner sends by chat so someone joins the workspace with any Google
+ * account (migration 0046). The token is derived from the id (modules/join-links), never
+ * stored. Redeeming is a conditional UPDATE on used_at/revoked_at/expires_at.
+ */
+export const workspaceJoinLinks = pgTable(
+  "workspace_join_link",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .default(WORKSPACE_ONE_ID)
+      .references(() => tenants.id),
+    role: roleEnum("role").notNull(),
+    inviteeName: text("invitee_name").notNull(),
+    outletIds: uuid("outlet_ids").array().notNull().default(sql`'{}'::uuid[]`),
+    clientRequestId: uuid("client_request_id").notNull(),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    usedByUserId: uuid("used_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("workspace_join_link_request_unique").on(table.tenantId, table.clientRequestId),
+    index("workspace_join_link_tenant_created_idx").on(table.tenantId, table.createdAt.desc()),
+  ],
+).enableRLS();
+
+export type WorkspaceJoinLink = typeof workspaceJoinLinks.$inferSelect;
+
 export const userBrands = pgTable(
   "user_brand",
   {

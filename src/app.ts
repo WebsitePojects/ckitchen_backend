@@ -7,6 +7,7 @@ import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
 import { createNoopHub, type RealtimeHub } from "./realtime/hub.js";
 import { healthRouter } from "./routes/health.js";
 import { createAuthRouter } from "./modules/auth/routes.js";
+import { createJoinLinkRouter } from "./modules/join-links/routes.js";
 import { createBrandsRouter } from "./modules/brands/routes.js";
 import { createStationsRouter } from "./modules/stations/routes.js";
 import { createMenuRouter } from "./modules/menu/routes.js";
@@ -123,6 +124,9 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   // inherits requireAuth.
   app.use("/api/v1/public", createPublicAttendanceRouter(db));
   app.use("/api/v1", createAuthRouter(db));
+  // Before every router that applies requireAuth broadly: /auth/join serves people who
+  // have no ORION account yet.
+  app.use("/api/v1", createJoinLinkRouter(db));
   app.use("/api/v1", createBusinessModulesRouter(db));
   app.use("/api/v1", createOutletsRouter(db));
   app.use("/api/v1", createBrandsRouter(db));

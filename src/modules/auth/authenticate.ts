@@ -154,6 +154,6 @@ async function linkByVerifiedEmail(
     ok: false,
     status: 403,
     code: "NOT_INVITED",
-    message: `${email} has not been added to ORION. Ask the owner to add you as staff.`,
+    message: `${email} has not been added to ORION. Ask the business owner for a join link.`,
   };
 }

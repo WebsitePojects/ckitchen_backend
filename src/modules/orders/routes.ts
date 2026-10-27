@@ -55,6 +55,7 @@ import {
   ingestOrder,
   listOrders,
   listOrdersWithDetail,
+  ORDER_LIST_MAX,
   type IngestOrderInput,
 } from "./service.js";
 import { getSimulatorStatus, startSimulator, stopSimulator } from "./simulator.js";
@@ -276,6 +277,21 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       return;
     }
 
+    // scope=board: the live dashboard (current business day + still-open orders).
+    const scope = req.query.scope;
+    if (scope !== undefined && scope !== "board") {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid scope. Valid value: board.");
+      return;
+    }
+    let limit: number | undefined;
+    if (req.query.limit !== undefined) {
+      limit = Number(req.query.limit);
+      if (!Number.isInteger(limit) || limit < 1 || limit > ORDER_LIST_MAX) {
+        sendError(res, 400, "VALIDATION_ERROR", `'limit' must be a whole number from 1 to ${ORDER_LIST_MAX}.`);
+        return;
+      }
+    }
+
     const listFilters = {
       brand_id,
       aggregator,
@@ -284,6 +300,8 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       from,
       to,
       location_ids: listScopeLocationIds(req.outletContext) ?? undefined,
+      board: scope === "board",
+      limit,
     };
 
     try {

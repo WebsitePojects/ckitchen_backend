@@ -51,7 +51,8 @@
  *        deduped lowstock events).
  */
 import { randomBytes } from "node:crypto";
-import { and, eq, getTableColumns, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { localDayRange } from "../business-time.js";
 import type { DB } from "../../db/client.js";
 import { menuItemOutlets, operationalFeatureFlags } from "../../db/enterprise-schema.js";
 import {
@@ -1593,8 +1594,13 @@ export async function cancelOrder(
 
 // ---------------------------------------------------------------------------
 // listOrders — GET /orders
-// Filters: brand_id, aggregator, station_id, status, from, to
+// Filters: brand_id, aggregator, station_id, status, from, to, board; newest first, capped.
 // ---------------------------------------------------------------------------
+
+/** Orders still in the kitchen: the live board always shows these, whatever their date. */
+const OPEN_ORDER_STATUSES = ["NEW", "PREPARING", "READY"] as const;
+/** Safety cap for any list call that does not set its own limit. */
+export const ORDER_LIST_MAX = 1000;
 
 export async function listOrders(
   db: DB,
@@ -1611,27 +1617,25 @@ export async function listOrders(
      * `[]` = caller has no outlets in scope → empty result.
      */
     location_ids?: string[];
+    /** Live board: orders placed in the current business day OR still open (NEW/PREPARING/READY). */
+    board?: boolean;
+    /** Newest-first page size; capped at ORDER_LIST_MAX. */
+    limit?: number;
   },
 ): Promise<(typeof orders.$inferSelect)[]> {
   // Build WHERE conditions on the orders table
   const conditions: ReturnType<typeof eq>[] = [];
 
   // H2 — outlet scoping. Derive the order's outlet via order→brand.location_id and
-  // keep only orders at an in-scope outlet. Resolving brand ids first keeps the
-  // return shape a flat orders[] (no join reshaping).
+  // keep only orders at an in-scope outlet. The brand lookup is a subquery in the same
+  // statement: every separate query is a full database round trip.
   if (filters.location_ids !== undefined) {
     if (filters.location_ids.length === 0) return [];
-    const brandRows = await db
-      .select({ id: brands.id })
-      .from(brands)
-      .where(inArray(brands.locationId, filters.location_ids));
-    const brandIds = brandRows.map((b) => b.id);
+    const brandsAtOutlets = db.select({ id: brands.id }).from(brands).where(inArray(brands.locationId, filters.location_ids));
     conditions.push(
       or(
         inArray(orders.locationId, filters.location_ids),
-        brandIds.length > 0
-          ? and(sql`${orders.locationId} IS NULL`, inArray(orders.brandId, brandIds))
-          : sql`false`,
+        and(sql`${orders.locationId} IS NULL`, inArray(orders.brandId, brandsAtOutlets)),
       )!,
     );
   }
@@ -1655,28 +1659,26 @@ export async function listOrders(
   if (filters.from) conditions.push(gte(orders.placedAt, new Date(filters.from)));
   if (filters.to) conditions.push(lte(orders.placedAt, new Date(filters.to)));
 
-  // station_id filter: use a subquery to find orders with items at that station
-  if (filters.station_id) {
-    const orderIdsAtStation = await db
-      .selectDistinct({ orderId: orderItems.orderId })
-      .from(orderItems)
-      .where(eq(orderItems.stationId, filters.station_id));
-
-    const ids = orderIdsAtStation.map((r) => r.orderId);
-    if (ids.length === 0) return [];
-
-    conditions.push(inArray(orders.id, ids));
+  if (filters.board) {
+    conditions.push(
+      or(gte(orders.placedAt, localDayRange().start), inArray(orders.status, [...OPEN_ORDER_STATUSES]))!,
+    );
   }
 
-  const rows =
-    conditions.length > 0
-      ? await db
-          .select()
-          .from(orders)
-          .where(and(...(conditions as Parameters<typeof and>)))
-      : await db.select().from(orders);
+  // station_id filter: orders with an item at that station (subquery, same round trip)
+  if (filters.station_id) {
+    conditions.push(
+      inArray(orders.id, db.selectDistinct({ orderId: orderItems.orderId }).from(orderItems).where(eq(orderItems.stationId, filters.station_id))),
+    );
+  }
 
-  return rows;
+  const limit = Math.min(Math.max(1, filters.limit ?? ORDER_LIST_MAX), ORDER_LIST_MAX);
+  return db
+    .select()
+    .from(orders)
+    .where(conditions.length > 0 ? and(...(conditions as Parameters<typeof and>)) : undefined)
+    .orderBy(desc(orders.placedAt), desc(orders.id))
+    .limit(limit);
 }
 
 // ---------------------------------------------------------------------------

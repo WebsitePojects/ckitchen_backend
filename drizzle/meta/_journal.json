@@ -309,6 +309,13 @@
       "when": 1785500600000,
       "tag": "0043_business_module",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1785500700000,
+      "tag": "0044_owner_alerts",
+      "breakpoints": true
     }
   ]
 }

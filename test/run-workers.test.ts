@@ -46,6 +46,8 @@ const FULL_ENV = {
   GRAB_API_CLIENT_ID: "grab-id",
   GRAB_API_CLIENT_SECRET: SAMPLE_SECRET,
   GRAB_API_ENV: "staging",
+  RESEND_API_KEY: "re_sample",
+  ALERT_EMAIL_FROM: "ORION Alerts <alerts@example.invalid>",
 };
 
 function captureLogger(): { log: Logger; lines: string[] } {
@@ -82,13 +84,13 @@ describe("module import", () => {
 describe("runWorkerTick", () => {
   it("runs every worker against an empty DB and reports zero work", async () => {
     const { workers, skipped } = buildWorkers(FULL_ENV);
-    expect(workers.map((w) => w.name)).toEqual(["grab-submit-order", "foodpanda-outbound", "outbound-commands"]);
+    expect(workers.map((w) => w.name)).toEqual(["grab-submit-order", "foodpanda-outbound", "outbound-commands", "owner-alerts"]);
     expect(skipped).toEqual([]);
 
     const { log, lines } = captureLogger();
     const tick = await runWorkerTick(db, { workers, log });
 
-    expect(tick.results.map((r) => r.name)).toEqual(["grab-submit-order", "foodpanda-outbound", "outbound-commands"]);
+    expect(tick.results.map((r) => r.name)).toEqual(["grab-submit-order", "foodpanda-outbound", "outbound-commands", "owner-alerts"]);
     expect(tick.results.every((r) => r.ok && r.result.claimed === 0)).toBe(true);
     expect(tick.didWork).toBe(false);
     expect(tick.failed).toBe(false);
@@ -129,9 +131,10 @@ describe("buildWorkers", () => {
   it("skips unconfigured integrations and says why, without ever running them", () => {
     const { workers, skipped } = buildWorkers({});
     expect(workers.map((w) => w.name)).toEqual(["grab-submit-order"]);
-    expect(skipped).toHaveLength(2);
+    expect(skipped).toHaveLength(3);
     expect(skipped.join(" ")).toContain("foodpanda-outbound");
     expect(skipped.join(" ")).toContain("outbound-commands");
+    expect(skipped.join(" ")).toContain("owner-alerts (RESEND_API_KEY not set)");
   });
 
   it("treats a partially configured foodpanda environment as unconfigured", () => {

@@ -19,6 +19,8 @@ import { eq } from "drizzle-orm";
 import type { DB } from "../db/client.js";
 import { aggregatorCommands } from "../db/outbound-schema.js";
 import { aggregatorAccounts } from "../db/schema.js";
+import { readAlertSettings } from "../modules/alerts/config.js";
+import { createAlertsWorker } from "../modules/alerts/worker.js";
 import { runFoodpandaOutboundOnce } from "../modules/foodpanda/worker.js";
 import { runGrabSubmitOrderWorkerOnce } from "../modules/grab/worker.js";
 import { getOutboundAdapter } from "../modules/outbound/adapter.js";
@@ -177,6 +179,13 @@ export function buildWorkers(env: Env = process.env): WorkerSetup {
     workers.push({ name: "outbound-commands", run: (db) => processCommands(db, new AccountRoutingAdapter(db, adapters)) });
   } else {
     skipped.push("outbound-commands (neither foodpanda nor Grab outbound API is configured)");
+  }
+
+  const alerts = readAlertSettings(env);
+  if (alerts.ok) {
+    workers.push(createAlertsWorker(alerts.settings));
+  } else {
+    skipped.push(`owner-alerts (${alerts.reason})`);
   }
 
   return { workers, skipped };

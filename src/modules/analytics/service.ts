@@ -26,6 +26,7 @@
  */
 import { sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
+import { toRows } from "../../db/rows.js";
 import { parseRangeBoundary } from "../date-range.js";
 import { BUSINESS_TZ_SQL } from "../business-time.js";
 
@@ -99,17 +100,6 @@ export interface BrandMargin {
 // Internal helper
 // ---------------------------------------------------------------------------
 
-/**
- * Casts the raw PGlite execute result to a typed row array.
- * PGlite returns `{ rows: {[col]: value}[], fields: Field[] }`.
- * drizzle-orm wraps this but the rows property always contains plain objects.
- */
-function toRows<T>(raw: unknown): T[] {
-  // postgres-js (Supabase) returns the row array directly; PGlite returns { rows: [...] }.
-  if (Array.isArray(raw)) return raw as T[];
-  const r = raw as { rows?: T[] };
-  return r.rows ?? [];
-}
 
 /**
  * Default wide date range used when caller does not supply from/to.

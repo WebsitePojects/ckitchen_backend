@@ -1457,6 +1457,7 @@ export const rolePageAccess = pgTable(
 ).enableRLS();
 
 export type RolePageAccess = typeof rolePageAccess.$inferSelect;
+export type NewRolePageAccess = typeof rolePageAccess.$inferInsert;
 
 /**
  * Owner's on/off choice per business module (migration 0043). The module catalog and the
@@ -1468,7 +1469,56 @@ export const businessModules = pgTable("business_module", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   updatedBy: uuid("updated_by").references(() => users.id),
 }).enableRLS();
-export type NewRolePageAccess = typeof rolePageAccess.$inferInsert;
+
+/**
+ * Owner email alerts (migration 0044). `alert_email` is the delivery outbox: sender,
+ * recipients, subject and body are frozen at compose time so every retry is the identical request
+ * under the same Idempotency-Key. See modules/alerts/.
+ */
+export const alertEmails = pgTable(
+  "alert_email",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    fromAddress: text("from_address").notNull(),
+    recipients: jsonb("recipients").$type<string[]>().notNull(),
+    subject: text("subject").notNull(),
+    textBody: text("text_body").notNull(),
+    htmlBody: text("html_body").notNull(),
+    status: text("status").$type<"PENDING" | "SENDING" | "SENT" | "FAILED">().notNull().default("PENDING"),
+    attempts: integer("attempts").notNull().default(0),
+    availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    lastError: text("last_error"),
+    providerMessageId: text("provider_message_id"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("alert_email_due_idx").on(table.availableAt).where(sql`${table.status} IN ('PENDING', 'SENDING')`),
+  ],
+).enableRLS();
+
+export type AlertKind = "LOW_STOCK" | "ORDER_UNATTENDED" | "ORDER_STUCK";
+
+/** One row per problem episode; at most one OPEN row per (kind, subject) (partial unique index). */
+export const alertEvents = pgTable(
+  "alert_event",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    kind: text("kind").$type<AlertKind>().notNull(),
+    /** inventory_stock.id for LOW_STOCK, order.id for the order kinds. */
+    subjectId: uuid("subject_id").notNull(),
+    locationId: uuid("location_id").references(() => locations.id),
+    details: jsonb("details").$type<Record<string, string | number | null>>().notNull(),
+    openedAt: timestamp("opened_at", { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    emailId: uuid("email_id").references(() => alertEmails.id),
+  },
+  (table) => [
+    uniqueIndex("alert_event_open_unique").on(table.kind, table.subjectId).where(sql`${table.resolvedAt} IS NULL`),
+    index("alert_event_unsent_idx").on(table.openedAt).where(sql`${table.emailId} IS NULL AND ${table.resolvedAt} IS NULL`),
+  ],
+).enableRLS();
 
 // ---------------------------------------------------------------------------
 // Discounts / Promos + 3-layer approval workflow

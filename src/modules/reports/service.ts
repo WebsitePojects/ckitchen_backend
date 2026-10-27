@@ -36,6 +36,7 @@
 import { eq, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { operationalFeatureFlags } from "../../db/enterprise-schema.js";
+import { toRows } from "../../db/rows.js";
 import { businessDateSql } from "../business-time.js";
 
 // ---------------------------------------------------------------------------
@@ -85,12 +86,6 @@ export interface OutletFilter {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Same PGlite-vs-postgres-js row unwrap as analytics/service.ts. */
-function toRows<T>(raw: unknown): T[] {
-  if (Array.isArray(raw)) return raw as T[];
-  const r = raw as { rows?: T[] };
-  return r.rows ?? [];
-}
 
 /**
  * Builds the `AND ...` outlet-scoping fragment applied to every sales query.

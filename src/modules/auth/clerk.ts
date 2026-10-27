@@ -70,19 +70,38 @@ export async function verifyClerkSessionToken(token: string, settings: ClerkSett
       authorizedParties: settings.authorizedParties,
     });
     if (result.errors || !result.data) {
-      // Log the reason codes (e.g. "session-token-expired"), never the token, so a sign-in
-      // that keeps failing can be diagnosed from the server log.
-      const errors: Array<{ reason?: string }> = Array.isArray(result.errors) ? result.errors : [];
-      const reasons = errors.map((e) => e.reason).join(", ") || "no token data";
-      console.warn(`[auth] Clerk session token rejected: ${reasons}`);
+      // Log why (reason code, else message) plus non-secret token facts, never the token, so a
+      // sign-in that keeps failing can be diagnosed from the server log.
+      const detail = ([] as unknown[])
+        .concat(result.errors ?? [])
+        .map((e) => {
+          const err = e as { reason?: string; message?: string };
+          return err.reason ?? err.message ?? String(e);
+        })
+        .join("; ");
+      console.warn(`[auth] Clerk session token rejected: ${detail || "no error detail"} | ${describeToken(token)}`);
       return null;
     }
     // `sub` is the standard JWT subject (the Clerk user id); checked at runtime below.
     const sub = (result.data as { sub?: unknown }).sub;
     return typeof sub === "string" && sub.length > 0 ? sub : null;
   } catch (err) {
-    console.warn(`[auth] Clerk session token verification failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn(`[auth] Clerk session token verification failed: ${err instanceof Error ? err.message : String(err)} | ${describeToken(token)}`);
     return null;
+  }
+}
+
+/** Unverified, non-secret facts about a bearer token for logs: never the token or signature. */
+function describeToken(token: string): string {
+  try {
+    const [header, payload] = token
+      .split(".")
+      .slice(0, 2)
+      .map((part) => JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as Record<string, unknown>);
+    const expiresIn = typeof payload.exp === "number" ? `${payload.exp - Math.floor(Date.now() / 1000)}s` : "?";
+    return `alg=${String(header.alg)} kid=${String(header.kid)} iss=${String(payload.iss)} azp=${String(payload.azp)} sts=${String(payload.sts ?? "-")} expires_in=${expiresIn}`;
+  } catch {
+    return "not a JWT";
   }
 }
 

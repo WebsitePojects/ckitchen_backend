@@ -10,6 +10,7 @@ import {
   pgEnum,
   pgTable,
   primaryKey,
+  smallint,
   text,
   timestamp,
   uniqueIndex,
@@ -517,6 +518,70 @@ export const users = pgTable("user", {
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 export type Role = User["role"];
+
+// ---------------------------------------------------------------------------
+// tenant / membership / tenant_settings  (SaaS step 1, migration 0045, D52)
+//
+// A tenant is one business workspace. Not read by the app yet: until step 6 `user.role`
+// stays authoritative and a DB trigger mirrors it into workspace #1's memberships.
+// ---------------------------------------------------------------------------
+
+/** Workspace #1: the business that existed before ORION became multi-workspace. */
+export const WORKSPACE_ONE_ID = "00000000-0000-4000-8000-000000000001";
+
+export const tenants = pgTable("tenant", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  /** URL key (/t/<slug>); format enforced by the tenant_slug_format check. */
+  slug: text("slug").notNull().unique("tenant_slug_unique"),
+  name: text("name").notNull(),
+  /** Clerk Organization id once linked; identity only, never authority. */
+  clerkOrgId: text("clerk_org_id"),
+  status: text("status").notNull().default("ACTIVE").$type<"ACTIVE" | "SUSPENDED">(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}).enableRLS();
+
+export type Tenant = typeof tenants.$inferSelect;
+
+export const memberships = pgTable(
+  "membership",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    role: roleEnum("role").notNull(),
+    status: userStatusEnum("status").notNull().default("ACTIVE"),
+    /** Bumped on every role/status/scope change so cached authorizations can be dropped. */
+    authzVersion: integer("authz_version").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("membership_tenant_user_unique").on(table.tenantId, table.userId),
+    index("membership_user_idx").on(table.userId),
+  ],
+).enableRLS();
+
+export type Membership = typeof memberships.$inferSelect;
+
+export const tenantSettings = pgTable("tenant_settings", {
+  tenantId: uuid("tenant_id")
+    .primaryKey()
+    .references(() => tenants.id),
+  timezone: text("timezone").notNull().default("Asia/Manila"),
+  businessDayStartHour: smallint("business_day_start_hour").notNull().default(5),
+  currency: text("currency").notNull().default("PHP"),
+  /** NULL = use the platform default from env. */
+  alertUnattendedMinutes: integer("alert_unattended_minutes"),
+  alertStuckMinutes: integer("alert_stuck_minutes"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}).enableRLS();
+
+export type TenantSettings = typeof tenantSettings.$inferSelect;
 
 export const userBrands = pgTable(
   "user_brand",

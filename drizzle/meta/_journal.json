@@ -316,6 +316,13 @@
       "when": 1785500700000,
       "tag": "0044_owner_alerts",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1785500800000,
+      "tag": "0045_workspace_foundation",
+      "breakpoints": true
     }
   ]
 }

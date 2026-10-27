@@ -28,6 +28,7 @@ import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
 import { attendanceRecords, employees } from "../src/db/schema.js";
+import { localDate } from "../src/modules/business-time.js";
 
 let app: Express;
 let db: DB;
@@ -454,7 +455,7 @@ describe("GET /api/v1/employees/:id/profile — month calendar + stats", () => {
       hired_at: "2026-01-01",
     });
 
-    const capturedAt = new Date(); // just now → same UTC day, same month
+    const capturedAt = new Date(); // just now
     await db.insert(attendanceRecords).values({
       employeeId: created.id,
       type: "TIME_IN",
@@ -462,8 +463,10 @@ describe("GET /api/v1/employees/:id/profile — month calendar + stats", () => {
       capturedAt,
     });
 
-    const expectedMonth = capturedAt.toISOString().slice(0, 7);
-    const expectedDate = capturedAt.toISOString().slice(0, 10);
+    // The profile groups by business day (Asia/Manila, from 05:00, D49), not the UTC date:
+    // between 21:00 and 24:00 UTC the two differ, and the test failed every evening.
+    const expectedDate = localDate(capturedAt);
+    const expectedMonth = expectedDate.slice(0, 7);
 
     // No month param → defaults to the current month
     const res = await getProfile(created.id);

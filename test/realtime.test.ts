@@ -25,7 +25,6 @@ import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
 import { randomUUID } from "node:crypto";
 import { createSocketHub, type RealtimeHub } from "../src/realtime/hub.js";
-import { loadConfig } from "../src/config.js";
 import { locations } from "../src/db/schema.js";
 
 // ---------------------------------------------------------------------------
@@ -89,7 +88,7 @@ beforeAll(async () => {
   ioServer = new IOServer(httpServer, { cors: { origin: "*" } });
   // Hub verifies handshake JWTs against the same secret the app signs with,
   // plus session revocation (H1) — so it needs the db handle.
-  hub = createSocketHub(ioServer, loadConfig().jwtSecret, db);
+  hub = createSocketHub(ioServer, db);
   const app = createApp(db, hub);
   // Attach Express as the HTTP request handler on the same server as Socket.IO
   httpServer.on("request", app);

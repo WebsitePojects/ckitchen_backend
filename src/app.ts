@@ -38,6 +38,7 @@ import { getGrabPartnerBasePath } from "./modules/grab/config.js";
 import { createGrabPartnerRouter } from "./modules/grab/routes.js";
 import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 import compression from "compression";
+import { createBusinessModulesRouter } from "./modules/business-modules/routes.js";
 
 /**
  * Express app factory.
@@ -122,6 +123,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   // inherits requireAuth.
   app.use("/api/v1/public", createPublicAttendanceRouter(db));
   app.use("/api/v1", createAuthRouter(db));
+  app.use("/api/v1", createBusinessModulesRouter(db));
   app.use("/api/v1", createOutletsRouter(db));
   app.use("/api/v1", createBrandsRouter(db));
   app.use("/api/v1", createStationsRouter(db));

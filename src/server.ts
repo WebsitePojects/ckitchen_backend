@@ -23,12 +23,20 @@ import { createDb } from "./db/client.js";
 import { runMigrations } from "./db/migrate.js";
 import { createSocketHub } from "./realtime/hub.js";
 import { getGrabPartnerConfigProblem } from "./modules/grab/config.js";
+import { clerkConfigProblem, clerkSettings } from "./modules/auth/clerk.js";
 
 const config = loadConfig();
 
 // A Grab misconfig disables only the Grab routes (503), so warn loudly but keep the dashboard API up.
 const grabConfigProblem = getGrabPartnerConfigProblem();
 if (grabConfigProblem) console.error(`[grab] CONFIG ERROR: ${grabConfigProblem}`);
+
+// Sign-in mode at a glance. Clerk is optional: without it, ORION's own password login is used.
+const clerk = clerkSettings();
+const clerkProblem = clerkConfigProblem(clerk);
+if (clerkProblem) console.error(`[auth] CONFIG ERROR: ${clerkProblem}`);
+else if (clerk) console.log(`[auth] Clerk sign-in enabled for: ${clerk.authorizedParties.join(", ")}`);
+else console.log("[auth] Clerk not configured: password login only.");
 
 const { db } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUrl });
 
@@ -65,7 +73,7 @@ const io = new IOServer(httpServer, {
 
 // 3. Hub backed by the live Socket.IO server (verifies handshake JWTs +
 //    session revocation — H1 — so `db` is passed in)
-const hub = createSocketHub(io, config.jwtSecret, db);
+const hub = createSocketHub(io, db);
 
 // 4. Express app with the hub injected
 const app = createApp(db, hub);

@@ -506,6 +506,8 @@ export const users = pgTable("user", {
   name: text("name").notNull(),
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
+  /** Clerk user id, linked on first Clerk sign-in by verified email. Unique when set (partial index, migration 0042). */
+  clerkUserId: text("clerk_user_id"),
   role: roleEnum("role").notNull(),
   status: userStatusEnum("status").notNull().default("ACTIVE"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1455,6 +1457,17 @@ export const rolePageAccess = pgTable(
 ).enableRLS();
 
 export type RolePageAccess = typeof rolePageAccess.$inferSelect;
+
+/**
+ * Owner's on/off choice per business module (migration 0043). The module catalog and the
+ * pages each covers live in modules/business-modules/catalog.ts; no row = module ON.
+ */
+export const businessModules = pgTable("business_module", {
+  key: text("key").primaryKey(),
+  enabled: boolean("enabled").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedBy: uuid("updated_by").references(() => users.id),
+}).enableRLS();
 export type NewRolePageAccess = typeof rolePageAccess.$inferInsert;
 
 // ---------------------------------------------------------------------------

@@ -45,12 +45,42 @@ export function forgetSession(sessionId: string): void {
   cache.delete(sessionId);
 }
 
-/** Call after revoking every session of a user (block, password reset, role change). */
+// ── Clerk identities ────────────────────────────────────────────────────────
+// Same idea for Clerk sign-ins: Clerk user id -> the resolved ORION user (role, outlets),
+// so a signed-in request does not re-read the user row every time. Role and outlet
+// changes call forgetUserSessions, which clears these too, so they apply immediately.
+
+const identities = new Map<string, { userId: string; value: unknown; validUntil: number }>();
+
+export function cachedClerkIdentity<T>(clerkUserId: string, now: number = Date.now()): T | null {
+  const entry = identities.get(clerkUserId);
+  if (!entry) return null;
+  if (entry.validUntil <= now) {
+    identities.delete(clerkUserId);
+    return null;
+  }
+  return entry.value as T;
+}
+
+export function rememberClerkIdentity(clerkUserId: string, userId: string, value: unknown, now: number = Date.now()): void {
+  if (identities.size >= MAX_ENTRIES && !identities.has(clerkUserId)) {
+    const oldest = identities.keys().next().value;
+    if (oldest !== undefined) identities.delete(oldest);
+  }
+  identities.set(clerkUserId, { userId, value, validUntil: now + TTL_MS });
+}
+
+/**
+ * Call after revoking a user's sessions OR changing their role/outlets/status: drops their
+ * cached session validity and cached Clerk identity so the change applies on the next request.
+ */
 export function forgetUserSessions(userId: string): void {
   for (const [sid, entry] of cache) if (entry.userId === userId) cache.delete(sid);
+  for (const [cid, entry] of identities) if (entry.userId === userId) identities.delete(cid);
 }
 
 /** Test helper. */
 export function clearSessionCache(): void {
   cache.clear();
+  identities.clear();
 }

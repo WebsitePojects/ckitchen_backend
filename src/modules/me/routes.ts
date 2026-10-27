@@ -22,6 +22,7 @@ import { rolePageAccess } from "../../db/schema.js";
 import { requireAuth } from "../auth/middleware.js";
 import { normalizeRole } from "../auth/roles.js";
 import { PAGE_KEYS, defaultAllowed } from "../admin/rbac-defaults.js";
+import { disabledPages } from "../business-modules/routes.js";
 
 export function createMeRouter(db: DB): Router {
   const router = Router();
@@ -39,9 +40,13 @@ export function createMeRouter(db: DB): Router {
       return;
     }
 
-    // OWNER is always full access — never restricted by the matrix.
+    // Pages of modules the owner switched off are hidden for EVERY role, owner included
+    // (the owner re-enables them under Settings, which can never be switched off).
+    const off = await disabledPages(db);
+
+    // OWNER is always full access — never restricted by the role matrix.
     if (role === "OWNER") {
-      res.json({ pages: [...PAGE_KEYS] });
+      res.json({ pages: PAGE_KEYS.filter((p) => !off.has(p)), disabled_pages: [...off] });
       return;
     }
 
@@ -55,8 +60,10 @@ export function createMeRouter(db: DB): Router {
     // was seeded, e.g. /pos) uses the code default. Without this, every page added
     // after go-live was silently denied to every non-OWNER role.
     const persisted = new Map(rows.map((r) => [r.pageKey, r.allowed]));
-    const pages = PAGE_KEYS.filter((pageKey) => persisted.get(pageKey) ?? defaultAllowed(role, pageKey));
-    res.json({ pages });
+    const pages = PAGE_KEYS.filter(
+      (pageKey) => !off.has(pageKey) && (persisted.get(pageKey) ?? defaultAllowed(role, pageKey)),
+    );
+    res.json({ pages, disabled_pages: [...off] });
   });
 
   return router;

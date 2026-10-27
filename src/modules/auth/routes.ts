@@ -21,8 +21,10 @@ function sendError(
 
 /** Strips password_hash before returning a user over the wire. */
 function toPublicUser(user: typeof users.$inferSelect) {
-  const { passwordHash, ...publicUser } = user;
-  return publicUser;
+  // Never expose the password hash or the raw Clerk id; the UI only needs to know whether
+  // this person has signed in with Clerk yet (drives "Resend invite").
+  const { passwordHash, clerkUserId, ...publicUser } = user;
+  return { ...publicUser, clerk_linked: clerkUserId !== null };
 }
 
 export function createAuthRouter(db: DB): Router {
@@ -139,7 +141,15 @@ export function createAuthRouter(db: DB): Router {
       sendError(res, 401, "AUTH_REQUIRED", "User no longer exists.");
       return;
     }
-    res.json({ user: toPublicUser(user) });
+    // Outlet scope as resolved by the server for THIS request. Clerk sign-ins carry no ORION
+    // claims in their token, so the frontend reads scope from here rather than decoding it.
+    res.json({
+      user: {
+        ...toPublicUser(user),
+        outlet_scope: req.user!.outletScope,
+        outlet_ids: req.user!.outletIds,
+      },
+    });
   });
 
   router.post("/auth/logout", requireAuth, async (req, res) => {

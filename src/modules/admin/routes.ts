@@ -43,7 +43,7 @@ import { requireAuth, requireRole } from "../auth/middleware.js";
 import { normalizeRole, V2_ROLES } from "../auth/roles.js";
 import { hashPassword } from "../auth/service.js";
 import { audit } from "../ems/audit.js";
-import { paramAsString, sendError } from "../http-errors.js";
+import { isUuid, paramAsString, sendError } from "../http-errors.js";
 import {
   MATRIX_ROLES,
   OWNER_PROTECTED_PAGES,
@@ -51,16 +51,20 @@ import {
   defaultAllowed,
 } from "./rbac-defaults.js";
 import { forgetUserSessions } from "../auth/session-cache.js";
+import { clerkSettings, sendClerkInvitation } from "../auth/clerk.js";
+import { randomBytes } from "node:crypto";
 
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
 const createUserSchema = z.object({
-  name: z.string().min(1),
-  email: z.string().email(),
+  name: z.string().trim().min(1),
+  // Normalised so "Ana@Mail.com" and "ana@mail.com" are one person (Clerk links by email).
+  email: z.string().trim().toLowerCase().email(),
   role: z.enum(V2_ROLES),
-  password: z.string().min(8),
+  // Optional once Clerk sign-in is on: staff sign in with Google/email and never need one.
+  password: z.string().min(8).optional(),
   outlet_ids: z.array(z.string().uuid()).optional(),
 });
 
@@ -123,8 +127,10 @@ function resolvePerformanceRange(from: string | undefined, to: string | undefine
 
 /** Strips password_hash before returning a user over the wire. */
 function toPublicUser(user: typeof users.$inferSelect) {
-  const { passwordHash, ...publicUser } = user;
-  return publicUser;
+  // Never expose the password hash or the raw Clerk id; the UI only needs to know whether
+  // this person has signed in with Clerk yet (drives "Resend invite").
+  const { passwordHash, clerkUserId, ...publicUser } = user;
+  return { ...publicUser, clerk_linked: clerkUserId !== null };
 }
 
 /** True if the (possibly v1) role normalizes to OWNER. */
@@ -200,11 +206,11 @@ async function loadRbacEntries(
     })
     .from(rolePageAccess);
 
-  const present = new Set(rows.map((r) => `${r.role} ${r.pageKey}`));
+  const present = new Set(rows.map((r) => `${r.role}\u0000${r.pageKey}`));
   const merged = [...rows];
   for (const role of MATRIX_ROLES) {
     for (const pageKey of PAGE_KEYS) {
-      if (!present.has(`${role} ${pageKey}`)) {
+      if (!present.has(`${role}\u0000${pageKey}`)) {
         merged.push({ role, pageKey, allowed: defaultAllowed(role, pageKey) });
       }
     }
@@ -264,6 +270,8 @@ export function createAdminRouter(db: DB): Router {
       lastLoginAt: lastLogin.get(u.id) ?? null,
       outletIds: outletsByUser.get(u.id) ?? [],
       brandIds: brandsByUser.get(u.id) ?? [],
+      // Whether this person has signed in with Clerk yet (drives "Resend invite" in the UI).
+      clerkLinked: u.clerkUserId !== null,
     }));
 
     res.json(result);
@@ -277,8 +285,13 @@ export function createAdminRouter(db: DB): Router {
       return;
     }
     const { name, email, role, password, outlet_ids } = parsed.data;
+    const clerk = clerkSettings();
+    if (!password && !clerk) {
+      sendError(res, 400, "VALIDATION_ERROR", "A password (8+ characters) is required until Clerk sign-in is set up.");
+      return;
+    }
 
-    const [dup] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
+    const [dup] = await db.select({ id: users.id }).from(users).where(sql`lower(${users.email}) = ${email}`);
     if (dup) {
       sendError(res, 409, "CONFLICT", `A user with email ${email} already exists.`);
       return;
@@ -296,7 +309,9 @@ export function createAdminRouter(db: DB): Router {
       }
     }
 
-    const passwordHash = await hashPassword(password);
+    // No password => an unusable random hash: the account can only sign in through Clerk,
+    // and the password path cannot be guessed into.
+    const passwordHash = await hashPassword(password ?? randomBytes(32).toString("base64url"));
     let created: typeof users.$inferSelect | undefined;
     await db.transaction(async (tx) => {
       [created] = await tx
@@ -321,7 +336,17 @@ export function createAdminRouter(db: DB): Router {
       metadata: { role, outletIds: outlet_ids ?? [] },
     });
 
-    res.status(201).json(toPublicUser(created!));
+    // Invite through Clerk so they get an email to set up their sign-in. A failed invite
+    // does not undo the account: the owner can resend it (POST /admin/users/:id/invite).
+    let invitation: "sent" | "failed" | "not_configured" = "not_configured";
+    if (clerk) {
+      try {
+        invitation = (await sendClerkInvitation(email, clerk)) ? "sent" : "not_configured";
+      } catch {
+        invitation = "failed";
+      }
+    }
+    res.status(201).json({ ...toPublicUser(created!), invitation });
   });
 
   // ── PATCH /admin/users/:id ────────────────────────────────────────────────
@@ -383,6 +408,8 @@ export function createAdminRouter(db: DB): Router {
       metadata: { fields: Object.keys(parsed.data) },
     });
 
+    // Role/outlet/status changes apply on the next request for Clerk sign-ins (cached identity).
+    forgetUserSessions(id);
     res.json(toPublicUser(updated));
   });
 
@@ -483,7 +510,55 @@ export function createAdminRouter(db: DB): Router {
       entityId: id,
     });
 
+    // Unblocked: drop any cached refusal state so they can sign in immediately.
+    forgetUserSessions(id);
     res.json(toPublicUser(updated));
+  });
+
+  // ── POST /admin/users/:id/invite ──────────────────────────────────────────
+  // (Re)sends the Clerk invitation email so the person can set up their sign-in.
+  // Idempotent on Clerk's side (ignoreExisting); refused for blocked or already-linked
+  // accounts, where an invitation would be meaningless.
+  router.post("/admin/users/:id/invite", async (req, res) => {
+    const id = paramAsString(req.params.id);
+    if (!isUuid(id)) {
+      sendError(res, 404, "NOT_FOUND", "User not found.");
+      return;
+    }
+    const clerk = clerkSettings();
+    if (!clerk) {
+      sendError(res, 409, "NOT_CONFIGURED", "Clerk sign-in is not set up yet, so there is nothing to send.");
+      return;
+    }
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    if (!user) {
+      sendError(res, 404, "NOT_FOUND", "User not found.");
+      return;
+    }
+    if (user.status === "BLOCKED") {
+      sendError(res, 409, "ACCOUNT_BLOCKED", "Unblock this account before inviting it.");
+      return;
+    }
+    if (user.clerkUserId) {
+      sendError(res, 409, "ALREADY_LINKED", `${user.name} has already signed in; no invitation needed.`);
+      return;
+    }
+    try {
+      await sendClerkInvitation(user.email, clerk);
+    } catch {
+      sendError(res, 503, "INVITE_FAILED", "The invitation could not be sent. Try again in a moment.");
+      return;
+    }
+    await audit(db, {
+      actorUserId: req.user!.id,
+      actorName: req.user!.name,
+      sessionId: req.user!.sessionId ?? null,
+      action: "admin.user.invite",
+      description: `Sent sign-in invitation to ${user.name} <${user.email}>`,
+      entityType: "user",
+      entityId: id,
+    });
+    res.json({ ok: true, invitation: "sent" });
   });
 
   // ── PUT /admin/users/:id/outlets ──────────────────────────────────────────
@@ -533,6 +608,8 @@ export function createAdminRouter(db: DB): Router {
       metadata: { outletIds },
     });
 
+    // New outlet access applies on the next request for Clerk sign-ins (cached identity).
+    forgetUserSessions(id);
     res.json({ userId: id, outletIds });
   });
 

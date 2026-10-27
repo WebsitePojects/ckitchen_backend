@@ -1,11 +1,8 @@
 import type { NextFunction, Request, Response } from "express";
-import { eq } from "drizzle-orm";
-import { loadConfig } from "../../config.js";
-import { verifyToken } from "./service.js";
 import { normalizeRole, outletScopeForRole, type OutletScope } from "./roles.js";
-import { userSessions, type User } from "../../db/schema.js";
+import type { User } from "../../db/schema.js";
 import type { DB } from "../../db/client.js";
-import { isSessionKnownValid, rememberValidSession } from "./session-cache.js";
+import { authenticateBearer } from "./authenticate.js";
 
 export interface AuthenticatedUser {
   id: string;
@@ -78,37 +75,16 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
   }
 
   try {
-    const { jwtSecret } = loadConfig();
-    const payload = verifyToken(token, jwtSecret);
-
-    // Session revocation check (only for tokens minted with a session id).
-    // A positive answer is cached for a few seconds (session-cache.ts) so this check does
-    // not cost a database round trip on every request.
-    if (payload.sid && !isSessionKnownValid(payload.sid)) {
-      const db = req.app.get("db") as DB | undefined;
-      if (db) {
-        const [session] = await db
-          .select({ logoutAt: userSessions.logoutAt })
-          .from(userSessions)
-          .where(eq(userSessions.id, payload.sid));
-        if (!session || session.logoutAt !== null) {
-          sendError(res, 401, "AUTH_REQUIRED", "Session ended. Please log in again.");
-          return;
-        }
-        rememberValidSession(payload.sid, payload.sub);
-      }
+    // Shared with the Socket.IO handshake (realtime/hub.ts) so both agree on who the caller is.
+    const result = await authenticateBearer(req.app.get("db") as DB | undefined, token);
+    if (!result.ok) {
+      sendError(res, result.status, result.code, result.message);
+      return;
     }
-
-    req.user = {
-      id: payload.sub,
-      role: payload.role,
-      sessionId: payload.sid,
-      outletScope: payload.outlet_scope ?? outletScopeForRole(payload.role),
-      outletIds: Array.isArray(payload.outlet_ids) ? payload.outlet_ids : [],
-      name: typeof payload.name === "string" && payload.name.length > 0 ? payload.name : null,
-    };
+    req.user = result.user;
     next();
   } catch {
+    // Any unexpected failure (e.g. the database is unreachable) fails closed: 401, never 500.
     sendError(res, 401, "AUTH_REQUIRED", "Invalid or expired token.");
   }
 }

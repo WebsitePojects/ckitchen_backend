@@ -295,6 +295,20 @@
       "when": 1785500400000,
       "tag": "0041_order_item_money_snapshot_menu_category",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1785500500000,
+      "tag": "0042_user_clerk_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1785500600000,
+      "tag": "0043_business_module",
+      "breakpoints": true
     }
   ]
 }

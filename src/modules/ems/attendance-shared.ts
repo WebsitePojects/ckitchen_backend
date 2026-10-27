@@ -16,6 +16,7 @@ import type { DB } from "../../db/client.js";
 import { attendanceRecords, attendanceTypeEnum, employees, type AttendanceRecord } from "../../db/schema.js";
 import { uploadAttendancePhoto } from "./cloudinary.js";
 import { audit } from "./audit.js";
+import { localDate, localDayRange } from "../business-time.js";
 
 /** Reject attendance photos larger than 8 MB (base64 string length ≈ byte budget). */
 export const MAX_PHOTO_BYTES = 8 * 1024 * 1024;
@@ -81,7 +82,7 @@ export interface DtrEntry {
 const FORFEIT_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Pairs punches into DTR entries, one per (employee, UTC date). Earliest TIME_IN
+ * Pairs punches into DTR entries, one per (employee, business-local date). Earliest TIME_IN
  * is paired with the latest TIME_OUT that day. `rows` MUST be ordered by
  * capturedAt ASC so the latest TIME_OUT wins. `nowMs` drives the 24h forfeit cut
  * (defaults to now) — pass it explicitly so callers computing several things off
@@ -95,7 +96,7 @@ export function pairDtrEntries(
   const byKey = new Map<string, DtrEntry>();
   for (const r of rows) {
     const iso = new Date(r.capturedAt).toISOString();
-    const date = iso.slice(0, 10);
+    const date = localDate(new Date(r.capturedAt));
     const key = `${r.employeeId}|${date}`;
     let entry = byKey.get(key);
     if (!entry) {
@@ -177,12 +178,12 @@ export async function recordAttendancePunch(
     //   TIME_IN  while a TIME_IN exists today          → 409 ALREADY_TIMED_IN
     //   TIME_OUT with no TIME_IN today                 → 409 NOT_TIMED_IN
     //   TIME_OUT while a TIME_OUT exists today         → 409 ALREADY_TIMED_OUT
-    // Day-scoped on UTC day boundaries — the same window /ems/attendance/self/
-    // today uses (Manila-day boundaries are the same documented follow-up), so a
-    // forfeited/unclosed yesterday never blocks today's TIME_IN.
+    // Day-scoped on business-local (Manila) day boundaries — the same window
+    // /ems/attendance/self/today uses — so a forfeited/unclosed yesterday never
+    // blocks today's TIME_IN.
     const now = new Date();
-    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+    // Business-local (Manila) day: a 07:30 TIME_IN must still count after 08:00 (UTC midnight).
+    const { start: startOfDay, end: endOfDay } = localDayRange(now);
     const todays = await tx
       .select({ type: attendanceRecords.type })
       .from(attendanceRecords)

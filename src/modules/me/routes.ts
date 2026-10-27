@@ -50,15 +50,12 @@ export function createMeRouter(db: DB): Router {
       .from(rolePageAccess)
       .where(eq(rolePageAccess.role, role));
 
-    // No rows at all for this role → table hasn't been seeded yet. Fall back
-    // to the code-defined defaults so the endpoint still works pre-seed.
-    if (rows.length === 0) {
-      const pages = PAGE_KEYS.filter((pageKey) => defaultAllowed(role, pageKey));
-      res.json({ pages });
-      return;
-    }
-
-    const pages = rows.filter((r) => r.allowed).map((r) => r.pageKey);
+    // Per-page merge, same convention as the admin matrix read (loadRbacEntries):
+    // a persisted row always wins; a page with no row yet (shipped after the table
+    // was seeded, e.g. /pos) uses the code default. Without this, every page added
+    // after go-live was silently denied to every non-OWNER role.
+    const persisted = new Map(rows.map((r) => [r.pageKey, r.allowed]));
+    const pages = PAGE_KEYS.filter((pageKey) => persisted.get(pageKey) ?? defaultAllowed(role, pageKey));
     res.json({ pages });
   });
 

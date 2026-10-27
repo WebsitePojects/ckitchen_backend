@@ -617,7 +617,8 @@ describe("Step (f): Analytics — per-brand ranking and peak-hour breakdown", ()
     // All 5 orders were placed at 2026-06-24 10:xx UTC → hour 10 should show up
     expect(rows.length).toBeGreaterThan(0);
 
-    const hour10 = rows.find((r) => r.hour === 10);
+    // Orders were placed 10:00-10:20 UTC = 18:00 Manila (hours are business-local).
+    const hour10 = rows.find((r) => r.hour === 18);
     expect(hour10, "Hour 10 in orders-by-hour").toBeTruthy();
     expect(hour10!.order_count).toBeGreaterThanOrEqual(5); // all 5 pilot orders placed at 10:xx
   });

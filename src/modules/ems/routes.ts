@@ -36,6 +36,7 @@ import { normalizeRole } from "../auth/roles.js";
 import { hashPassword } from "../auth/service.js";
 import { sendError } from "../http-errors.js";
 import { pairDtrEntries, recordAttendancePunch, type DtrEntry } from "./attendance-shared.js";
+import { localDate, localDayRange, localMonthRange } from "../business-time.js";
 
 // ---------------------------------------------------------------------------
 // Unified employee + login-account creation (client-critical)
@@ -114,7 +115,7 @@ function canonicalWorkDaysCsv(days: readonly WorkDayToken[]): string {
 /** Normalize a date-ish value (Date | 'YYYY-MM-DD…' | null) to 'YYYY-MM-DD' | null. */
 function toDateString(v: unknown): string | null {
   if (v == null) return null;
-  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (v instanceof Date) return localDate(v);
   const s = String(v);
   return s.length >= 10 ? s.slice(0, 10) : s;
 }
@@ -690,9 +691,7 @@ export function createEmsRouter(db: DB): Router {
   // frontend "clock in/out" gate. Returns employee=null when the caller has no
   // ACTIVE linked employee row (those users are exempt from the gate).
   //
-  // NOTE: "today" uses UTC day boundaries — fine for the prototype. Manila-day
-  // (UTC+8) boundaries are a documented follow-up (a punch just after local
-  // midnight can land on the previous UTC day near the 16:00-24:00 UTC window).
+  // "today" is the business-local (Manila) day — see business-time.ts.
   router.get("/ems/attendance/self/today", requireAuth, async (req, res) => {
     const [emp] = await db
       .select()
@@ -705,8 +704,8 @@ export function createEmsRouter(db: DB): Router {
     }
 
     const now = new Date();
-    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+    // Business-local (Manila) day: a 07:30 TIME_IN must still count after 08:00 (UTC midnight).
+    const { start: startOfDay, end: endOfDay } = localDayRange(now);
 
     const todays = await db
       .select()
@@ -849,8 +848,7 @@ export function createEmsRouter(db: DB): Router {
     }
 
     const daysInMonth = new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
-    const monthStart = new Date(Date.UTC(year, monthIndex, 1, 0, 0, 0, 0));
-    const monthEnd = new Date(Date.UTC(year, monthIndex, daysInMonth, 23, 59, 59, 999));
+    const { start: monthStart, end: monthEnd } = localMonthRange(year, monthIndex + 1);
 
     // ONE query for the month's punches, asc so pairDtrEntries can pair in memory.
     const punches = await db
@@ -872,7 +870,7 @@ export function createEmsRouter(db: DB): Router {
     const workDays = parseWorkDays(emp.workDays);
     const workDaySet = new Set(workDays);
     const DOW = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"] as const;
-    const todayStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-${String(now.getUTCDate()).padStart(2, "0")}`;
+    const todayStr = localDate(now);
     // Pre-hire scheduled days are NOT absences. Fall back to created_at's date
     // when hired_at is unknown.
     const hireStr = toDateString(emp.hiredAt) ?? toDateString(emp.createdAt) ?? "0000-01-01";

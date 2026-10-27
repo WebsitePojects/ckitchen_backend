@@ -18,6 +18,7 @@ import { parseRangeBoundary } from "../date-range.js";
 import { sendError, sendInternalError } from "../http-errors.js";
 import { getSalesReport, type OutletFilter, type SalesGroupBy } from "./service.js";
 import { buildSalesReportPdf, buildSalesReportXlsx } from "./export.js";
+import { localDate, localMonthRange } from "../business-time.js";
 
 const REPORTS_ROLES = ["OWNER", "ACCOUNTING"] as const;
 
@@ -34,14 +35,13 @@ const exportQuerySchema = salesReportQuerySchema.extend({
 });
 
 // ---------------------------------------------------------------------------
-// Date range resolution — defaults to the current UTC calendar month (D33 #10:
+// Date range resolution — defaults to the current business-local month (D33 #10:
 // "date range defaulting to current month").
 // ---------------------------------------------------------------------------
 
 function currentMonthRange(): { from: Date; to: Date } {
-  const now = new Date();
-  const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0));
-  const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0, 23, 59, 59, 999));
+  const [year, month] = localDate().split("-").map(Number);
+  const { start: from, end: to } = localMonthRange(year!, month!);
   return { from, to };
 }
 

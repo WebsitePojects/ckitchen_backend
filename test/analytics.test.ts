@@ -27,8 +27,9 @@
  *     Seoul Bowl   revenue=150  orders=1  avg=150  → ranked 2nd (weakest)
  *
  *   Orders-by-hour (2026-01-15):
- *     hour=10 → 3 orders
- *     hour=14 → 1 order
+ *     hour=18 Manila (10:00 UTC) → 3 orders
+ *     hour=22 Manila (14:00 UTC) → 1 order
+ *   Hours are business-local (Asia/Manila, UTC+8) since the business-time fix.
  *
  *   Aggregators (2026-01-15):
  *     FOODPANDA  orders=2  revenue=350
@@ -336,7 +337,7 @@ describe("GET /api/v1/analytics/orders-by-hour", () => {
     expect(Array.isArray(res.body)).toBe(true);
   });
 
-  it("returns hour=10 with order_count=3 (three Tokyo House orders at 10:00/10:15/10:30 UTC)", async () => {
+  it("returns Manila hour=18 with order_count=3 (Tokyo House orders at 10:00/10:15/10:30 UTC)", async () => {
     const res = await request(app)
       .get("/api/v1/analytics/orders-by-hour")
       .set("Authorization", `Bearer ${adminToken}`)
@@ -345,12 +346,12 @@ describe("GET /api/v1/analytics/orders-by-hour", () => {
     expect(res.status).toBe(200);
     const body = res.body as Array<{ hour: number; order_count: number }>;
 
-    const hour10 = body.find((h) => Number(h.hour) === 10);
+    const hour10 = body.find((h) => Number(h.hour) === 18);
     expect(hour10, "Hour 10 not found in response").toBeTruthy();
     expect(Number(hour10!.order_count)).toBe(3);
   });
 
-  it("returns hour=14 with order_count=1 (Seoul Bowl order at 14:00 UTC)", async () => {
+  it("returns Manila hour=22 with order_count=1 (Seoul Bowl order at 14:00 UTC)", async () => {
     const res = await request(app)
       .get("/api/v1/analytics/orders-by-hour")
       .set("Authorization", `Bearer ${adminToken}`)
@@ -359,7 +360,7 @@ describe("GET /api/v1/analytics/orders-by-hour", () => {
     expect(res.status).toBe(200);
     const body = res.body as Array<{ hour: number; order_count: number }>;
 
-    const hour14 = body.find((h) => Number(h.hour) === 14);
+    const hour14 = body.find((h) => Number(h.hour) === 22);
     expect(hour14, "Hour 14 not found in response").toBeTruthy();
     expect(Number(hour14!.order_count)).toBe(1);
   });
@@ -375,8 +376,8 @@ describe("GET /api/v1/analytics/orders-by-hour", () => {
 
     // Only hours 10 and 14 have orders in this fresh DB
     const allHours = body.map((h) => Number(h.hour));
-    expect(allHours).toContain(10);
-    expect(allHours).toContain(14);
+    expect(allHours).toContain(18);
+    expect(allHours).toContain(22);
     expect(body).toHaveLength(2);
   });
 
@@ -698,7 +699,7 @@ describe("GET /api/v1/analytics/orders-by-hour-by-brand", () => {
       brands: Array<{ brandId: string; brandName: string; count: number }>;
     }>;
 
-    const bucket10 = body.find((b) => Number(b.hour) === 10)!;
+    const bucket10 = body.find((b) => Number(b.hour) === 18)!; // 10:00 UTC = 18:00 Manila
     const tokyo = bucket10.brands.find((b) => b.brandId === brandAId);
     const seoul = bucket10.brands.find((b) => b.brandId === brandBId);
     expect(tokyo, "Tokyo House missing from hour 10 bucket").toBeTruthy();
@@ -717,7 +718,7 @@ describe("GET /api/v1/analytics/orders-by-hour-by-brand", () => {
       hour: number;
       brands: Array<{ brandId: string; brandName: string; count: number }>;
     }>;
-    const bucket14 = body.find((b) => Number(b.hour) === 14)!;
+    const bucket14 = body.find((b) => Number(b.hour) === 22)!; // 14:00 UTC = 22:00 Manila
     const tokyo = bucket14.brands.find((b) => b.brandId === brandAId);
     const seoul = bucket14.brands.find((b) => b.brandId === brandBId);
     expect(Number(seoul!.count)).toBe(1);
@@ -734,7 +735,7 @@ describe("GET /api/v1/analytics/orders-by-hour-by-brand", () => {
       hour: number;
       brands: Array<{ brandId: string; brandName: string; count: number }>;
     }>;
-    const bucket11 = body.find((b) => Number(b.hour) === 11)!;
+    const bucket11 = body.find((b) => Number(b.hour) === 19)!; // 11:00 UTC = 19:00 Manila
     const tokyo = bucket11.brands.find((b) => b.brandId === brandAId);
     expect(Number(tokyo!.count)).toBe(1);
   });

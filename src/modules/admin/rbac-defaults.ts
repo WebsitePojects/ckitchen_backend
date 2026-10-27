@@ -32,6 +32,8 @@ export const PAGE_ROLES: Readonly<Record<string, readonly string[]>> = {
   // Overview
   "/": ["OUTLET_MANAGER", "BRAND_MANAGER"],
   "/orders": ["OUTLET_MANAGER", "BRAND_MANAGER", "KITCHEN_CREW", "ACCOUNTING"],
+  // POS order entry (tablet-keyed aggregator orders + walk-ins); same people who logged orders before.
+  "/pos": ["OUTLET_MANAGER", "BRAND_MANAGER", "KITCHEN_CREW"],
   "/kitchen": ["OUTLET_MANAGER", "KITCHEN_CREW"],
   "/printers": ["OUTLET_MANAGER", "KITCHEN_CREW"],
   "/tv": ["OUTLET_MANAGER", "KITCHEN_CREW"],

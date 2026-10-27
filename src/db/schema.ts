@@ -392,6 +392,10 @@ export const menuItems = pgTable(
     imageUrl: text("image_url"),
     itemNo: text("item_no"),
     remarks: text("remarks"),
+    /** Menu section shown on aggregator apps and the POS screen (e.g. "Fun Chow", "Milktea"). Migration 0041. */
+    category: text("category"),
+    /** Customer-facing description from the brand's menu sheet. Migration 0041. */
+    description: text("description"),
   },
   (table) => [
     index("menu_item_brand_id_idx").on(table.brandId),
@@ -682,6 +686,10 @@ export const orderItems = pgTable(
      * streams' service work; this column only adds the storage.
      */
     componentSnapshot: jsonb("component_snapshot"),
+    /** Menu price at the moment the order was placed; reports use this, never the live price. Migration 0041. */
+    unitPrice: numeric("unit_price", { precision: 14, scale: 2 }),
+    /** Recipe food cost per unit at order time (sum of portion x ingredient unit cost). Migration 0041. */
+    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }),
   },
   (table) => [
     index("order_item_order_id_idx").on(table.orderId),

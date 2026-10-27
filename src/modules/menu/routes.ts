@@ -40,6 +40,10 @@ const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 const imageUrlField = z.string().url().startsWith("https://").max(2048);
 const itemNoField = z.string().trim().min(1).max(32);
 const remarksField = z.string().trim().max(500);
+// Menu section (e.g. "Fun Chow"); groups tiles on the POS screen. Empty string = clear.
+const categoryField = z.string().trim().max(60);
+// Customer-facing description from the brand's menu sheet (aggregator apps cap it at 140).
+const descriptionField = z.string().trim().max(500);
 
 /**
  * Rejects a duplicate product number within the same brand (unique per brand,
@@ -71,6 +75,8 @@ const createMenuItemSchema = z.object({
   image_url: imageUrlField.optional(),
   item_no: itemNoField.optional(),
   remarks: remarksField.optional(),
+  category: categoryField.optional(),
+  description: descriptionField.optional(),
 });
 
 const updateMenuItemSchema = z
@@ -84,6 +90,8 @@ const updateMenuItemSchema = z
     image_url: imageUrlField.nullable().optional(),
     item_no: itemNoField.nullable().optional(),
     remarks: remarksField.nullable().optional(),
+    category: categoryField.nullable().optional(),
+    description: descriptionField.nullable().optional(),
   })
   .refine((body) => Object.keys(body).some((k) => body[k as keyof typeof body] !== undefined), {
     message: "At least one field is required.",
@@ -171,6 +179,8 @@ export function createMenuRouter(db: DB): Router {
         imageUrl: parsed.data.image_url,
         itemNo: parsed.data.item_no,
         remarks: parsed.data.remarks,
+        category: parsed.data.category || null,
+        description: parsed.data.description || null,
       })
       .returning();
 
@@ -234,6 +244,8 @@ export function createMenuRouter(db: DB): Router {
     if (parsed.data.image_url !== undefined) updates.imageUrl = parsed.data.image_url;
     if (parsed.data.item_no !== undefined) updates.itemNo = parsed.data.item_no;
     if (parsed.data.remarks !== undefined) updates.remarks = parsed.data.remarks;
+    if (parsed.data.category !== undefined) updates.category = parsed.data.category || null;
+    if (parsed.data.description !== undefined) updates.description = parsed.data.description || null;
 
     const [updated] = await db
       .update(menuItems)

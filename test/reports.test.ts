@@ -41,6 +41,7 @@ import { loadConfig } from "../src/config.js";
 import { signToken } from "../src/modules/auth/service.js";
 import { aggregatorAccounts, brands, users } from "../src/db/schema.js";
 import { menuItemOutlets } from "../src/db/enterprise-schema.js";
+import { localDate, localMonthRange } from "../src/modules/business-time.js";
 
 let app: Express;
 let db: DB;
@@ -265,14 +266,14 @@ describe("GET /api/v1/reports/sales — date range", () => {
     expect(res.body.error.code).toBe("VALIDATION_ERROR");
   });
 
-  it("defaults to the current UTC calendar month when from/to are omitted", async () => {
+  it("defaults to the current business month (Manila, 05:00 day start) when from/to are omitted", async () => {
     const res = await request(app)
       .get("/api/v1/reports/sales")
       .set("Authorization", `Bearer ${adminToken}`);
     expect(res.status).toBe(200);
 
-    const now = new Date();
-    const expectedFrom = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+    const [year, month] = localDate().split("-").map(Number);
+    const expectedFrom = localMonthRange(year!, month!).start.toISOString();
     expect(res.body.from).toBe(expectedFrom);
     expect(res.body.group_by).toBe("day");
   });

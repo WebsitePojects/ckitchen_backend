@@ -5,6 +5,7 @@ import { verifyToken } from "./service.js";
 import { normalizeRole, outletScopeForRole, type OutletScope } from "./roles.js";
 import { userSessions, type User } from "../../db/schema.js";
 import type { DB } from "../../db/client.js";
+import { isSessionKnownValid, rememberValidSession } from "./session-cache.js";
 
 export interface AuthenticatedUser {
   id: string;
@@ -81,7 +82,9 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     const payload = verifyToken(token, jwtSecret);
 
     // Session revocation check (only for tokens minted with a session id).
-    if (payload.sid) {
+    // A positive answer is cached for a few seconds (session-cache.ts) so this check does
+    // not cost a database round trip on every request.
+    if (payload.sid && !isSessionKnownValid(payload.sid)) {
       const db = req.app.get("db") as DB | undefined;
       if (db) {
         const [session] = await db
@@ -92,6 +95,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
           sendError(res, 401, "AUTH_REQUIRED", "Session ended. Please log in again.");
           return;
         }
+        rememberValidSession(payload.sid, payload.sub);
       }
     }
 

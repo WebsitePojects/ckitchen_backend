@@ -21,6 +21,7 @@ import type { DB } from "../../db/client.js";
 import { attendanceRecords, attendanceTypeEnum, employees } from "../../db/schema.js";
 import { sendError } from "../http-errors.js";
 import { recordAttendancePunch } from "./attendance-shared.js";
+import { localDayRange } from "../business-time.js";
 
 const publicPunchSchema = z.object({
   employee_id: z.string().uuid(),
@@ -76,8 +77,8 @@ export function createPublicAttendanceRouter(db: DB): Router {
       .where(eq(employees.status, "ACTIVE"));
 
     const now = new Date();
-    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-    const endOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+    // Business-local (Manila) day: a 07:30 TIME_IN must still count after 08:00 (UTC midnight).
+    const { start: startOfDay, end: endOfDay } = localDayRange(now);
     const stateRows = await db
       .select({
         employeeId: attendanceRecords.employeeId,

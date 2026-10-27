@@ -27,6 +27,7 @@
 import { sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { parseRangeBoundary } from "../date-range.js";
+import { BUSINESS_TZ_SQL } from "../business-time.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -82,9 +83,16 @@ export interface AggregatorAnalytics {
 export interface BrandMargin {
   brand_id: string;
   name: string;
+  /** Sum of what each line actually sold for (order_item.unit_price), cancelled orders excluded. */
   revenue: number;
+  /** Food cost frozen at order time (order_item.unit_cost). */
   recipe_cost_total: number;
+  /** Gross food margin: revenue - recipe_cost_total. */
   margin: number;
+  /** Aggregator commission on that revenue, from each order's frozen commission rate. */
+  commission: number;
+  /** What the brand actually keeps: revenue - recipe_cost_total - commission. */
+  net_margin: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +151,8 @@ export async function getBrandsAnalytics(
            ON o.brand_id   = b.id
           AND o.placed_at >= ${fromDate.toISOString()}
           AND o.placed_at <= ${toDate.toISOString()}
+          -- A cancelled order earned nothing; it must not inflate revenue or AOV.
+          AND o.status <> 'CANCELLED'
     GROUP BY b.id, b.name
     ORDER BY COALESCE(SUM(o.total::numeric), 0) DESC NULLS LAST
   `);
@@ -174,7 +184,8 @@ export async function getBrandsAnalytics(
 // ---------------------------------------------------------------------------
 
 /**
- * Returns only hours that had at least one order on the given UTC date.
+ * Returns only hours that had at least one order on the given business-local date
+ * (hours are business-local too, see business-time.ts).
  * Sparse array — hours with no orders are omitted (peak-load view).
  */
 export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrderCount[]> {
@@ -183,17 +194,15 @@ export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrder
   const startOfDay = parseRangeBoundary(date, "from");
   const endOfDay = parseRangeBoundary(date, "to");
 
-  // EXTRACT on TIMESTAMPTZ in PostgreSQL/PGlite is relative to the session timezone.
-  // PGlite defaults to UTC, and we store all timestamps as UTC, so this is correct.
-  // The explicit AT TIME ZONE 'UTC' ensures correctness even if session TZ differs.
+  // Hours are bucketed in the business timezone (Manila), not UTC, so 7pm means 7pm.
   const raw = await db.execute(sql`
     SELECT
-      EXTRACT(HOUR FROM placed_at AT TIME ZONE 'UTC')::integer AS hour,
+      EXTRACT(HOUR FROM placed_at AT TIME ZONE ${BUSINESS_TZ_SQL})::integer AS hour,
       COUNT(id)::integer                                        AS order_count
     FROM "order"
     WHERE placed_at >= ${startOfDay.toISOString()}
       AND placed_at <= ${endOfDay.toISOString()}
-    GROUP BY EXTRACT(HOUR FROM placed_at AT TIME ZONE 'UTC')
+    GROUP BY EXTRACT(HOUR FROM placed_at AT TIME ZONE ${BUSINESS_TZ_SQL})
     ORDER BY hour
   `);
 
@@ -247,7 +256,7 @@ export async function getOrdersByHourByBrand(db: DB, date: string): Promise<Hour
            ON o.brand_id   = b.id
           AND o.placed_at >= ${startOfDay.toISOString()}
           AND o.placed_at <= ${endOfDay.toISOString()}
-          AND EXTRACT(HOUR FROM o.placed_at AT TIME ZONE 'UTC')::integer = h.hour
+          AND EXTRACT(HOUR FROM o.placed_at AT TIME ZONE ${BUSINESS_TZ_SQL})::integer = h.hour
     GROUP BY h.hour, b.id, b.name
     ORDER BY h.hour, b.name
   `);
@@ -304,6 +313,7 @@ export async function getAggregatorsAnalytics(
     FROM "order"
     WHERE placed_at >= ${fromDate.toISOString()}
       AND placed_at <= ${toDate.toISOString()}
+      AND status <> 'CANCELLED'
     GROUP BY aggregator
     ORDER BY revenue DESC
   `);
@@ -323,11 +333,15 @@ export async function getAggregatorsAnalytics(
 /**
  * Per-brand margin using recipe costing (CK1-ARC-002 §5.2):
  *
- *   recipe_cost(menu_item) = Σ over recipe_lines of (portion_qty × ingredient.unit_cost)
- *   margin(menu_item)      = price − recipe_cost
- *   brand revenue          = Σ(order_item.qty × menu_item.price)        for orders in range
- *   brand recipe_cost_total= Σ(order_item.qty × recipe_cost)            for orders in range
- *   brand margin           = brand revenue − brand recipe_cost_total
+ *   brand revenue          = Σ(qty × order_item.unit_price)   price frozen at order time
+ *   brand recipe_cost_total= Σ(qty × order_item.unit_cost)    food cost frozen at order time
+ *   brand margin           = revenue − recipe_cost_total       (gross food margin)
+ *   brand commission       = Σ(qty × unit_price × rate / 100) rate frozen on the order
+ *   brand net_margin       = margin − commission
+ *
+ * Cancelled orders are excluded. Rows from before migration 0041 fall back to the live
+ * menu price / recipe cost; an order with no frozen commission rate falls back to the
+ * listing's current rate, else 0.
  *
  * Uses a two-CTE query:
  *   1. recipe_costs  — pre-computes recipe_cost per menu_item
@@ -354,22 +368,39 @@ export async function getMarginsAnalytics(
       GROUP BY rl.menu_item_id
     ),
     filtered_items AS (
-      SELECT oi.menu_item_id, oi.qty
+      SELECT
+        oi.menu_item_id,
+        oi.qty,
+        oi.unit_price,
+        oi.unit_cost,
+        COALESCE(o.commission_rate_snapshot::numeric, aa.commission_rate::numeric, 0) AS commission_rate
       FROM order_item oi
       JOIN "order" o ON o.id = oi.order_id
+      LEFT JOIN aggregator_account aa ON aa.id = o.aggregator_account_id
       WHERE o.placed_at >= ${fromDate.toISOString()}
         AND o.placed_at <= ${toDate.toISOString()}
+        AND o.status <> 'CANCELLED'
+    ),
+    lines AS (
+      SELECT
+        mi.brand_id,
+        fi.qty * COALESCE(fi.unit_price::numeric, mi.price::numeric)                AS line_revenue,
+        fi.qty * COALESCE(fi.unit_cost::numeric, rc.recipe_cost, 0)                AS line_cost,
+        fi.qty * COALESCE(fi.unit_price::numeric, mi.price::numeric) * fi.commission_rate / 100 AS line_commission
+      FROM filtered_items fi
+      JOIN menu_item mi ON mi.id = fi.menu_item_id
+      LEFT JOIN recipe_costs rc ON rc.menu_item_id = fi.menu_item_id
     )
     SELECT
       b.id AS brand_id,
       b.name,
-      COALESCE(SUM(fi.qty * mi.price::numeric),                   0) AS revenue,
-      COALESCE(SUM(fi.qty * COALESCE(rc.recipe_cost, 0)),         0) AS recipe_cost_total,
-      COALESCE(SUM(fi.qty * (mi.price::numeric - COALESCE(rc.recipe_cost, 0))), 0) AS margin
+      COALESCE(SUM(l.line_revenue), 0)                                        AS revenue,
+      COALESCE(SUM(l.line_cost), 0)                                           AS recipe_cost_total,
+      COALESCE(SUM(l.line_revenue - l.line_cost), 0)                          AS margin,
+      COALESCE(SUM(l.line_commission), 0)                                     AS commission,
+      COALESCE(SUM(l.line_revenue - l.line_cost - l.line_commission), 0)      AS net_margin
     FROM brand b
-    LEFT JOIN menu_item mi ON mi.brand_id = b.id
-    LEFT JOIN recipe_costs rc ON rc.menu_item_id = mi.id
-    LEFT JOIN filtered_items fi ON fi.menu_item_id = mi.id
+    LEFT JOIN lines l ON l.brand_id = b.id
     GROUP BY b.id, b.name
   `);
 
@@ -379,6 +410,8 @@ export async function getMarginsAnalytics(
     revenue: string | number;
     recipe_cost_total: string | number;
     margin: string | number;
+    commission: string | number;
+    net_margin: string | number;
   };
 
   return toRows<MarginRow>(raw).map((row) => ({
@@ -387,6 +420,8 @@ export async function getMarginsAnalytics(
     revenue: Number(row.revenue),
     recipe_cost_total: Number(row.recipe_cost_total),
     margin: Number(row.margin),
+    commission: Number(row.commission),
+    net_margin: Number(row.net_margin),
   }));
 }
 
@@ -400,8 +435,8 @@ export async function getMarginsAnalytics(
  * existed via getBrandsAnalytics; this is the product side).
  *
  *   qtySold = Σ(order_item.qty)                     for orders in range
- *   revenue = qtySold × menu_item.price              (price is per-item, so
- *                                                      this equals Σ(qty × price) per line)
+ *   revenue = Σ(qty × order_item.unit_price)          price frozen at order time
+ *                                                      (live menu price only for pre-0041 rows)
  *   orders  = COUNT(DISTINCT order_id)  containing this menu item, in range
  *
  * Defaults to the same all-time DEFAULT_FROM/DEFAULT_TO window as the
@@ -429,7 +464,7 @@ export async function getProductPerformance(
 
   const raw = await db.execute(sql`
     WITH filtered_items AS (
-      SELECT oi.menu_item_id, oi.order_id, oi.qty
+      SELECT oi.menu_item_id, oi.order_id, oi.qty, oi.unit_price
       FROM order_item oi
       JOIN "order" o ON o.id = oi.order_id
       WHERE o.placed_at >= ${fromDate.toISOString()}
@@ -442,7 +477,7 @@ export async function getProductPerformance(
       mi.brand_id,
       b.name                                        AS brand_name,
       COALESCE(SUM(fi.qty), 0)::integer             AS qty_sold,
-      COALESCE(SUM(fi.qty * mi.price::numeric), 0)  AS revenue,
+      COALESCE(SUM(fi.qty * COALESCE(fi.unit_price::numeric, mi.price::numeric)), 0) AS revenue,
       COUNT(DISTINCT fi.order_id)::integer          AS orders
     FROM menu_item mi
     JOIN brand b ON b.id = mi.brand_id

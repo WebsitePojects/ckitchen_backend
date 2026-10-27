@@ -37,6 +37,7 @@ import { createFoodpandaPluginRouter } from "./modules/foodpanda/routes.js";
 import { getGrabPartnerBasePath } from "./modules/grab/config.js";
 import { createGrabPartnerRouter } from "./modules/grab/routes.js";
 import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
+import compression from "compression";
 
 /**
  * Express app factory.
@@ -56,6 +57,11 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   // chain lets a client spoof its IP and trips express-rate-limit's
   // ERR_ERL_PERMISSIVE_TRUST_PROXY safety guard.
   app.set("trust proxy", 1);
+
+  // Compress JSON responses (order, menu and report lists can be hundreds of KB). Over a
+  // kitchen tablet's mobile connection, transfer size dominates page load time. Responses
+  // under 1 KB are left alone because compressing them costs more than it saves.
+  app.use(compression({ threshold: 1024 }));
 
   // SF-3 (audit-backend.md HIGH "no helmet"): security headers. CSP is mostly
   // inert for a JSON-only API (no HTML/script is ever served), but img-src is

@@ -288,6 +288,13 @@
       "when": 1785500300000,
       "tag": "0040_aggregator_account_active_external_id_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1785500400000,
+      "tag": "0041_order_item_money_snapshot_menu_category",
+      "breakpoints": true
     }
   ]
 }

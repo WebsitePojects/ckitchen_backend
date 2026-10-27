@@ -8,6 +8,7 @@ import { signToken, verifyPassword, fakeVerifyPassword } from "./service.js";
 import { requireAuth } from "./middleware.js";
 import { normalizeRole, outletScopeForRole } from "./roles.js";
 import { audit } from "../ems/audit.js";
+import { forgetSession } from "./session-cache.js";
 
 function sendError(
   res: import("express").Response,
@@ -150,6 +151,7 @@ export function createAuthRouter(db: DB): Router {
         .update(userSessions)
         .set({ logoutAt: new Date() })
         .where(eq(userSessions.id, sid));
+      forgetSession(sid);
 
       // Audit the logout (non-blocking)
       void audit(db, {

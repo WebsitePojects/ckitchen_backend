@@ -18,6 +18,8 @@
  * src/modules/reports/routes.ts (GET /reports/sales + /reports/sales/export).
  */
 
+import { localDayEnd, localDayStart } from "./business-time.js";
+
 /** Matches a date-only param exactly: YYYY-MM-DD, nothing more. */
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -32,9 +34,9 @@ const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
  */
 export function parseRangeBoundary(value: string, boundary: "from" | "to"): Date {
   if (DATE_ONLY_RE.test(value)) {
-    return new Date(
-      boundary === "from" ? `${value}T00:00:00.000Z` : `${value}T23:59:59.999Z`,
-    );
+    // The business day, not the UTC day: "2026-10-27" means Manila's 27th
+    // (2026-10-26T16:00Z .. 2026-10-27T15:59:59.999Z). See business-time.ts.
+    return boundary === "from" ? localDayStart(value) : localDayEnd(value);
   }
   return new Date(value);
 }

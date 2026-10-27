@@ -51,7 +51,7 @@
  *        deduped lowstock events).
  */
 import { randomBytes } from "node:crypto";
-import { and, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { menuItemOutlets, operationalFeatureFlags } from "../../db/enterprise-schema.js";
 import {
@@ -170,6 +170,72 @@ export interface IngestResult {
 export interface IngestOrderOptions {
   /** null = HQ/all scope; array = server-resolved outlet memberships. */
   allowedLocationIds?: string[] | null;
+  /**
+   * The outlet the caller is working in (server-verified X-Outlet-Id). A walk-in
+   * (aggregator OTHER) is taken at that outlet, so it picks/creates the brand's
+   * walk-in listing there.
+   */
+  workingLocationId?: string | null;
+}
+
+/**
+ * Resolves the outlet a walk-in is taken at: the caller's working outlet when the brand
+ * runs there, else the brand's only outlet. A multi-outlet brand with no working outlet
+ * is ambiguous and refused rather than guessed (business-rules #7).
+ */
+async function resolveWalkInLocation(
+  db: DB,
+  brand: { id: string; name: string; locationId: string | null },
+  workingLocationId: string | null | undefined,
+): Promise<string> {
+  const deployments = (
+    await db
+      .select({ locationId: brandOutlet.locationId })
+      .from(brandOutlet)
+      .where(and(eq(brandOutlet.brandId, brand.id), eq(brandOutlet.isActive, true)))
+  ).map((d) => d.locationId);
+  const outlets = deployments.length > 0 ? deployments : brand.locationId ? [brand.locationId] : [];
+  if (workingLocationId && outlets.includes(workingLocationId)) return workingLocationId;
+  if (outlets.length === 1) return outlets[0]!;
+  if (outlets.length === 0) throw new ListingMappingRequiredError(`${brand.name} is not deployed to any outlet yet.`);
+  throw new ListingMappingRequiredError(
+    `${brand.name} runs in ${outlets.length} outlets. Select the outlet you are working in before taking a walk-in.`,
+  );
+}
+
+/**
+ * Get-or-create the brand's walk-in listing at an outlet. Walk-ins need a listing like any
+ * other channel (idempotency, reports, commission = none), but real brands are created
+ * without one, which made every walk-in fail. The external id is deterministic, so two
+ * cashiers creating it at the same moment collide on the active-listing unique index
+ * (migration 0040) and both reuse the winner.
+ */
+async function ensureWalkInListing(db: DB, brandId: string, locationId: string) {
+  const externalMerchantId = `WALKIN-${brandId}-${locationId}`;
+  await db
+    .insert(aggregatorAccounts)
+    .values({
+      brandId,
+      aggregator: "OTHER",
+      externalMerchantId,
+      credentialRef: "walk-in",
+      locationId,
+      mappingStatus: "RESOLVED",
+      isActive: true,
+    })
+    .onConflictDoNothing();
+  const [listing] = await db
+    .select()
+    .from(aggregatorAccounts)
+    .where(
+      and(
+        eq(aggregatorAccounts.aggregator, "OTHER"),
+        eq(aggregatorAccounts.externalMerchantId, externalMerchantId),
+        eq(aggregatorAccounts.isActive, true),
+      ),
+    );
+  if (!listing) throw new ListingMappingRequiredError("The walk-in channel could not be prepared. Try again.");
+  return listing;
 }
 
 export interface LowStockEvent {
@@ -368,7 +434,7 @@ export async function ingestOrder(
   // Must happen BEFORE the idempotency check: idempotency is scoped to the
   // listing (aggregator_account_id), not the raw aggregator enum, so the
   // account has to be resolved first (Rule #5, listing-scoped variant).
-  const allCandidates = input.aggregator_account_id
+  let allCandidates = input.aggregator_account_id
     ? await db
         .select()
         .from(aggregatorAccounts)
@@ -390,10 +456,17 @@ export async function ingestOrder(
             eq(aggregatorAccounts.isActive, true),
           ),
         );
+  // Walk-in without an explicit listing: use (or create) the brand's walk-in listing at
+  // the outlet where the order is taken. Picking by outlet also keeps a brand with walk-in
+  // listings in several outlets from being "ambiguous".
+  if (input.aggregator === "OTHER" && !input.aggregator_account_id) {
+    const walkInLocationId = await resolveWalkInLocation(db, brand, options.workingLocationId);
+    const atOutlet = allCandidates.filter((c) => c.locationId === walkInLocationId);
+    allCandidates = atOutlet.length > 0 ? atOutlet : [await ensureWalkInListing(db, brand.id, walkInLocationId)];
+  }
+
   if (allCandidates.length === 0) {
-    throw new NotFoundError(
-      `No aggregator account found for brand ${input.brand_id} + ${input.aggregator}.`,
-    );
+    throw new NotFoundError(`${brand.name} has no active ${input.aggregator} listing. Add one under Channel Listings.`);
   }
 
   const resolvedCandidates = allCandidates.filter(
@@ -612,8 +685,11 @@ export async function ingestOrder(
   const lines =
     requestedMenuItemIds.length > 0
       ? await db
-          .select()
+          // The ingredient's current unit cost rides along on the same query so each order
+          // line can freeze its food cost (order_item.unit_cost) without an extra round trip.
+          .select({ ...getTableColumns(recipeLines), ingredientUnitCost: ingredients.unitCost })
           .from(recipeLines)
+          .innerJoin(ingredients, eq(ingredients.id, recipeLines.ingredientId))
           .where(inArray(recipeLines.menuItemId, requestedMenuItemIds))
       : [];
 
@@ -642,6 +718,16 @@ export async function ingestOrder(
         uom: line.unit,
       })),
     );
+  }
+
+  // Food cost per unit of each menu item at order time (0 for an item with no recipe).
+  const unitCostByMenuItem = new Map<string, string>();
+  for (const menuItemId of requestedMenuItemIds) {
+    const cost = (linesByMenuItem.get(menuItemId) ?? []).reduce(
+      (sum, line) => sum + Number(line.portionQty) * Number(line.ingredientUnitCost ?? 0),
+      0,
+    );
+    unitCostByMenuItem.set(menuItemId, cost.toFixed(4));
   }
 
   const requiredByIngredient = new Map<string, number>();
@@ -802,6 +888,10 @@ export async function ingestOrder(
             // componentSnapshotByMenuItem above) — [] for a zero-recipe menu
             // item, never null, for every order created through this path.
             componentSnapshot: componentSnapshotByMenuItem.get(item.menuItemId) ?? [],
+            // Migration 0041: what this line sold for and cost at order time, so a later
+            // menu price or supplier cost change never rewrites past revenue or margins.
+            unitPrice: item.price,
+            unitCost: unitCostByMenuItem.get(item.menuItemId) ?? "0",
           })),
         );
 

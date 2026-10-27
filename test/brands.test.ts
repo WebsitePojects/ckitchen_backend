@@ -250,12 +250,12 @@ describe("Brand activity — ?detail=daily&month= (client review 2026-07-08)", (
       .send({ aggregator: "FOODPANDA", external_merchant_id: "FP-DAILY", credential_ref: "daily-ref" });
     const accountId = accRes.body.id as string;
 
-    // Seed orders DIRECTLY so placed_at lands on exact UTC days of 2026-03.
+    // Seed orders DIRECTLY so placed_at lands on exact business days (Manila, 05:00 cutoff) of 2026-03.
     await db.insert(orders).values([
       { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-1", total: "100.50", status: "COMPLETED", placedAt: new Date("2026-03-05T10:00:00Z") },
-      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-2", total: "49.50", status: "NEW", placedAt: new Date("2026-03-05T22:30:00Z") },
+      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-2", total: "49.50", status: "NEW", placedAt: new Date("2026-03-05T15:30:00Z") }, // 23:30 Manila, Mar 5
       { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-3", total: "999.00", status: "CANCELLED", cancelReason: "test", placedAt: new Date("2026-03-05T12:00:00Z") },
-      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-4", total: "25.00", status: "COMPLETED", placedAt: new Date("2026-03-31T23:59:00Z") },
+      { brandId, aggregatorAccountId: accountId, aggregator: "FOODPANDA", externalRef: "daily-4", total: "25.00", status: "COMPLETED", placedAt: new Date("2026-03-31T19:00:00Z") }, // 03:00 Manila Apr 1 = Mar 31 business day
     ]);
   });
 

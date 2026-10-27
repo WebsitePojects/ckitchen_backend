@@ -79,6 +79,23 @@ export interface CreateDbOptions {
  * Stays a plain sync function (no async/Promise) so existing call sites — including every
  * test's `createDb()` with no args — keep working unchanged.
  */
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/**
+ * TLS is required for every database except a LOCAL one that explicitly opts out with
+ * `?sslmode=disable` (e.g. the Docker Postgres used for QA). A remote host never gets
+ * plaintext, even if its URL asks for it, so a copy-pasted URL cannot downgrade production.
+ */
+export function sslOptionFor(databaseUrl: string): "require" | false {
+  try {
+    const url = new URL(databaseUrl);
+    if (url.searchParams.get("sslmode") === "disable" && LOOPBACK_HOSTS.has(url.hostname)) return false;
+  } catch {
+    /* unparseable URL: keep the safe default */
+  }
+  return "require";
+}
+
 export function createDb(opts?: string | CreateDbOptions) {
   // Back-compat: `createDb(dataDir?)` (a plain string or undefined), as called by every
   // existing test and by server.ts/seed.ts/migrate.ts today.
@@ -86,7 +103,7 @@ export function createDb(opts?: string | CreateDbOptions) {
     typeof opts === "string" || opts === undefined ? { dataDir: opts, databaseUrl: undefined } : opts;
 
   if (isPostgresUrl(databaseUrl)) {
-    const client = postgres(databaseUrl, { prepare: false, ssl: "require", max: 10 });
+    const client = postgres(databaseUrl, { prepare: false, ssl: sslOptionFor(databaseUrl), max: 10 });
     const db = drizzlePostgres(client, { schema });
     return { client, db };
   }

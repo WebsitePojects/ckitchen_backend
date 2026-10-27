@@ -164,6 +164,8 @@ export function createOrdersRouter(db: DB, hub: RealtimeHub): Router {
       const result = await ingestOrder(db, parsed.data as IngestOrderInput, {
         allowedLocationIds:
           req.outletContext?.scope === "ALL" ? null : (req.outletContext?.outletIds ?? []),
+        // Verified by resolveOutletContext (present only if the caller may use it).
+        workingLocationId: req.outletContext?.selectedOutletId ?? null,
       });
 
       // DUPLICATE_ORDER → 200 (idempotent replay, not an error)

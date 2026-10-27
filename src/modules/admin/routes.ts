@@ -50,6 +50,7 @@ import {
   PAGE_KEYS,
   defaultAllowed,
 } from "./rbac-defaults.js";
+import { forgetUserSessions } from "../auth/session-cache.js";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -150,6 +151,7 @@ async function revokeSessions(db: DB, userId: string): Promise<void> {
     .update(userSessions)
     .set({ logoutAt: new Date() })
     .where(and(eq(userSessions.userId, userId), isNull(userSessions.logoutAt)));
+  forgetUserSessions(userId);
 }
 
 // ---------------------------------------------------------------------------

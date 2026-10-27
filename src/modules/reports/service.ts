@@ -36,6 +36,7 @@
 import { eq, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { operationalFeatureFlags } from "../../db/enterprise-schema.js";
+import { businessDateSql } from "../business-time.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -203,7 +204,7 @@ export async function getSalesReport(
   if (groupBy === "day") {
     raw = await db.execute(sql`
       SELECT
-        TO_CHAR(o.placed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS key,
+        ${businessDateSql(sql`o.placed_at`)} AS key,
         COUNT(o.id)::integer AS orders_count,
         COALESCE(SUM(o.total::numeric), 0) AS gross_sales,
         ROUND(
@@ -220,7 +221,7 @@ export async function getSalesReport(
         AND o.placed_at >= ${from.toISOString()}
         AND o.placed_at <= ${to.toISOString()}
         ${scopeCondition}
-      GROUP BY TO_CHAR(o.placed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')
+      GROUP BY ${businessDateSql(sql`o.placed_at`)}
       ORDER BY key ASC
     `);
   } else if (groupBy === "brand") {

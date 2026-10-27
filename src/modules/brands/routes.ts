@@ -23,6 +23,7 @@ import { requireAuth, requireRole, resolveOutletContext } from "../auth/middlewa
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { audit } from "../ems/audit.js";
 import { paramAsString, sendError } from "../http-errors.js";
+import { businessDateSql, localMonthRange } from "../business-time.js";
 
 const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 /** Deploying a brand to an outlet / deactivating it is an OWNER (HQ) action. */
@@ -455,8 +456,9 @@ export function createBrandsRouter(db: DB): Router {
         return;
       }
 
-      const monthStart = new Date(Date.UTC(year, month - 1, 1));
-      const nextMonthStart = new Date(Date.UTC(year, month, 1));
+      // Business-local month (Manila), matching the per-day grouping below.
+      const { start: monthStart, end: monthEnd } = localMonthRange(year, month);
+      const nextMonthStart = new Date(monthEnd.getTime() + 1);
       const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
 
       // The month's activity-log rows (same row shape as the default `events`).
@@ -473,7 +475,8 @@ export function createBrandsRouter(db: DB): Router {
         .orderBy(asc(brandActivityLog.changedAt));
 
       // ONE grouped query: per-UTC-day order count + revenue, CANCELLED excluded.
-      const dayExpr = sql<string>`to_char(${orders.placedAt} AT TIME ZONE 'UTC', 'YYYY-MM-DD')`;
+      // Business date (05:00 cutoff), matching the month bounds above.
+      const dayExpr = sql<string>`${businessDateSql(sql`${orders.placedAt}`)}`;
       const orderRows = await db
         .select({
           date: dayExpr,

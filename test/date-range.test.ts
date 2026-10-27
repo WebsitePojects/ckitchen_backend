@@ -26,6 +26,7 @@ import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
 import { parseRangeBoundary } from "../src/modules/date-range.js";
+import { localDate, localDayEnd, localDayStart } from "../src/modules/business-time.js";
 
 let app: Express;
 let db: DB;
@@ -39,7 +40,8 @@ let orderId: string;
 const placedAt = new Date();
 const placedAtIso = placedAt.toISOString();
 /** Today's DATE-ONLY string — exactly what the frontend date picker sends. */
-const today = placedAtIso.slice(0, 10);
+// The business-local (Manila) date, which is what a date-only param now means.
+const today = localDate(placedAt);
 
 async function login(email: string, password: string): Promise<string> {
   const res = await request(app).post("/api/v1/auth/login").send({ email, password });
@@ -113,15 +115,15 @@ beforeAll(async () => {
 // ---------------------------------------------------------------------------
 
 describe("parseRangeBoundary (shared helper)", () => {
-  it("expands a date-only 'from' to start of the UTC day", () => {
+  it("expands a date-only 'from' to the start of the business day (05:00 Manila)", () => {
     expect(parseRangeBoundary("2026-07-08", "from").toISOString()).toBe(
-      "2026-07-08T00:00:00.000Z",
+      "2026-07-07T21:00:00.000Z",
     );
   });
 
-  it("expands a date-only 'to' to end of the UTC day", () => {
+  it("expands a date-only 'to' to the end of the business day (04:59:59.999 Manila next day)", () => {
     expect(parseRangeBoundary("2026-07-08", "to").toISOString()).toBe(
-      "2026-07-08T23:59:59.999Z",
+      "2026-07-08T20:59:59.999Z",
     );
   });
 
@@ -266,8 +268,8 @@ describe("reports count an order COMPLETED today when from=to are date-only", ()
     expect(res.body.totals.orders_count).toBe(1);
     expect(Number(res.body.totals.gross_sales)).toBeCloseTo(250, 2);
     // Echoed range reflects the expanded full-day bounds
-    expect(res.body.from).toBe(`${today}T00:00:00.000Z`);
-    expect(res.body.to).toBe(`${today}T23:59:59.999Z`);
+    expect(res.body.from).toBe(localDayStart(today).toISOString());
+    expect(res.body.to).toBe(localDayEnd(today).toISOString());
   });
 
   it("GET /reports/sales/export?format=xlsx", async () => {

@@ -338,15 +338,20 @@ export function createAdminRouter(db: DB): Router {
 
     // Invite through Clerk so they get an email to set up their sign-in. A failed invite
     // does not undo the account: the owner can resend it (POST /admin/users/:id/invite).
+    // The link is returned to this owner only (never logged) so it can be sent by chat when
+    // the invitation email does not arrive.
     let invitation: "sent" | "failed" | "not_configured" = "not_configured";
+    let inviteUrl: string | null = null;
     if (clerk) {
       try {
-        invitation = (await sendClerkInvitation(email, clerk)) ? "sent" : "not_configured";
+        const sent = await sendClerkInvitation(email, clerk);
+        invitation = sent ? "sent" : "not_configured";
+        inviteUrl = sent?.url ?? null;
       } catch {
         invitation = "failed";
       }
     }
-    res.status(201).json({ ...toPublicUser(created!), invitation });
+    res.status(201).json({ ...toPublicUser(created!), invitation, inviteUrl });
   });
 
   // ── PATCH /admin/users/:id ────────────────────────────────────────────────
@@ -543,8 +548,9 @@ export function createAdminRouter(db: DB): Router {
       sendError(res, 409, "ALREADY_LINKED", `${user.name} has already signed in; no invitation needed.`);
       return;
     }
+    let inviteUrl: string | null = null;
     try {
-      await sendClerkInvitation(user.email, clerk);
+      inviteUrl = (await sendClerkInvitation(user.email, clerk))?.url ?? null;
     } catch {
       sendError(res, 503, "INVITE_FAILED", "The invitation could not be sent. Try again in a moment.");
       return;
@@ -558,7 +564,7 @@ export function createAdminRouter(db: DB): Router {
       entityType: "user",
       entityId: id,
     });
-    res.json({ ok: true, invitation: "sent" });
+    res.json({ ok: true, invitation: "sent", inviteUrl });
   });
 
   // ── PUT /admin/users/:id/outlets ──────────────────────────────────────────

@@ -28,7 +28,11 @@ try {
         process.exitCode = 1;
       } else {
         console.log(`[owner:grant] ${result.outcome}; invitation: ${result.invitation}`);
-        if (result.invitation === "sent") console.log("[owner:grant] check that inbox for the Clerk invitation, then sign in with Google or an email code.");
+        if (result.invitation === "sent") {
+          console.log("[owner:grant] check that inbox for the Clerk invitation, then sign in with Google or an email code.");
+          // Operator's own terminal only: the link signs up this one email, so send it privately.
+          if (result.inviteUrl) console.log(`[owner:grant] or open this private sign-up link: ${result.inviteUrl}`);
+        }
       }
     }
   } else if (command === "retire-seeds") {

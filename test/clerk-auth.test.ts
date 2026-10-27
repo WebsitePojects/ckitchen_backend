@@ -23,7 +23,7 @@ vi.mock("../src/modules/auth/clerk.js", () => ({
   verifiedPrimaryEmail: async (clerkUserId: string) => clerkState.emails.get(clerkUserId) ?? null,
   sendClerkInvitation: async (email: string) => {
     clerkState.invited.push(email);
-    return true;
+    return { url: `https://accounts.example/invite?for=${encodeURIComponent(email)}` };
   },
 }));
 
@@ -45,7 +45,7 @@ async function addStaff(email: string, role = "KITCHEN_CREW") {
     .set("Authorization", `Bearer ${ownerToken}`)
     .send({ name: email.split("@")[0], email, role });
   expect(res.status, JSON.stringify(res.body)).toBe(201);
-  return res.body as { id: string; invitation: string };
+  return res.body as { id: string; invitation: string; inviteUrl?: string | null };
 }
 
 beforeAll(async () => {
@@ -64,6 +64,16 @@ describe("Clerk sign-in", () => {
     const created = await addStaff("Cook.One@Example.com");
     expect(created.invitation).toBe("sent");
     expect(clerkState.invited).toContain("cook.one@example.com"); // normalised
+    // The owner gets the link too, to send by chat when the email does not arrive.
+    expect(created.inviteUrl).toContain("accounts.example/invite");
+  });
+
+  it("resend invite returns the link again for someone who has not signed in yet", async () => {
+    const created = await addStaff("Waiting.Cook@Example.com");
+    const res = await request(app).post(`/api/v1/admin/users/${created.id}/invite`).set("Authorization", `Bearer ${ownerToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, invitation: "sent" });
+    expect(res.body.inviteUrl).toContain("accounts.example/invite");
   });
 
   it("first sign-in links by verified email; later requests resolve by Clerk id with the ORION role", async () => {

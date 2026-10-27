@@ -17,7 +17,7 @@ let app: Express;
 const invites: string[] = [];
 const fakeInvite = async (email: string) => {
   invites.push(email);
-  return true;
+  return { url: `https://accounts.example/invite?for=${encodeURIComponent(email)}` };
 };
 const byEmail = async (email: string) => (await db.select().from(users).where(sql`lower(${users.email}) = ${email}`))[0];
 
@@ -31,6 +31,7 @@ describe("grantFirstOwner", () => {
   it("creates a password-less OWNER for a real email and sends the invitation", async () => {
     const result = await grantFirstOwner(db, { email: "  Boss@Kitchen-Biz.PH ", name: "Sir Boss" }, fakeInvite);
     expect(result).toMatchObject({ outcome: "created", invitation: "sent" });
+    expect(result.outcome === "created" && result.inviteUrl).toContain("accounts.example/invite");
     const row = await byEmail("boss@kitchen-biz.ph");
     expect(row).toMatchObject({ role: "OWNER", status: "ACTIVE", email: "boss@kitchen-biz.ph" });
     expect(invites).toContain("boss@kitchen-biz.ph");

@@ -110,16 +110,23 @@ export async function verifiedPrimaryEmail(clerkUserId: string, settings: ClerkS
 }
 
 /**
- * Sends a Clerk invitation email so the person can create their sign-in. Idempotent:
- * an existing invitation or account is not an error. Returns false when Clerk is off.
+ * Sends a Clerk invitation email so the person can create their sign-in, and returns the
+ * invitation link so the owner can also send it by chat (invitation emails do not always
+ * arrive). The link signs up that one email only; return it to the inviting owner, never log
+ * it. Idempotent: an existing invitation or account is not an error. Null when Clerk is off.
  */
-export async function sendClerkInvitation(email: string, settings: ClerkSettings | null): Promise<boolean> {
-  if (!settings || clerkConfigProblem(settings)) return false;
-  await clerk(settings).invitations.createInvitation({
+export async function sendClerkInvitation(email: string, settings: ClerkSettings | null): Promise<{ url: string | null } | null> {
+  if (!settings || clerkConfigProblem(settings)) return null;
+  const client = clerk(settings);
+  const created = await client.invitations.createInvitation({
     emailAddress: email,
     ignoreExisting: true,
     notify: true,
     ...(settings.signInUrl ? { redirectUrl: settings.signInUrl } : {}),
   });
-  return true;
+  if (created.url) return { url: created.url };
+  // An existing pending invitation can come back without its link; read it from the list.
+  const pending = await client.invitations.getInvitationList({ query: email, status: "pending" });
+  const match = pending.data.find((inv) => inv.emailAddress.toLowerCase() === email.toLowerCase() && inv.url);
+  return { url: match?.url ?? null };
 }

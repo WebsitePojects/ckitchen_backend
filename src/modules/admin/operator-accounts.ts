@@ -21,10 +21,16 @@ import { audit } from "../ems/audit.js";
 const OPERATOR_ACTOR = "operator (server CLI)";
 
 export type GrantOwnerResult =
-  | { outcome: "created" | "already_owner"; userId: string; invitation: "sent" | "already_linked" | "not_configured" }
+  | {
+      outcome: "created" | "already_owner";
+      userId: string;
+      invitation: "sent" | "already_linked" | "not_configured";
+      /** Sign-up link for this email, to send by chat when the email does not arrive. */
+      inviteUrl?: string | null;
+    }
   | { outcome: "refused"; reason: string };
 
-export type InviteSender = (email: string) => Promise<boolean>;
+export type InviteSender = (email: string) => Promise<{ url: string | null } | null>;
 
 const defaultInvite: InviteSender = (email) => sendClerkInvitation(email, clerkSettings());
 
@@ -68,7 +74,9 @@ export async function grantFirstOwner(
 
   if (user.clerkUserId) return { outcome, userId: user.id, invitation: "already_linked" };
   const sent = await invite(email);
-  return { outcome, userId: user.id, invitation: sent ? "sent" : "not_configured" };
+  return sent
+    ? { outcome, userId: user.id, invitation: "sent", inviteUrl: sent.url }
+    : { outcome, userId: user.id, invitation: "not_configured" };
 }
 
 /** Seed/demo accounts: any user on a reserved, undeliverable domain such as cloudkitchen.local. */

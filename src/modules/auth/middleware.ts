@@ -83,8 +83,11 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     }
     req.user = result.user;
     next();
-  } catch {
+  } catch (err) {
     // Any unexpected failure (e.g. the database is unreachable) fails closed: 401, never 500.
+    // Log the error class and driver code only: Drizzle messages embed SQL params (emails).
+    const cause = (err as { cause?: { code?: string } } | null)?.cause;
+    console.error(`[auth] authentication error: ${err instanceof Error ? err.name : typeof err}${cause?.code ? ` (${cause.code})` : ""}`);
     sendError(res, 401, "AUTH_REQUIRED", "Invalid or expired token.");
   }
 }

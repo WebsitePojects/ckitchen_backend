@@ -69,11 +69,19 @@ export async function verifyClerkSessionToken(token: string, settings: ClerkSett
       jwtKey: settings.jwtKey,
       authorizedParties: settings.authorizedParties,
     });
-    if (result.errors || !result.data) return null;
+    if (result.errors || !result.data) {
+      // Log the reason codes (e.g. "session-token-expired"), never the token, so a sign-in
+      // that keeps failing can be diagnosed from the server log.
+      const errors: Array<{ reason?: string }> = Array.isArray(result.errors) ? result.errors : [];
+      const reasons = errors.map((e) => e.reason).join(", ") || "no token data";
+      console.warn(`[auth] Clerk session token rejected: ${reasons}`);
+      return null;
+    }
     // `sub` is the standard JWT subject (the Clerk user id); checked at runtime below.
     const sub = (result.data as { sub?: unknown }).sub;
     return typeof sub === "string" && sub.length > 0 ? sub : null;
-  } catch {
+  } catch (err) {
+    console.warn(`[auth] Clerk session token verification failed: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }

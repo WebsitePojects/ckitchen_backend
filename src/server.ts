@@ -19,7 +19,8 @@ import { Server as IOServer } from "socket.io";
 import { createApp } from "./app.js";
 import { loadConfig, isPostgresUrl } from "./config.js";
 import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
-import { createDb } from "./db/client.js";
+import type postgres from "postgres";
+import { createDb, keepPoolWarm } from "./db/client.js";
 import { runMigrations } from "./db/migrate.js";
 import { createSocketHub } from "./realtime/hub.js";
 import { getGrabPartnerConfigProblem } from "./modules/grab/config.js";
@@ -38,7 +39,8 @@ if (clerkProblem) console.error(`[auth] CONFIG ERROR: ${clerkProblem}`);
 else if (clerk) console.log(`[auth] Clerk sign-in enabled for: ${clerk.authorizedParties.join(", ")}`);
 else console.log("[auth] Clerk not configured: password login only.");
 
-const { db } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUrl });
+const { db, client } = createDb({ dataDir: config.dbPath, databaseUrl: config.databaseUrl });
+if (isPostgresUrl(config.databaseUrl)) keepPoolWarm(client as postgres.Sql);
 
 // DB target banner — make it impossible to miss WHICH database this process talks to.
 // A silent, uncommented cloud DATABASE_URL in .env once caused local "dev" runs to mutate

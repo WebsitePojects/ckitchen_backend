@@ -55,9 +55,19 @@ export function createOutletsRouter(db: DB): Router {
   const router = Router();
 
   router.get("/outlets", requireAuth, async (_req, res) => {
-    const outletRows = await db.select().from(locations);
-    const response = await Promise.all(outletRows.map((outlet) => withWarehouses(db, outlet)));
-    res.json(response);
+    // Two queries in parallel instead of one warehouse query per outlet (N+1). Both tables
+    // hold a handful of rows per business, so reading every warehouse is the cheap side.
+    const [outletRows, warehouseRows] = await Promise.all([
+      db.select().from(locations),
+      db.select().from(warehouses),
+    ]);
+    const byOutlet = new Map<string, (typeof warehouseRows)[number][]>();
+    for (const warehouse of warehouseRows) {
+      const list = byOutlet.get(warehouse.locationId) ?? [];
+      list.push(warehouse);
+      byOutlet.set(warehouse.locationId, list);
+    }
+    res.json(outletRows.map((outlet) => ({ ...outlet, warehouses: byOutlet.get(outlet.id) ?? [] })));
   });
 
   router.get("/outlets/:id", requireAuth, async (req, res) => {

@@ -8,9 +8,9 @@
  *     `user` row. First sign-in links the Clerk account to the ORION user whose email
  *     matches the VERIFIED Clerk email. Anyone not invited is refused.
  */
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, isNull, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
-import { users, userSessions, userOutletAccess } from "../../db/schema.js";
+import { users, userSessions } from "../../db/schema.js";
 import { loadConfig } from "../../config.js";
 import { audit } from "../ems/audit.js";
 import { verifyToken, type AuthTokenPayload } from "./service.js";
@@ -74,16 +74,36 @@ async function authenticateOrionToken(db: DB | undefined, payload: AuthTokenPayl
 
 type UserRow = typeof users.$inferSelect;
 
+/**
+ * The ORION user for a Clerk id plus their outlet ids, in ONE round trip: every cache miss
+ * pays it, and the database is ~229 ms away from the API (Paris to Tokyo).
+ * The outer reference is written as "user"."id" on purpose: Drizzle prints a bare "id"
+ * for ${users.id} in a single-table select, which would bind to the subquery's own table.
+ */
+async function findClerkUser(db: DB, clerkUserId: string): Promise<{ user: UserRow; outletIds: string[] } | undefined> {
+  const [row] = await db
+    .select({
+      user: getTableColumns(users),
+      outletIds: sql<string[]>`coalesce((select array_agg(a.location_id) from user_outlet_access a where a.user_id = "user"."id"), '{}')`,
+    })
+    .from(users)
+    .where(eq(users.clerkUserId, clerkUserId));
+  return row;
+}
+
 async function resolveClerkUser(db: DB, clerkUserId: string, settings: ClerkSettings): Promise<AuthResult> {
   const cached = cachedClerkIdentity<AuthenticatedUser>(clerkUserId);
   if (cached) return { ok: true, user: cached };
 
-  let [user] = await db.select().from(users).where(eq(users.clerkUserId, clerkUserId));
-  if (!user) {
+  let found = await findClerkUser(db, clerkUserId);
+  if (!found) {
+    // First sign-in only: link by verified email, then read the account the same way.
     const linked = await linkByVerifiedEmail(db, clerkUserId, settings);
     if (!linked.ok) return linked;
-    user = linked.user;
+    found = await findClerkUser(db, clerkUserId);
+    if (!found) return INVALID;
   }
+  const { user, outletIds } = found;
 
   if (user.status === "BLOCKED") {
     return { ok: false, status: 403, code: "ACCOUNT_BLOCKED", message: "This account has been blocked. Contact the owner." };
@@ -92,15 +112,11 @@ async function resolveClerkUser(db: DB, clerkUserId: string, settings: ClerkSett
     return { ok: false, status: 403, code: "ROLE_RETIRED", message: "This account's role has been retired. Contact the owner." };
   }
 
-  const access = await db
-    .select({ locationId: userOutletAccess.locationId })
-    .from(userOutletAccess)
-    .where(eq(userOutletAccess.userId, user.id));
   const authenticated: AuthenticatedUser = {
     id: user.id,
     role: user.role,
     outletScope: outletScopeForRole(user.role),
-    outletIds: access.map((a) => a.locationId),
+    outletIds,
     name: user.name,
   };
   rememberClerkIdentity(clerkUserId, user.id, authenticated);

@@ -98,6 +98,10 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
     cors({
       origin: corsOriginCallback(isOriginAllowed),
       exposedHeaders: ["Content-Disposition"],
+      // Every signed-in request carries Authorization, so browsers send a preflight first.
+      // Without Max-Age they re-ask every 5 s, adding a full round trip (~233 ms from the
+      // Philippines to the Paris VPS) to almost every call. Chrome caps this at 2 h.
+      maxAge: 7200,
     }),
   );
 

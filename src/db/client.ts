@@ -96,6 +96,26 @@ export function sslOptionFor(databaseUrl: string): "require" | false {
   return "require";
 }
 
+/**
+ * Keeps `size` pooled connections open and recently used, for a remote Postgres only.
+ *
+ * Opening a connection costs TCP + TLS + auth round trips; with the database far from the
+ * API (Paris VPS to Tokyo Supabase, ~229 ms each) that is 1-3 s, measured on production
+ * 2026-10-28, and it landed on whichever user request found the pool empty or a connection
+ * recycled. Pinging `size` connections in parallel at start and every `intervalMs` keeps
+ * them ready. Failures are logged, never thrown: a ping is not a request.
+ */
+export function keepPoolWarm(client: postgres.Sql, size = 4, intervalMs = 60_000): () => void {
+  const ping = () =>
+    Promise.all(Array.from({ length: size }, () => client`select 1`)).catch((err: unknown) => {
+      console.warn(`[db] keep-warm ping failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  void ping();
+  const timer = setInterval(() => void ping(), intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
 export function createDb(opts?: string | CreateDbOptions) {
   // Back-compat: `createDb(dataDir?)` (a plain string or undefined), as called by every
   // existing test and by server.ts/seed.ts/migrate.ts today.

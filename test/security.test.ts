@@ -93,6 +93,25 @@ describe("CORS allowlist (SF-3: replaces wildcard '*')", () => {
     const res = await request(app).get("/api/v1/health");
     expect(res.status).toBe(200);
   });
+
+  it("lets browsers cache the preflight for 2 h, so signed-in calls skip an extra round trip", async () => {
+    const res = await request(app)
+      .options("/api/v1/auth/me")
+      .set("Origin", DEFAULT_PROD_ORIGIN)
+      .set("Access-Control-Request-Method", "GET")
+      .set("Access-Control-Request-Headers", "authorization,x-outlet-id");
+    expect(res.status).toBe(204);
+    expect(res.headers["access-control-allow-origin"]).toBe(DEFAULT_PROD_ORIGIN);
+    expect(res.headers["access-control-max-age"]).toBe("7200");
+  });
+
+  it("an unrecognized origin's preflight gets no CORS grant", async () => {
+    const res = await request(app)
+      .options("/api/v1/auth/me")
+      .set("Origin", "https://evil.example.com")
+      .set("Access-Control-Request-Method", "GET");
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------

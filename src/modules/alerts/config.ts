@@ -34,6 +34,16 @@ export function isEmailAddress(value: string): boolean {
   return EMAIL_RE.test(value);
 }
 
+/**
+ * Reserved, never-deliverable domains (RFC 2606 / 6761), e.g. the seeded admin@cloudkitchen.local.
+ * Sending to them only produces bounces, which damage the sender domain's reputation.
+ */
+const UNDELIVERABLE_TLD_RE = /\.(local|localhost|test|example|invalid)$/i;
+
+export function isDeliverableEmail(value: string): boolean {
+  return isEmailAddress(value) && !UNDELIVERABLE_TLD_RE.test(value);
+}
+
 function minutes(env: Env, name: string, fallback: number): number | string {
   const raw = env[name]?.trim();
   if (!raw) return fallback;

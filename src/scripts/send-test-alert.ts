@@ -23,7 +23,7 @@ const { db, client } = createDb({ dataDir: config.dbPath, databaseUrl: config.da
 try {
   const queued = await queueTestEmail(db, alerts.settings, new Date());
   if (!queued) {
-    console.error("[alerts:test] no recipients: no ACTIVE OWNER user and ALERT_EMAIL_TO is empty");
+    console.error("[alerts:test] no recipients: no ACTIVE OWNER with a real email (test domains like .local are skipped) and ALERT_EMAIL_TO is empty");
     process.exitCode = 1;
   } else {
     const result = await deliverAlertEmails(db, alerts.settings, createResendSender(), new Date());

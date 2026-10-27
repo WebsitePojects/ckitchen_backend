@@ -109,6 +109,8 @@ beforeAll(async () => {
   ).body.id;
   menuItemId = (await request(app).post(`/api/v1/brands/${brandId}/menu`).set(auth()).send({ name: "Alert Bowl", price: "150", station_id: stations[0]!.id })).body.id;
 
+  await db.insert(users).values({ name: "Real Owner", email: "owner@kitchen-alerts.ph", passwordHash: "x", role: "OWNER" });
+
   const all = await db.select().from(warehouses);
   kitchenWarehouseId = all.find((w) => w.type === "KITCHEN")!.id;
   mainWarehouseId = all.find((w) => w.type === "MAIN" && w.locationId === all.find((k) => k.id === kitchenWarehouseId)!.locationId)!.id;
@@ -231,7 +233,8 @@ describe("digest composing", () => {
 
     const emails = await db.select().from(alertEmails);
     expect(emails).toHaveLength(1);
-    expect(emails[0]!.recipients).toEqual(expect.arrayContaining(["admin@cloudkitchen.local", "ops@example.com"]));
+    // The seeded owner (admin@cloudkitchen.local) is a reserved, undeliverable domain: never emailed.
+    expect(emails[0]!.recipients).toEqual(["owner@kitchen-alerts.ph", "ops@example.com"]);
     expect(emails[0]!.subject).toMatch(/order.* not started/);
     expect(emails[0]!.subject).toMatch(/low on stock/);
     expect((await db.select().from(alertEvents)).every((e) => e.emailId === emails[0]!.id)).toBe(true);

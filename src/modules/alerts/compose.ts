@@ -11,7 +11,7 @@ import type { DB } from "../../db/client.js";
 import { toRows } from "../../db/rows.js";
 import { alertEmails, alertEvents, users } from "../../db/schema.js";
 import { BUSINESS_TIMEZONE } from "../business-time.js";
-import { isEmailAddress, type AlertSettings } from "./config.js";
+import { isDeliverableEmail, type AlertSettings } from "./config.js";
 import { renderAlertDigest } from "./render.js";
 
 /** Resend accepts at most 50 recipients per email. */
@@ -21,14 +21,14 @@ const MAX_ALERTS_PER_EMAIL = 100;
 /** Arbitrary constant naming the "compose alert digest" critical section for pg advisory locks. */
 const COMPOSE_LOCK_KEY = 4402440;
 
-/** Active owners plus ALERT_EMAIL_TO, lower-cased and de-duplicated. */
+/** Active owners plus ALERT_EMAIL_TO, lower-cased, de-duplicated, undeliverable test domains dropped. */
 export async function alertRecipients(db: DB, settings: AlertSettings): Promise<string[]> {
   const owners = await db
     .select({ email: users.email })
     .from(users)
     .where(and(eq(users.role, "OWNER"), eq(users.status, "ACTIVE")));
   const all = [...owners.map((o) => o.email.trim().toLowerCase()), ...settings.extraRecipients];
-  return [...new Set(all.filter(isEmailAddress))].slice(0, MAX_RECIPIENTS);
+  return [...new Set(all.filter(isDeliverableEmail))].slice(0, MAX_RECIPIENTS);
 }
 
 export type ComposeResult =

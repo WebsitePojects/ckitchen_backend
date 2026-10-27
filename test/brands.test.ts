@@ -96,6 +96,27 @@ describe("GET /api/v1/brands", () => {
     expect(names).toContain("Seoul Bowl");
   });
 
+  it("includes each brand's menu item count (one query, used by the Menu page brand list)", async () => {
+    const created = await request(app)
+      .post("/api/v1/brands")
+      .set("Authorization", `Bearer ${adminToken}`)
+      .send({ name: "Counted Brand", color: "#123456" });
+    const brandId = created.body.id as string;
+    for (const name of ["Adobo Bowl", "Sinigang Bowl"]) {
+      const item = await request(app)
+        .post(`/api/v1/brands/${brandId}/menu`)
+        .set("Authorization", `Bearer ${adminToken}`)
+        .send({ name, price: 199 });
+      expect(item.status).toBe(201);
+    }
+
+    const listRes = await request(app).get("/api/v1/brands").set("Authorization", `Bearer ${adminToken}`);
+    const counted = listRes.body.find((b: { id: string }) => b.id === brandId);
+    expect(counted.menuItemCount).toBe(2);
+    const fresh = listRes.body.find((b: { name: string }) => b.name === "Seoul Bowl");
+    expect(fresh.menuItemCount).toBe(0);
+  });
+
   it("filters by is_active", async () => {
     const createRes = await request(app)
       .post("/api/v1/brands")

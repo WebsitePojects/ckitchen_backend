@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { and, asc, eq, gte, inArray, lt, lte, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, gte, inArray, lt, lte, ne, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -163,10 +163,18 @@ export function createBrandsRouter(db: DB): Router {
       );
     }
 
+    // Item count per brand in the same query (indexed menu_item.brand_id): the Menu page lists
+    // every brand with its count, so this must not become one request per brand.
+    const columns = {
+      ...getTableColumns(brands),
+      // Outer column written out: Drizzle prints ${brands.id} as a bare "id" here, which the
+      // subquery would resolve to menu_item.id.
+      menuItemCount: sql<number>`(select count(*)::int from menu_item m where m.brand_id = "brand"."id")`,
+    };
     const rows =
       conditions.length > 0
-        ? await db.select().from(brands).where(and(...conditions))
-        : await db.select().from(brands);
+        ? await db.select(columns).from(brands).where(and(...conditions))
+        : await db.select(columns).from(brands);
 
     res.json(rows);
   });

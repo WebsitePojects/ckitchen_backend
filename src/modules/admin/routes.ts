@@ -30,6 +30,7 @@ import type { DB } from "../../db/client.js";
 import {
   auditLogs,
   brands,
+  employees,
   locations,
   orders,
   rolePageAccess,
@@ -242,21 +243,27 @@ export function createAdminRouter(db: DB): Router {
   router.get("/admin/users", async (_req, res) => {
     const userRows = await db.select().from(users);
 
-    // Batch the per-user relations, stitch in JS (small cardinality).
-    const [sessions, access, brands] = await Promise.all([
-      db.select({ userId: userSessions.userId, loginAt: userSessions.loginAt }).from(userSessions),
+    // Batch the per-user relations, stitch in JS. Last login is aggregated in SQL: the session
+    // table grows with every sign-in, so reading all of it to find one max per user does not scale.
+    const [sessions, access, brands, linkedEmployees] = await Promise.all([
+      db
+        .select({ userId: userSessions.userId, loginAt: sql<Date | null>`max(${userSessions.loginAt})`.mapWith((v) => (v ? new Date(v) : null)) })
+        .from(userSessions)
+        .groupBy(userSessions.userId),
       db
         .select({ userId: userOutletAccess.userId, locationId: userOutletAccess.locationId })
         .from(userOutletAccess),
       db.select({ userId: userBrands.userId, brandId: userBrands.brandId }).from(userBrands),
+      db
+        .select({ userId: employees.userId, id: employees.id, fullName: employees.fullName })
+        .from(employees)
+        .where(sql`${employees.userId} IS NOT NULL`),
     ]);
 
     const lastLogin = new Map<string, Date>();
-    for (const s of sessions) {
-      if (!s.loginAt) continue;
-      const prev = lastLogin.get(s.userId);
-      if (!prev || s.loginAt > prev) lastLogin.set(s.userId, s.loginAt);
-    }
+    for (const s of sessions) if (s.loginAt) lastLogin.set(s.userId, s.loginAt);
+    // One login belongs to at most one employee (D58), so this map is one-to-one.
+    const employeeByUser = new Map(linkedEmployees.map((e) => [e.userId!, { id: e.id, fullName: e.fullName }]));
     const outletsByUser = new Map<string, string[]>();
     for (const a of access) {
       const arr = outletsByUser.get(a.userId) ?? [];
@@ -282,6 +289,8 @@ export function createAdminRouter(db: DB): Router {
       brandIds: brandsByUser.get(u.id) ?? [],
       // Whether this person has signed in with Clerk yet (drives "Resend invite" in the UI).
       clerkLinked: u.clerkUserId !== null,
+      // The employee record this login belongs to, or null for a login nobody is linked to.
+      employee: employeeByUser.get(u.id) ?? null,
     }));
 
     res.json(result);

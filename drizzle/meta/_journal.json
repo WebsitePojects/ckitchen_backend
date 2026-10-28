@@ -365,6 +365,13 @@
       "when": 1785501400000,
       "tag": "0051_quantity_standard_and_units",
       "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1785501500000,
+      "tag": "0052_employee_login_link_and_performance_notes",
+      "breakpoints": true
     }
   ]
 }

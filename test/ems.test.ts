@@ -8,7 +8,7 @@
  *   - POST /auth/logout — sets logout_at on session and writes auth.logout audit entry
  *   - POST /orders/:id/advance — writes order.advance audit row with actor + sessionId
  *   - GET /audit?session_id= — returns only that session's audit rows
- *   - GET /ems/analytics/employee/:userId — counts actions for the actor
+ *   (per-employee system activity now lives in employee-access.test.ts, D58)
  */
 import { beforeAll, describe, expect, it } from "vitest";
 import request from "supertest";
@@ -483,97 +483,5 @@ describe("GET /api/v1/audit", () => {
       const second = new Date(rows[1]!.createdAt).getTime();
       expect(first).toBeGreaterThanOrEqual(second);
     }
-  });
-});
-
-describe("GET /api/v1/ems/analytics/employee/:userId", () => {
-  it("SUPER_ADMIN can view any user's analytics", async () => {
-    const [kitchenUser] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, "kitchen_staff@cloudkitchen.local"));
-
-    const res = await request(app)
-      .get(`/api/v1/ems/analytics/employee/${kitchenUser.id}`)
-      .set("Authorization", `Bearer ${adminToken}`);
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty("totalActions");
-    expect(res.body).toHaveProperty("orderAdvances");
-    expect(res.body).toHaveProperty("sessions");
-    expect(res.body.userId).toBe(kitchenUser.id);
-  });
-
-  it("user can view their own analytics", async () => {
-    // Login as kitchen staff to get their own token
-    const loginRes = await request(app)
-      .post("/api/v1/auth/login")
-      .send({ email: "kitchen_staff@cloudkitchen.local", password: "password123" });
-    const ksToken = loginRes.body.token as string;
-
-    const [kitchenUser] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, "kitchen_staff@cloudkitchen.local"));
-
-    const res = await request(app)
-      .get(`/api/v1/ems/analytics/employee/${kitchenUser.id}`)
-      .set("Authorization", `Bearer ${ksToken}`);
-    expect(res.status).toBe(200);
-    expect(res.body.userId).toBe(kitchenUser.id);
-  });
-
-  it("user cannot view another user's analytics → 403", async () => {
-    const [adminUser] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, "admin@cloudkitchen.local"));
-
-    const res = await request(app)
-      .get(`/api/v1/ems/analytics/employee/${adminUser.id}`)
-      .set("Authorization", `Bearer ${kitchenToken}`);
-    expect(res.status).toBe(403);
-  });
-
-  it("reflects order.advance count after advancing orders", async () => {
-    // Use kitchen staff to advance an order
-    const loginRes = await request(app)
-      .post("/api/v1/auth/login")
-      .send({ email: "kitchen_staff@cloudkitchen.local", password: "password123" });
-    const ksToken = loginRes.body.token as string;
-
-    const [kitchenUser] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, "kitchen_staff@cloudkitchen.local"));
-
-    // Get baseline count
-    const baseRes = await request(app)
-      .get(`/api/v1/ems/analytics/employee/${kitchenUser.id}`)
-      .set("Authorization", `Bearer ${adminToken}`);
-    const baseAdvances = baseRes.body.orderAdvances as number;
-
-    // Advance a fresh order
-    const ingestRes = await request(app)
-      .post("/api/v1/ingest/order")
-      .set("Authorization", `Bearer ${adminToken}`)
-      .send({
-        brand_id: brandId,
-        aggregator: "FOODPANDA",
-        external_ref: nextRef(),
-        items: [{ menu_item_id: grillItemId, qty: 1 }],
-      });
-    const orderId = ingestRes.body.order_id as string;
-
-    await request(app)
-      .post(`/api/v1/orders/${orderId}/advance`)
-      .set("Authorization", `Bearer ${ksToken}`);
-
-    // Wait for non-blocking audit write
-    await new Promise((r) => setTimeout(r, 80));
-
-    const afterRes = await request(app)
-      .get(`/api/v1/ems/analytics/employee/${kitchenUser.id}`)
-      .set("Authorization", `Bearer ${adminToken}`);
-    expect(afterRes.body.orderAdvances).toBeGreaterThan(baseAdvances);
   });
 });

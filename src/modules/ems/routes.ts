@@ -2,12 +2,15 @@
  * EMS Routes — CK1-EMS-005 (E1 + E2-core + E3 attendance/DTR)
  *
  * Endpoints:
- *   GET  /employees                          — list (filter status/department/location_id)
- *   POST /employees                          — create (OWNER, or OUTLET_MANAGER scoped to their outlet)
- *   PATCH /employees/:id                     — partial update (OWNER, or OUTLET_MANAGER scoped to their outlet)
+ *   GET  /employees                          — list (filter status/department/location_id/access)
+ *   POST /employees                          — create (OWNER/HR, or OUTLET_MANAGER scoped to their outlet)
+ *   PATCH /employees/:id                     — partial update (same roles as create)
  *   GET  /employees/:id/profile              — Employee 360 month calendar + stats
  *   GET  /audit                              — audit trail (SUPER_ADMIN/BRAND_MANAGER)
- *   GET  /ems/analytics/employee/:userId     — per-staff analytics (self or admin)
+ *
+ * System access (D58): an employee either has a login (`access: SYSTEM_USER`, employee.user_id
+ * set) or not (`STAFF_ONLY`). Only an OWNER grants, links or unlinks a login; see
+ * employee-access.ts. Everyone clocks in the same way, whatever their access.
  *
  * E3 attendance (CK1-EMS-005 §3):
  *   POST /ems/attendance                     — record TIME_IN or TIME_OUT with Cloudinary photo
@@ -15,7 +18,7 @@
  *   GET  /ems/attendance/dtr                 — paired DTR view with worked_minutes
  */
 import { Router, type Request, type Response } from "express";
-import { and, asc, count, desc, eq, gte, inArray, isNull, lte, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lte, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
@@ -27,37 +30,27 @@ import {
   employees,
   locations,
   roleEnum,
-  userSessions,
+  userOutletAccess,
   users,
 } from "../../db/schema.js";
+import { isUniqueViolation } from "../../db/pg-errors.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope, listScopeLocationIds, resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { normalizeRole } from "../auth/roles.js";
 import { hashPassword } from "../auth/service.js";
 import { sendError } from "../http-errors.js";
 import { pairDtrEntries, recordAttendancePunch, type DtrEntry } from "./attendance-shared.js";
-import { localDate, localDayRange, localMonthRange } from "../business-time.js";
+import { localDate, localDayEnd, localDayRange, localDayStart, localMonthRange } from "../business-time.js";
+import { audit } from "./audit.js";
+import { EMPLOYEE_READ_ROLES, resolveReadableEmployee } from "./employee-scope.js";
 
 // ---------------------------------------------------------------------------
 // Unified employee + login-account creation (client-critical)
 // ---------------------------------------------------------------------------
 
-/**
- * Detects a PostgreSQL unique-violation (23505) surfaced through PGlite/
- * postgres-js/drizzle error wrapping — same helper shape used in
- * orders/service.ts, customer-orders/service.ts, production/service.ts.
- */
-function isUniqueViolation(err: unknown): boolean {
-  if (err && typeof err === "object") {
-    const e = err as Record<string, unknown>;
-    if (e["code"] === "23505") return true;
-    if (e["cause"] && typeof e["cause"] === "object") {
-      const cause = e["cause"] as Record<string, unknown>;
-      if (cause["code"] === "23505") return true;
-    }
-  }
-  return false;
-}
+/** Unique indexes whose violation has its own answer (migrations 0048, 0052). */
+const EMPLOYEE_NO_UNIQUE = "employee_employee_no_unique";
+const EMPLOYEE_LOGIN_LINK_UNIQUE = "employee_user_link_unique";
 
 /**
  * Internal-only signal thrown inside the POST /employees/:id/account
@@ -180,11 +173,26 @@ const updateEmployeeSchema = z.object({
 });
 
 /**
- * Roles allowed to create/edit employee rows. OWNER (HQ) is unrestricted;
- * OUTLET_MANAGER is ASSIGNED-scope and may only target outlets in their
+ * Roles allowed to create/edit employee rows. OWNER and HR (HQ, ALL scope) are
+ * unrestricted; OUTLET_MANAGER is ASSIGNED-scope and may only target outlets in their
  * `user_outlet_access` membership (enforced via {@link isOutletInScope} below).
+ * Giving an employee a LOGIN is narrower: OWNER only (see requireOwnerForLogin).
  */
-const EMPLOYEE_WRITE_ROLES = ["OWNER", "OUTLET_MANAGER"] as const;
+const EMPLOYEE_WRITE_ROLES = ["OWNER", "HR", "OUTLET_MANAGER"] as const;
+
+/** Derived, never stored, so it cannot drift from employee.user_id (D58). */
+function accessOf(userId: string | null): "SYSTEM_USER" | "STAFF_ONLY" {
+  return userId ? "SYSTEM_USER" : "STAFF_ONLY";
+}
+
+/**
+ * Gives a newly created login the outlet its employee works at, so the login can act there
+ * at once instead of landing with no outlet in scope. ALL-scope roles ignore the row.
+ */
+async function grantEmployeeOutlet(tx: Pick<DB, "insert">, userId: string, locationId: string | null): Promise<void> {
+  if (!locationId) return;
+  await tx.insert(userOutletAccess).values({ userId, locationId }).onConflictDoNothing();
+}
 
 const createAttendanceSchema = z.object({
   employee_id: z.string().uuid(),
@@ -200,41 +208,14 @@ const createAttendanceSchema = z.object({
 export function createEmsRouter(db: DB): Router {
   const router = Router();
 
-  async function resolveReadableEmployee(req: Request, res: Response, employeeId: string, invalidStatus: 400 | 404) {
-    if (!UUID_RE.test(employeeId)) {
-      sendError(
-        res,
-        invalidStatus,
-        invalidStatus === 400 ? "VALIDATION_ERROR" : "NOT_FOUND",
-        invalidStatus === 400 ? "employee_id must be a valid UUID." : `Employee ${employeeId} not found.`,
-      );
-      return null;
-    }
-
-    const [emp] = await db
-      .select({ id: employees.id, locationId: employees.locationId, userId: employees.userId })
-      .from(employees)
-      .where(eq(employees.id, employeeId));
-    if (!emp) {
-      sendError(res, 404, "NOT_FOUND", `Employee ${employeeId} not found.`);
-      return null;
-    }
-
-    // A person may always read their own record (e.g. a cook's own punches on the Attendance
-    // page). Without this, an employee with no outlet set (location_id null) was outside
-    // everyone's scope except OWNER, including their own.
-    const isSelf = emp.userId !== null && emp.userId === req.user!.id;
-    if (!isSelf && req.outletContext?.scope !== "ALL" && !isOutletInScope(req.outletContext, emp.locationId)) {
-      sendError(res, 403, "FORBIDDEN", "Employee is outside your access scope.");
-      return null;
-    }
-
-    return emp;
-  }
-
   // ── GET /employees ────────────────────────────────────────────────────────
-  router.get("/employees", requireAuth, resolveOutletContext, async (req, res) => {
+  router.get("/employees", requireAuth, requireRole(...EMPLOYEE_READ_ROLES), resolveOutletContext, async (req, res) => {
     const statusParam = req.query.status as string | undefined;
+    const accessParam = req.query.access as string | undefined;
+    if (accessParam !== undefined && accessParam !== "SYSTEM_USER" && accessParam !== "STAFF_ONLY") {
+      sendError(res, 400, "VALIDATION_ERROR", "Invalid access. Valid: SYSTEM_USER, STAFF_ONLY.");
+      return;
+    }
     const departmentParam = req.query.department as string | undefined;
     const locationIdParam = req.query.location_id as string | undefined;
 
@@ -270,20 +251,25 @@ export function createEmsRouter(db: DB): Router {
     }
     if (statusParam) conditions.push(eq(employees.status, statusParam as typeof employeeStatusEnum.enumValues[number]));
     if (departmentParam) conditions.push(eq(employees.department, departmentParam as typeof departmentEnum.enumValues[number]));
+    if (accessParam === "SYSTEM_USER") conditions.push(isNotNull(employees.userId));
+    if (accessParam === "STAFF_ONLY") conditions.push(isNull(employees.userId));
 
-    // Left-joined so every row carries hasLogin/userEmail (unified employee +
-    // login-account creation, client-critical) without an N+1 lookup.
+    // Left-joined so every row carries its login (email, role, status) without an N+1 lookup.
     const rows = await db
-      .select({ employee: employees, userEmail: users.email })
+      .select({ employee: employees, userEmail: users.email, userRole: users.role, userStatus: users.status })
       .from(employees)
       .leftJoin(users, eq(employees.userId, users.id))
-      .where(conditions.length ? and(...conditions) : undefined);
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(asc(employees.fullName));
 
     res.json(
       rows.map((r) => ({
         ...serializeEmployee(r.employee),
-        hasLogin: r.userEmail !== null,
+        access: accessOf(r.employee.userId),
+        hasLogin: r.employee.userId !== null,
         userEmail: r.userEmail ?? null,
+        userRole: r.userRole ?? null,
+        userStatus: r.userStatus ?? null,
       })),
     );
   });
@@ -301,6 +287,13 @@ export function createEmsRouter(db: DB): Router {
       const parsed = createEmployeeSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         sendError(res, 400, "VALIDATION_ERROR", "Invalid employee payload.", parsed.error.issues);
+        return;
+      }
+
+      // Granting system access is an owner decision: an outlet manager or HR creating a login
+      // here could otherwise pick any role, OWNER included.
+      if ((parsed.data.account || parsed.data.user_id) && normalizeRole(req.user!.role) !== "OWNER") {
+        sendError(res, 403, "OWNER_ONLY", "Only an owner can give an employee system access.");
         return;
       }
 
@@ -361,6 +354,15 @@ export function createEmsRouter(db: DB): Router {
               .values({ ...employeeValues, userId: user!.id })
               .returning();
             createdEmployee = employee!;
+            await grantEmployeeOutlet(tx, user!.id, locationId);
+            await audit(tx as unknown as DB, {
+              ...actorOf(req),
+              action: "employee.create",
+              description: `Created employee ${employee!.fullName} with a ${role} login <${email}>`,
+              entityType: "employee",
+              entityId: employee!.id,
+              metadata: { access: "SYSTEM_USER", userId: user!.id, role },
+            });
           });
 
           res.status(201).json({
@@ -368,23 +370,46 @@ export function createEmsRouter(db: DB): Router {
             user: { id: createdUser.id, email: createdUser.email, role: createdUser.role },
           });
         } catch (err) {
+          if (isUniqueViolation(err, EMPLOYEE_NO_UNIQUE)) {
+            sendError(res, 409, "EMPLOYEE_NO_TAKEN", `Employee number ${parsed.data.employee_no} is already used.`);
+            return;
+          }
+          // Any other unique violation here is the login email: the global unique email also
+          // refuses an address another workspace owns, which RLS hides from a re-query (D55).
           if (isUniqueViolation(err)) {
-            // Recovery re-query MUST run outside the aborted transaction
-            // (Postgres aborts the whole tx on error) — hence `db`, not `tx`.
-            const [existingUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
-            if (existingUser) {
-              sendError(res, 409, "EMAIL_TAKEN", `Email ${email} is already registered.`);
-              return;
-            }
+            sendError(res, 409, "EMAIL_TAKEN", `Email ${email} is already registered.`);
+            return;
           }
           throw err;
         }
         return;
       }
 
-      const [employee] = await db.insert(employees).values(employeeValues).returning();
-
-      res.status(201).json(serializeEmployee(employee!));
+      try {
+        const employee = await db.transaction(async (tx) => {
+          const [row] = await tx.insert(employees).values(employeeValues).returning();
+          await audit(tx as unknown as DB, {
+            ...actorOf(req),
+            action: "employee.create",
+            description: `Created employee ${row!.fullName}${row!.userId ? " linked to an existing login" : " (staff only, no login)"}`,
+            entityType: "employee",
+            entityId: row!.id,
+            metadata: { access: accessOf(row!.userId), userId: row!.userId },
+          });
+          return row!;
+        });
+        res.status(201).json({ ...serializeEmployee(employee), access: accessOf(employee.userId) });
+      } catch (err) {
+        if (isUniqueViolation(err, EMPLOYEE_NO_UNIQUE)) {
+          sendError(res, 409, "EMPLOYEE_NO_TAKEN", `Employee number ${parsed.data.employee_no} is already used.`);
+          return;
+        }
+        if (isUniqueViolation(err, EMPLOYEE_LOGIN_LINK_UNIQUE)) {
+          sendError(res, 409, "USER_ALREADY_LINKED", "That login already belongs to another employee.");
+          return;
+        }
+        throw err;
+      }
     },
   );
 
@@ -411,7 +436,7 @@ export function createEmsRouter(db: DB): Router {
     }
 
     const [existing] = await db
-      .select({ id: employees.id, userId: employees.userId, fullName: employees.fullName })
+      .select({ id: employees.id, userId: employees.userId, fullName: employees.fullName, locationId: employees.locationId })
       .from(employees)
       .where(eq(employees.id, id));
     if (!existing) {
@@ -443,6 +468,15 @@ export function createEmsRouter(db: DB): Router {
           throw new EmployeeAccountRaceLostError();
         }
         linkedEmployee = updated[0]!;
+        await grantEmployeeOutlet(tx, user!.id, existing.locationId);
+        await audit(tx as unknown as DB, {
+          ...actorOf(req),
+          action: "employee.login.create",
+          description: `Gave ${existing.fullName} a ${role} login <${email}>`,
+          entityType: "employee",
+          entityId: id,
+          metadata: { userId: user!.id, role },
+        });
       });
 
       res.status(201).json({
@@ -455,12 +489,8 @@ export function createEmsRouter(db: DB): Router {
         return;
       }
       if (isUniqueViolation(err)) {
-        // Recovery re-query MUST run outside the aborted transaction.
-        const [existingUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, email));
-        if (existingUser) {
-          sendError(res, 409, "EMAIL_TAKEN", `Email ${email} is already registered.`);
-          return;
-        }
+        sendError(res, 409, "EMAIL_TAKEN", `Email ${email} is already registered.`);
+        return;
       }
       throw err;
     }
@@ -490,7 +520,7 @@ export function createEmsRouter(db: DB): Router {
       }
 
       const [existing] = await db
-        .select({ id: employees.id, locationId: employees.locationId })
+        .select({ id: employees.id, locationId: employees.locationId, fullName: employees.fullName })
         .from(employees)
         .where(eq(employees.id, id));
       if (!existing) {
@@ -537,8 +567,27 @@ export function createEmsRouter(db: DB): Router {
       if (parsed.data.location_id !== undefined) updates.locationId = parsed.data.location_id;
       if (parsed.data.attendance_required !== undefined) updates.attendanceRequired = parsed.data.attendance_required;
 
-      const [updated] = await db.update(employees).set(updates).where(eq(employees.id, id)).returning();
-      res.json(serializeEmployee(updated!));
+      try {
+        const updated = await db.transaction(async (tx) => {
+          const [row] = await tx.update(employees).set(updates).where(eq(employees.id, id)).returning();
+          await audit(tx as unknown as DB, {
+            ...actorOf(req),
+            action: "employee.update",
+            description: `Updated employee ${existing.fullName}`,
+            entityType: "employee",
+            entityId: id,
+            metadata: { fields: Object.keys(parsed.data) },
+          });
+          return row!;
+        });
+        res.json({ ...serializeEmployee(updated), access: accessOf(updated.userId) });
+      } catch (err) {
+        if (isUniqueViolation(err, EMPLOYEE_NO_UNIQUE)) {
+          sendError(res, 409, "EMPLOYEE_NO_TAKEN", `Employee number ${parsed.data.employee_no} is already used.`);
+          return;
+        }
+        throw err;
+      }
     },
   );
 
@@ -578,69 +627,6 @@ export function createEmsRouter(db: DB): Router {
       res.json(rows);
     },
   );
-
-  // ── GET /ems/analytics/employee/:userId ───────────────────────────────────
-  router.get("/ems/analytics/employee/:userId", requireAuth, async (req, res) => {
-    const targetUserId = req.params.userId as string;
-    const { from, to } = req.query as Record<string, string | undefined>;
-
-    // Only self or an OWNER/BRAND_MANAGER can view (roles v2, alias-normalized).
-    const isSelf = req.user!.id === targetUserId;
-    const viewerRole = normalizeRole(req.user!.role);
-    const isAdmin = viewerRole === "OWNER" || viewerRole === "BRAND_MANAGER";
-    if (!isSelf && !isAdmin) {
-      sendError(res, 403, "FORBIDDEN", "Can only view your own analytics.");
-      return;
-    }
-
-    const conditions = [eq(auditLogs.actorUserId, targetUserId)];
-    if (from) conditions.push(gte(auditLogs.createdAt, new Date(from)));
-    if (to) conditions.push(lte(auditLogs.createdAt, new Date(to)));
-
-    // Total action count
-    const [totalRow] = await db
-      .select({ total: count() })
-      .from(auditLogs)
-      .where(and(...conditions));
-
-    // Count of order.advance actions
-    const orderAdvanceConditions = [
-      eq(auditLogs.actorUserId, targetUserId),
-      eq(auditLogs.action, "order.advance"),
-    ];
-    if (from) orderAdvanceConditions.push(gte(auditLogs.createdAt, new Date(from)));
-    if (to) orderAdvanceConditions.push(lte(auditLogs.createdAt, new Date(to)));
-
-    const [advanceRow] = await db
-      .select({ total: count() })
-      .from(auditLogs)
-      .where(and(...orderAdvanceConditions));
-
-    // Action breakdown by type
-    const actionBreakdown = await db
-      .select({
-        action: auditLogs.action,
-        total: count(),
-      })
-      .from(auditLogs)
-      .where(and(...conditions))
-      .groupBy(auditLogs.action);
-
-    // Session count
-    const sessionConditions: ReturnType<typeof eq>[] = [eq(userSessions.userId, targetUserId)];
-    const sessionCount = await db
-      .select({ total: count() })
-      .from(userSessions)
-      .where(and(...sessionConditions));
-
-    res.json({
-      userId: targetUserId,
-      totalActions: Number(totalRow?.total ?? 0),
-      orderAdvances: Number(advanceRow?.total ?? 0),
-      actionBreakdown,
-      sessions: Number(sessionCount[0]?.total ?? 0),
-    });
-  });
 
   // ── POST /ems/attendance ──────────────────────────────────────────────────
   // Record a TIME_IN / TIME_OUT punch with a Cloudinary photo proof.
@@ -752,7 +738,7 @@ export function createEmsRouter(db: DB): Router {
       return;
     }
     if (employee_id) {
-      const emp = await resolveReadableEmployee(req, res, employee_id, 400);
+      const emp = await resolveReadableEmployee(db, req, res, employee_id, 400);
       if (!emp) return;
     }
 
@@ -772,7 +758,7 @@ export function createEmsRouter(db: DB): Router {
   });
 
   // ── GET /ems/attendance/dtr ───────────────────────────────────────────────
-  // Daily Time Record: one entry per (employee, UTC date) — earliest TIME_IN
+  // Daily Time Record: one entry per (employee, business-local date) — earliest TIME_IN
   // paired with the latest TIME_OUT that day; worked minutes between them.
   // An unpaired TIME_IN yields time_out=null and minutes=null.
   //
@@ -797,18 +783,28 @@ export function createEmsRouter(db: DB): Router {
       return;
     }
     if (employee_id) {
-      const emp = await resolveReadableEmployee(req, res, employee_id, 400);
+      const emp = await resolveReadableEmployee(db, req, res, employee_id, 400);
       if (!emp) return;
     }
 
-    const conditions: ReturnType<typeof eq>[] = [];
+    // Business-local (Manila) days like every other attendance view, and a bounded window:
+    // the unfiltered DTR used to read every punch ever recorded.
+    const window = resolveDtrWindow(from, to);
+    if (!window.ok) {
+      sendError(res, 400, "VALIDATION_ERROR", window.message);
+      return;
+    }
+    const conditions: SQL[] = [
+      gte(attendanceRecords.capturedAt, window.start),
+      lte(attendanceRecords.capturedAt, window.end),
+    ];
     if (employee_id) conditions.push(eq(attendanceRecords.employeeId, employee_id));
-    if (from) conditions.push(gte(attendanceRecords.capturedAt, new Date(`${from}T00:00:00.000Z`)));
-    if (to) conditions.push(lte(attendanceRecords.capturedAt, new Date(`${to}T23:59:59.999Z`)));
 
-    const rows = conditions.length
-      ? await db.select().from(attendanceRecords).where(and(...conditions)).orderBy(asc(attendanceRecords.capturedAt))
-      : await db.select().from(attendanceRecords).orderBy(asc(attendanceRecords.capturedAt));
+    const rows = await db
+      .select()
+      .from(attendanceRecords)
+      .where(and(...conditions))
+      .orderBy(asc(attendanceRecords.capturedAt));
 
     // Pairing lives in attendance-shared.ts so the profile endpoint pairs
     // identically (see pairDtrEntries). Rows are asc by capturedAt as required.
@@ -838,14 +834,19 @@ export function createEmsRouter(db: DB): Router {
     const year = Number(m[1]);
     const monthIndex = monthNum - 1;
 
-    const scopedEmp = await resolveReadableEmployee(req, res, id, 404);
+    const scopedEmp = await resolveReadableEmployee(db, req, res, id, 404);
     if (!scopedEmp) return;
 
-    const [emp] = await db.select().from(employees).where(eq(employees.id, id));
-    if (!emp) {
+    const [row] = await db
+      .select({ employee: employees, userEmail: users.email })
+      .from(employees)
+      .leftJoin(users, eq(employees.userId, users.id))
+      .where(eq(employees.id, id));
+    if (!row) {
       sendError(res, 404, "NOT_FOUND", `Employee ${id} not found.`);
       return;
     }
+    const emp = row.employee;
 
     const daysInMonth = new Date(Date.UTC(year, monthIndex + 1, 0)).getUTCDate();
     const { start: monthStart, end: monthEnd } = localMonthRange(year, monthIndex + 1);
@@ -958,6 +959,9 @@ export function createEmsRouter(db: DB): Router {
         workDays,
         hiredAt: toDateString(emp.hiredAt),
         userId: emp.userId,
+        userEmail: row.userEmail ?? null,
+        access: accessOf(emp.userId),
+        locationId: emp.locationId,
         createdAt: emp.createdAt,
       },
       month,
@@ -975,4 +979,35 @@ export function createEmsRouter(db: DB): Router {
   });
 
   return router;
+}
+
+/** Actor fields for an audit row, always from the verified token (never the body). */
+function actorOf(req: Request) {
+  return { actorUserId: req.user!.id, actorName: req.user!.name ?? null, sessionId: req.user!.sessionId ?? null };
+}
+
+const DTR_MAX_DAYS = 93;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * DTR window from optional YYYY-MM-DD bounds, in business-local days. Defaults to the
+ * current business month; refuses a reversed range or one longer than about a quarter.
+ */
+function resolveDtrWindow(
+  from: string | undefined,
+  to: string | undefined,
+): { ok: true; start: Date; end: Date } | { ok: false; message: string } {
+  if ((from && !DATE_RE.test(from)) || (to && !DATE_RE.test(to))) {
+    return { ok: false, message: "from/to must be YYYY-MM-DD." };
+  }
+  const today = localDate(new Date());
+  const toDay = to ?? today;
+  const fromDay = from ?? `${toDay.slice(0, 7)}-01`;
+  if (fromDay > toDay) return { ok: false, message: "'from' is after 'to'." };
+  const start = localDayStart(fromDay);
+  const end = localDayEnd(toDay);
+  if (end.getTime() - start.getTime() > DTR_MAX_DAYS * 86_400_000) {
+    return { ok: false, message: `The DTR covers at most ${DTR_MAX_DAYS} days per request.` };
+  }
+  return { ok: true, start, end };
 }

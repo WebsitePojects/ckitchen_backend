@@ -406,12 +406,14 @@ describe("M4 — GET /ems/attendance/dtr role gate", () => {
     expect(Array.isArray(res.body)).toBe(true);
   });
 
-  it("non-OWNER WITH valid in-scope employee_id → 200 (filtered still allowed)", async () => {
+  // D58: a colleague's punches carry their face photos, so crew in the same outlet may no
+  // longer read them; only people roles (owner, HR, outlet manager, accounting) or yourself.
+  it("kitchen crew reading a colleague's DTR in their own outlet → 403", async () => {
     const res = await request(app)
       .get(`/api/v1/ems/attendance/dtr?employee_id=${outletAEmployeeId}`)
       .set("Authorization", `Bearer ${kitchenA}`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe("FORBIDDEN");
   });
 });
 

@@ -14,11 +14,18 @@
  *   GET /analytics/aggregators?from&to            — revenue+count split by aggregator
  *   GET /analytics/margins?from&to                — per-brand recipe-cost margin
  *   GET /analytics/products?from&to               — MOTM #8: per menu-item performance
+ *   GET /analytics/brand-performance?months&brand_ids — D59: monthly P&L, trend, projection,
+ *                                                    verdict; brand- and outlet-scoped
  */
 import { Router } from "express";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { requireAuth, requireRole } from "../auth/middleware.js";
+import { eq } from "drizzle-orm";
+import { userBrands } from "../../db/schema.js";
+import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
+import { listScopeLocationIds } from "../auth/outlet-scope.js";
+import { normalizeRole } from "../auth/roles.js";
+import { getBrandPerformance } from "./brand-performance.js";
 import { sendError, sendInternalError } from "../http-errors.js";
 import {
   getAggregatorsAnalytics,
@@ -43,6 +50,22 @@ const dateRangeSchema = z.object({
   from: z.string().optional(),
   to: z.string().optional(),
 });
+
+const brandPerformanceSchema = z.object({
+  months: z.coerce.number().int().min(1).max(24).default(6),
+  brand_ids: z
+    .string()
+    .optional()
+    .transform((v) => (v ? [...new Set(v.split(",").map((s) => s.trim()).filter(Boolean))] : undefined))
+    .pipe(z.array(z.string().uuid()).max(50).optional()),
+});
+
+/**
+ * Brand performance is money, so it is scoped twice: a BRAND_MANAGER sees only the brands
+ * assigned to them (user_brand), and an outlet-scoped reader only orders placed at their
+ * outlets. OWNER and ACCOUNTING see the whole workspace (or the outlet picked in the header).
+ */
+const BRAND_PERFORMANCE_ROLES = ["OWNER", "ACCOUNTING", "BRAND_MANAGER", "OUTLET_MANAGER"] as const;
 
 const dateSchema = z.object({
   date: z.string().min(1, { message: "Query param 'date' is required." }),
@@ -190,6 +213,42 @@ export function createAnalyticsRouter(db: DB): Router {
 
       try {
         const data = await getProductPerformance(db, parsed.data.from, parsed.data.to);
+        res.json(data);
+      } catch (err) {
+        sendInternalError(res, err, "analytics");
+      }
+    },
+  );
+
+  // ── GET /analytics/brand-performance?months&brand_ids ─────────────────────
+  router.get(
+    "/analytics/brand-performance",
+    requireAuth,
+    requireRole(...BRAND_PERFORMANCE_ROLES),
+    resolveOutletContext,
+    async (req, res) => {
+      const parsed = brandPerformanceSchema.safeParse(req.query);
+      if (!parsed.success) {
+        sendError(res, 400, "VALIDATION_ERROR", "months must be 1-24; brand_ids a comma list of UUIDs.", parsed.error.issues);
+        return;
+      }
+      try {
+        let brandIds = parsed.data.brand_ids ?? null;
+        if (normalizeRole(req.user!.role) === "BRAND_MANAGER") {
+          const assigned = (
+            await db.select({ brandId: userBrands.brandId }).from(userBrands).where(eq(userBrands.userId, req.user!.id))
+          ).map((r) => r.brandId);
+          if (brandIds && brandIds.some((id) => !assigned.includes(id))) {
+            sendError(res, 403, "FORBIDDEN", "That brand is not assigned to you.");
+            return;
+          }
+          brandIds = brandIds ?? assigned;
+        }
+        const data = await getBrandPerformance(db, {
+          brandIds,
+          locationIds: listScopeLocationIds(req.outletContext),
+          months: parsed.data.months,
+        });
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");

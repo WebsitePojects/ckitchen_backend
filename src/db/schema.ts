@@ -1231,6 +1231,9 @@ export const employees = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
+    // A login belongs to at most one employee per workspace: the partial unique index
+    // "employee_user_link_unique" on (tenant_id, user_id) WHERE user_id IS NOT NULL lives in
+    // migration 0052 (tenant_id is not declared in TypeScript here, see tenantIdColumn).
     index("employee_user_id_idx").on(table.userId),
     index("employee_location_id_idx").on(table.locationId),
   ],
@@ -1238,6 +1241,46 @@ export const employees = pgTable(
 
 export type Employee = typeof employees.$inferSelect;
 export type NewEmployee = typeof employees.$inferInsert;
+
+/** Kinds of manual performance note (migration 0052, D58). Kept in sync with the CHECK. */
+export const PERFORMANCE_NOTE_KINDS = ["COMMENDATION", "CONCERN", "REVIEW", "INCIDENT", "NOTE"] as const;
+export type PerformanceNoteKind = (typeof PERFORMANCE_NOTE_KINDS)[number];
+
+/**
+ * Manual performance log for one employee (D58): what owners/HR record by hand, so staff
+ * who never sign in still have a performance history. Append-only: a wrong note is voided
+ * with a reason (voided_at + void_reason), never edited or deleted.
+ */
+export const employeePerformanceNotes = pgTable(
+  "employee_performance_note",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: tenantIdColumn(),
+    employeeId: uuid("employee_id")
+      .notNull()
+      .references(() => employees.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<PerformanceNoteKind>().notNull(),
+    /** Optional 1-5 score; NULL for notes that are not a rating. */
+    rating: smallint("rating"),
+    title: text("title").notNull(),
+    body: text("body"),
+    /** The day the observed thing happened (business-local), not when it was typed. */
+    occurredOn: date("occurred_on").notNull(),
+    clientRequestId: uuid("client_request_id").notNull(),
+    recordedByUserId: uuid("recorded_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    recordedByName: text("recorded_by_name"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    voidedAt: timestamp("voided_at", { withTimezone: true }),
+    voidedByUserId: uuid("voided_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    voidReason: text("void_reason"),
+  },
+  (table) => [
+    uniqueIndex("employee_performance_note_request_unique").on(table.tenantId, table.clientRequestId),
+    index("employee_performance_note_employee_idx").on(table.employeeId, table.occurredOn.desc()),
+  ],
+).enableRLS();
+
+export type EmployeePerformanceNote = typeof employeePerformanceNotes.$inferSelect;
 
 export const userSessions = pgTable(
   "user_session",
@@ -1277,6 +1320,7 @@ export const auditLogs = pgTable(
   (table) => [
     index("audit_log_created_at_idx").on(table.createdAt.desc()),
     index("audit_log_actor_idx").on(table.actorUserId),
+    index("audit_log_actor_created_idx").on(table.actorUserId, table.createdAt.desc()),
     index("audit_log_entity_idx").on(table.entityType, table.entityId),
     index("audit_log_location_created_idx").on(table.locationId, table.createdAt.desc()),
     index("audit_log_correlation_idx").on(table.correlationId),

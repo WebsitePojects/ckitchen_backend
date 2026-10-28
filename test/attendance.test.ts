@@ -393,9 +393,10 @@ describe("DTR status: COMPLETE / OPEN / FORFEITED (24h rule)", () => {
     return emp!.id;
   }
 
-  async function dtrFor(employeeId: string) {
+  // The DTR defaults to the current business month; `range` reaches older punches.
+  async function dtrFor(employeeId: string, range = "") {
     const res = await request(app)
-      .get(`/api/v1/ems/attendance/dtr?employee_id=${employeeId}`)
+      .get(`/api/v1/ems/attendance/dtr?employee_id=${employeeId}${range}`)
       .set("Authorization", `Bearer ${adminToken}`);
     expect(res.status).toBe(200);
     return res.body as Array<{ status: string; time_out: string | null; minutes: number | null }>;
@@ -453,7 +454,7 @@ describe("DTR status: COMPLETE / OPEN / FORFEITED (24h rule)", () => {
       },
     ]);
 
-    const entries = await dtrFor(empId);
+    const entries = await dtrFor(empId, "&from=2026-05-01&to=2026-05-31");
     expect(entries.length).toBe(1);
     expect(entries[0]!.status).toBe("COMPLETE");
     expect(entries[0]!.minutes).toBe(60);

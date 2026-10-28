@@ -19,6 +19,7 @@ import { createPrintingRouter } from "./modules/printing/routes.js";
 import { createAnalyticsRouter } from "./modules/analytics/routes.js";
 import { createOutletsRouter } from "./modules/outlets/routes.js";
 import { createEmsRouter } from "./modules/ems/routes.js";
+import { createEmployeeAccessRouter } from "./modules/ems/employee-access.js";
 import { createPublicAttendanceRouter } from "./modules/ems/public-attendance.js";
 import { createMasterRouter } from "./modules/master/routes.js";
 import { createPurchasingRouter } from "./modules/purchasing/routes.js";
@@ -168,6 +169,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub(), options: A
   app.use("/api/v1", createPrintingRouter(scopedDb, hub));
   app.use("/api/v1", createAnalyticsRouter(scopedDb));
   app.use("/api/v1", createEmsRouter(scopedDb));
+  app.use("/api/v1", createEmployeeAccessRouter(scopedDb));
   app.use("/api/v1", createMasterRouter(scopedDb));
   app.use("/api/v1", createPurchasingRouter(scopedDb));
   app.use("/api/v1", createReportsRouter(scopedDb));

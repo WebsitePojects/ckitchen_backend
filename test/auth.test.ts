@@ -8,6 +8,7 @@ import { runMigrations } from "../src/db/migrate.js";
 import { users } from "../src/db/schema.js";
 import { hashPassword } from "../src/modules/auth/service.js";
 import { requireAuth, requireRole } from "../src/modules/auth/middleware.js";
+import { createWorkspaceConnections } from "../src/modules/tenancy/connections.js";
 
 let app: Express;
 let db: DB;
@@ -49,6 +50,7 @@ beforeAll(async () => {
   });
   app = express();
   app.set("db", db);
+  app.set("workspaces", createWorkspaceConnections({ platformDb: db, isolated: false }));
   // Test route FIRST so it is matched before the mounted createApp sub-app (which
   // ends in a terminal 404 catch-all); auth endpoints fall through to createApp.
   app.use(testRouter);

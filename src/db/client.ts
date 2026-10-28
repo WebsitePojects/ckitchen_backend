@@ -64,6 +64,8 @@ export interface CreateDbOptions {
   dataDir?: string;
   /** Raw DATABASE_URL. When it's a postgres://|postgresql:// URL, connects via postgres-js. */
   databaseUrl?: string;
+  /** Pool sizing for postgres-js (per-workspace pools are small; the owner pool keeps 10). */
+  pool?: { max: number; idleTimeoutSeconds?: number };
 }
 
 /**
@@ -119,11 +121,16 @@ export function keepPoolWarm(client: postgres.Sql, size = 4, intervalMs = 60_000
 export function createDb(opts?: string | CreateDbOptions) {
   // Back-compat: `createDb(dataDir?)` (a plain string or undefined), as called by every
   // existing test and by server.ts/seed.ts/migrate.ts today.
-  const { dataDir, databaseUrl } =
-    typeof opts === "string" || opts === undefined ? { dataDir: opts, databaseUrl: undefined } : opts;
+  const { dataDir, databaseUrl, pool } =
+    typeof opts === "string" || opts === undefined ? { dataDir: opts, databaseUrl: undefined, pool: undefined } : opts;
 
   if (isPostgresUrl(databaseUrl)) {
-    const client = postgres(databaseUrl, { prepare: false, ssl: sslOptionFor(databaseUrl), max: 10 });
+    const client = postgres(databaseUrl, {
+      prepare: false,
+      ssl: sslOptionFor(databaseUrl),
+      max: pool?.max ?? 10,
+      ...(pool?.idleTimeoutSeconds ? { idle_timeout: pool.idleTimeoutSeconds } : {}),
+    });
     const db = drizzlePostgres(client, { schema });
     return { client, db };
   }

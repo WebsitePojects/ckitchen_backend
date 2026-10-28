@@ -29,15 +29,15 @@ const login = async (email: string, password: string) =>
 
 describe("session cache", () => {
   it("expires entries after the TTL", () => {
-    rememberValidSession("s1", "u1", 1_000);
+    rememberValidSession("s1", "u1", "t1", 1_000);
     expect(isSessionKnownValid("s1", 1_000 + 14_000)).toBe(true);
     expect(isSessionKnownValid("s1", 1_000 + 15_001)).toBe(false);
   });
 
   it("forgetUserSessions drops every session of that user only", () => {
-    rememberValidSession("a", "u1");
-    rememberValidSession("b", "u1");
-    rememberValidSession("c", "u2");
+    rememberValidSession("a", "u1", "t1");
+    rememberValidSession("b", "u1", "t1");
+    rememberValidSession("c", "u2", "t1");
     forgetUserSessions("u1");
     expect(isSessionKnownValid("a")).toBe(false);
     expect(isSessionKnownValid("b")).toBe(false);

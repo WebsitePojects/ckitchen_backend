@@ -34,7 +34,9 @@
  * is injected so tests that call `createApp(db)` get a noop hub automatically.
  */
 import type { Server as IOServer } from "socket.io";
+import { and, eq, sql } from "drizzle-orm";
 import type { DB } from "../db/client.js";
+import { locations } from "../db/schema.js";
 import { authenticateBearer } from "../modules/auth/authenticate.js";
 import type { AuthenticatedUser } from "../modules/auth/middleware.js";
 
@@ -55,14 +57,23 @@ export interface RealtimeHub {
 // Socket.IO-backed implementation
 // ---------------------------------------------------------------------------
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
- * True if a socket's authenticated user may join `locationId`'s room: ALL-scope
- * users may join any outlet; ASSIGNED users only rooms in their `outlet_ids`.
- * Legacy tokens without an `outlet_scope` claim fall back to the role default.
+ * True if a socket's authenticated user may join `locationId`'s room: the outlet must belong
+ * to the user's own workspace (D55: "ALL outlets" means all of YOUR business's outlets), and
+ * ASSIGNED users additionally only rooms in their `outlet_ids`. Rooms are keyed by outlet id
+ * alone, so without the workspace check an owner of another business who learned an outlet
+ * id could listen to its live orders.
  */
-function canJoinLocation(user: AuthenticatedUser, locationId: string): boolean {
-  if (user.outletScope === "ALL") return true;
-  return user.outletIds.includes(locationId);
+async function canJoinLocation(db: DB, user: AuthenticatedUser, locationId: string): Promise<boolean> {
+  if (!UUID_RE.test(locationId)) return false;
+  if (user.outletScope !== "ALL" && !user.outletIds.includes(locationId)) return false;
+  const [outlet] = await db
+    .select({ id: locations.id })
+    .from(locations)
+    .where(and(eq(locations.id, locationId), sql`"location"."tenant_id" = ${user.tenantId}`));
+  return Boolean(outlet);
 }
 
 /**
@@ -112,12 +123,18 @@ export function createSocketHub(io: IOServer, db: DB): RealtimeHub {
 
     // Attempt to join `locationId` if the socket's user is authorized; otherwise
     // refuse and tell the client (H1). Never silently join a foreign room.
-    const tryJoin = (locationId: unknown): void => {
+    const tryJoin = async (locationId: unknown): Promise<void> => {
       if (typeof locationId !== "string" || locationId.length === 0) return;
-      if (!user || !canJoinLocation(user, locationId)) {
+      let allowed = false;
+      try {
+        allowed = Boolean(user) && (await canJoinLocation(db, user!, locationId));
+      } catch {
+        allowed = false; // a failed check never joins (fail closed)
+      }
+      if (!allowed) {
         socket.emit("join_rejected", {
           code: "FORBIDDEN",
-          locationId: typeof locationId === "string" ? locationId : null,
+          locationId,
           message: "Outlet not in your access scope.",
         });
         return;
@@ -126,10 +143,10 @@ export function createSocketHub(io: IOServer, db: DB): RealtimeHub {
     };
 
     // Auto-join via handshake auth (preferred — set before connect())
-    tryJoin(socket.handshake.auth?.locationId);
+    void tryJoin(socket.handshake.auth?.locationId);
 
     // Dynamic join event (clients that know/switch the locationId at runtime)
-    socket.on("join", (locationId: unknown) => tryJoin(locationId));
+    socket.on("join", (locationId: unknown) => void tryJoin(locationId));
   });
 
   return {

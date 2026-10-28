@@ -10,7 +10,7 @@
  */
 import { and, eq, getTableColumns, isNull, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
-import { users, userSessions } from "../../db/schema.js";
+import { users, userSessions, WORKSPACE_ONE_ID } from "../../db/schema.js";
 import { loadConfig } from "../../config.js";
 import { audit } from "../ems/audit.js";
 import { verifyToken, type AuthTokenPayload } from "./service.js";
@@ -19,7 +19,7 @@ import type { AuthenticatedUser } from "./middleware.js";
 import { clerkSettings, verifiedPrimaryEmail, verifyClerkSessionToken, type ClerkSettings } from "./clerk.js";
 import {
   cachedClerkIdentity,
-  isSessionKnownValid,
+  knownValidSessionWorkspace,
   rememberClerkIdentity,
   rememberValidSession,
 } from "./session-cache.js";
@@ -47,17 +47,33 @@ export async function authenticateBearer(db: DB | undefined, token: string): Pro
   return resolveClerkUser(db, clerkUserId, settings);
 }
 
+/**
+ * The workspace of the session's user (one per account for now), as a subquery so the
+ * session check and this lookup share one round trip. The outer reference is spelled
+ * "user_session"."user_id" on purpose: see findClerkUser.
+ */
+const SESSION_WORKSPACE = sql<string | null>`(select m.tenant_id from membership m where m.user_id = "user_session"."user_id" order by m.created_at limit 1)`;
+
 async function authenticateOrionToken(db: DB | undefined, payload: AuthTokenPayload): Promise<AuthResult> {
+  // Password sign-in is the IT break-glass for workspace #1; a token with no session or no
+  // membership on record (legacy, tests) stays there.
+  let tenantId: string = WORKSPACE_ONE_ID;
   // Session revocation check; a positive answer is cached briefly (session-cache.ts).
-  if (payload.sid && db && !isSessionKnownValid(payload.sid)) {
-    const [session] = await db
-      .select({ logoutAt: userSessions.logoutAt })
-      .from(userSessions)
-      .where(eq(userSessions.id, payload.sid));
-    if (!session || session.logoutAt !== null) {
-      return { ok: false, status: 401, code: "AUTH_REQUIRED", message: "Session ended. Please log in again." };
+  if (payload.sid && db) {
+    const cached = knownValidSessionWorkspace(payload.sid);
+    if (cached) {
+      tenantId = cached;
+    } else {
+      const [session] = await db
+        .select({ logoutAt: userSessions.logoutAt, tenantId: SESSION_WORKSPACE })
+        .from(userSessions)
+        .where(eq(userSessions.id, payload.sid));
+      if (!session || session.logoutAt !== null) {
+        return { ok: false, status: 401, code: "AUTH_REQUIRED", message: "Session ended. Please log in again." };
+      }
+      tenantId = session.tenantId ?? WORKSPACE_ONE_ID;
+      rememberValidSession(payload.sid, payload.sub, tenantId);
     }
-    rememberValidSession(payload.sid, payload.sub);
   }
   return {
     ok: true,
@@ -68,6 +84,7 @@ async function authenticateOrionToken(db: DB | undefined, payload: AuthTokenPayl
       outletScope: payload.outlet_scope ?? outletScopeForRole(payload.role),
       outletIds: Array.isArray(payload.outlet_ids) ? payload.outlet_ids : [],
       name: typeof payload.name === "string" && payload.name.length > 0 ? payload.name : null,
+      tenantId,
     },
   };
 }
@@ -80,11 +97,15 @@ type UserRow = typeof users.$inferSelect;
  * The outer reference is written as "user"."id" on purpose: Drizzle prints a bare "id"
  * for ${users.id} in a single-table select, which would bind to the subquery's own table.
  */
-async function findClerkUser(db: DB, clerkUserId: string): Promise<{ user: UserRow; outletIds: string[] } | undefined> {
+async function findClerkUser(
+  db: DB,
+  clerkUserId: string,
+): Promise<{ user: UserRow; outletIds: string[]; tenantId: string | null } | undefined> {
   const [row] = await db
     .select({
       user: getTableColumns(users),
       outletIds: sql<string[]>`coalesce((select array_agg(a.location_id) from user_outlet_access a where a.user_id = "user"."id"), '{}')`,
+      tenantId: sql<string | null>`(select m.tenant_id from membership m where m.user_id = "user"."id" order by m.created_at limit 1)`,
     })
     .from(users)
     .where(eq(users.clerkUserId, clerkUserId));
@@ -103,13 +124,17 @@ async function resolveClerkUser(db: DB, clerkUserId: string, settings: ClerkSett
     found = await findClerkUser(db, clerkUserId);
     if (!found) return INVALID;
   }
-  const { user, outletIds } = found;
+  const { user, outletIds, tenantId } = found;
 
   if (user.status === "BLOCKED") {
     return { ok: false, status: 403, code: "ACCOUNT_BLOCKED", message: "This account has been blocked. Contact the owner." };
   }
   if (normalizeRole(user.role) === null) {
     return { ok: false, status: 403, code: "ROLE_RETIRED", message: "This account's role has been retired. Contact the owner." };
+  }
+  if (!tenantId) {
+    // An account with no workspace has nothing it may see (fail closed).
+    return { ok: false, status: 403, code: "NO_WORKSPACE", message: "This account does not belong to a workspace. Ask the owner for a join link." };
   }
 
   const authenticated: AuthenticatedUser = {
@@ -118,6 +143,7 @@ async function resolveClerkUser(db: DB, clerkUserId: string, settings: ClerkSett
     outletScope: outletScopeForRole(user.role),
     outletIds,
     name: user.name,
+    tenantId,
   };
   rememberClerkIdentity(clerkUserId, user.id, authenticated);
   return { ok: true, user: authenticated };

@@ -3,6 +3,7 @@ import { normalizeRole, outletScopeForRole, type OutletScope } from "./roles.js"
 import type { User } from "../../db/schema.js";
 import type { DB } from "../../db/client.js";
 import { authenticateBearer } from "./authenticate.js";
+import { enterWorkspace } from "../tenancy/connections.js";
 
 export interface AuthenticatedUser {
   id: string;
@@ -20,6 +21,8 @@ export interface AuthenticatedUser {
    * than guessing a name.
    */
   name: string | null;
+  /** The workspace this request acts for (membership; the database enforces it, D55). */
+  tenantId: string;
 }
 
 /** Resolved outlet context for a request (set by {@link resolveOutletContext}). */
@@ -82,14 +85,17 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
       return;
     }
     req.user = result.user;
-    next();
   } catch (err) {
     // Any unexpected failure (e.g. the database is unreachable) fails closed: 401, never 500.
     // Log the error class and driver code only: Drizzle messages embed SQL params (emails).
     const cause = (err as { cause?: { code?: string } } | null)?.cause;
     console.error(`[auth] authentication error: ${err instanceof Error ? err.name : typeof err}${cause?.code ? ` (${cause.code})` : ""}`);
     sendError(res, 401, "AUTH_REQUIRED", "Invalid or expired token.");
+    return;
   }
+  // Everything after this runs as the user's workspace (the database enforces it, D55).
+  // Outside the try: a handler's own error must not be reported as a failed sign-in.
+  await enterWorkspace(req, res, next, req.user.tenantId);
 }
 
 /**

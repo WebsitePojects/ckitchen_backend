@@ -22,7 +22,6 @@ import {
   userOutletAccess,
   users,
   workspaceJoinLinks,
-  WORKSPACE_ONE_ID,
   type Role,
   type User,
   type WorkspaceJoinLink,
@@ -31,6 +30,8 @@ import { loadConfig } from "../../config.js";
 import { hashPassword } from "../auth/service.js";
 import { outletScopeForRole } from "../auth/roles.js";
 import { isUuid } from "../http-errors.js";
+import { currentWorkspace } from "../tenancy/context.js";
+import { actAsWorkspace } from "../tenancy/roles.js";
 
 const TOKEN_CONTEXT = "orion-join-link:v1:";
 
@@ -65,8 +66,15 @@ export function joinLinkStatus(link: WorkspaceJoinLink, now = new Date()): JoinL
 }
 
 // ---------------------------------------------------------------------------
-// Owner side
+// Owner side (runs inside the owner's workspace; RLS also confines it there)
 // ---------------------------------------------------------------------------
+
+/** The workspace of the current request; owner-side functions only run inside one. */
+function workspaceId(): string {
+  const context = currentWorkspace();
+  if (!context) throw new Error("join links: no workspace entered");
+  return context.tenantId;
+}
 
 export interface CreateJoinLinkInput {
   role: Role;
@@ -93,7 +101,7 @@ export async function createJoinLink(db: DB, input: CreateJoinLinkInput): Promis
   const [created] = await db
     .insert(workspaceJoinLinks)
     .values({
-      tenantId: WORKSPACE_ONE_ID,
+      tenantId: workspaceId(),
       role: input.role,
       inviteeName: input.inviteeName,
       outletIds,
@@ -110,7 +118,7 @@ export async function createJoinLink(db: DB, input: CreateJoinLinkInput): Promis
   const [existing] = await db
     .select()
     .from(workspaceJoinLinks)
-    .where(and(eq(workspaceJoinLinks.tenantId, WORKSPACE_ONE_ID), eq(workspaceJoinLinks.clientRequestId, input.clientRequestId)));
+    .where(and(eq(workspaceJoinLinks.tenantId, workspaceId()), eq(workspaceJoinLinks.clientRequestId, input.clientRequestId)));
   const sameIntent =
     existing &&
     existing.role === input.role &&
@@ -125,7 +133,7 @@ export async function listJoinLinks(db: DB, limit = 50) {
     .select({ link: workspaceJoinLinks, usedByName: users.name })
     .from(workspaceJoinLinks)
     .leftJoin(users, eq(users.id, workspaceJoinLinks.usedByUserId))
-    .where(eq(workspaceJoinLinks.tenantId, WORKSPACE_ONE_ID))
+    .where(eq(workspaceJoinLinks.tenantId, workspaceId()))
     .orderBy(desc(workspaceJoinLinks.createdAt), desc(workspaceJoinLinks.id))
     .limit(limit);
 }
@@ -141,7 +149,7 @@ export async function revokeJoinLink(db: DB, id: string): Promise<RevokeJoinLink
     .where(
       and(
         eq(workspaceJoinLinks.id, id),
-        eq(workspaceJoinLinks.tenantId, WORKSPACE_ONE_ID),
+        eq(workspaceJoinLinks.tenantId, workspaceId()),
         isNull(workspaceJoinLinks.usedAt),
         isNull(workspaceJoinLinks.revokedAt),
       ),
@@ -152,7 +160,7 @@ export async function revokeJoinLink(db: DB, id: string): Promise<RevokeJoinLink
   const [link] = await db
     .select()
     .from(workspaceJoinLinks)
-    .where(and(eq(workspaceJoinLinks.id, id), eq(workspaceJoinLinks.tenantId, WORKSPACE_ONE_ID)));
+    .where(and(eq(workspaceJoinLinks.id, id), eq(workspaceJoinLinks.tenantId, workspaceId())));
   if (!link) return { ok: false, code: "NOT_FOUND" };
   if (link.usedAt) return { ok: false, code: "ALREADY_USED" };
   return { ok: true, link }; // already revoked: a repeated click is a no-op
@@ -243,10 +251,9 @@ export async function redeemJoinLink(
         )
         .returning();
       if (!link) throw new LinkUnavailableError();
-      // Until SaaS step 6 the account's workspace comes from the user row (mirrored into
-      // workspace #1's membership by trigger), so a link for any other workspace cannot be
-      // honoured yet. Fail closed rather than put someone in the wrong business.
-      if (link.tenantId !== WORKSPACE_ONE_ID) throw new LinkUnavailableError();
+      // The new account, its outlets and the membership are written AS the link's workspace,
+      // so they can only land there (RLS + the membership trigger read the connected role).
+      await actAsWorkspace(tx, link.tenantId);
 
       const [created] = await tx
         .insert(users)

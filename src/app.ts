@@ -40,6 +40,9 @@ import { createGrabPartnerRouter } from "./modules/grab/routes.js";
 import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 import compression from "compression";
 import { createBusinessModulesRouter } from "./modules/business-modules/routes.js";
+import { createSignupRouter } from "./modules/signup/routes.js";
+import { createWorkspaceScopedDb } from "./modules/tenancy/context.js";
+import { createWorkspaceConnections, workspaceOne, type WorkspaceConnections } from "./modules/tenancy/connections.js";
 
 /**
  * Express app factory.
@@ -48,7 +51,20 @@ import { createBusinessModulesRouter } from "./modules/business-modules/routes.j
  * @param hub  - Realtime hub for emitting Socket.IO events (defaults to a no-op
  *               hub so existing tests calling `createApp(db)` keep working unchanged).
  */
-export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
+export interface AppOptions {
+  /** Per-workspace database connections (D55). Default: single-business mode on `db`. */
+  workspaces?: WorkspaceConnections;
+}
+
+/**
+ * `db` is the owner connection: sign-in, join links and sign-up use it directly, because
+ * they decide WHICH workspace a person belongs to. Every other router gets a
+ * workspace-scoped handle that resolves to the current request's workspace connection
+ * and refuses to run outside one (modules/tenancy).
+ */
+export function createApp(db: DB, hub: RealtimeHub = createNoopHub(), options: AppOptions = {}): Express {
+  const workspaces = options.workspaces ?? createWorkspaceConnections({ platformDb: db, isolated: false });
+  const scopedDb = createWorkspaceScopedDb();
   const app = express();
 
   // H5 (Fable review 2026-07-05): trust exactly ONE proxy hop. In prod the API sits
@@ -120,44 +136,50 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub()): Express {
   app.use(getGrabPartnerBasePath(), express.json({ limit: "1mb" }));
   app.use(express.json({ limit: "12mb" })); // base64 attendance photos (≤8 MB) must reach the handler, not be 413'd by the parser
   app.set("db", db);
+  app.set("workspaces", workspaces);
 
   app.use("/api/v1", healthRouter);
   // Public, UNAUTHENTICATED kiosk endpoints — mounted under /api/v1/public with no
   // auth middleware (deliberate: shared-tablet clock in/out, photo = identity).
   // Its own router applies a feature flag + per-IP rate limit; nothing here
   // inherits requireAuth.
-  app.use("/api/v1/public", createPublicAttendanceRouter(db));
+  // No signed-in user: the kiosk serves CloudKitchen's outlets only for now.
+  app.use("/api/v1/public", workspaceOne, createPublicAttendanceRouter(scopedDb));
   app.use("/api/v1", createAuthRouter(db));
   // Before every router that applies requireAuth broadly: /auth/join serves people who
   // have no ORION account yet.
   app.use("/api/v1", createJoinLinkRouter(db));
-  app.use("/api/v1", createBusinessModulesRouter(db));
-  app.use("/api/v1", createOutletsRouter(db));
-  app.use("/api/v1", createBrandsRouter(db));
-  app.use("/api/v1", createStationsRouter(db));
-  app.use("/api/v1", createMenuRouter(db));
-  app.use("/api/v1", createInventoryRouter(db, hub));
-  app.use("/api/v1", createAdjustmentsRouter(db, hub));
-  app.use("/api/v1", createOrdersRouter(db, hub));
-  app.use("/api/v1", createPrintingRouter(db, hub));
-  app.use("/api/v1", createAnalyticsRouter(db));
-  app.use("/api/v1", createEmsRouter(db));
-  app.use("/api/v1", createMasterRouter(db));
-  app.use("/api/v1", createPurchasingRouter(db));
-  app.use("/api/v1", createReportsRouter(db));
-  app.use("/api/v1", createAdminRouter(db));
-  app.use("/api/v1", createMeRouter(db));
-  app.use("/api/v1", createDiscountsRouter(db));
-  app.use("/api/v1", createCommercialTermsRouter(db));
-  app.use("/api/v1", createStockReturnsRouter(db, hub));
-  app.use("/api/v1", createProductionRouter(db, hub));
-  app.use("/api/v1", createCustomerOrdersRouter(db, hub));
-  app.use("/api/v1", createTransfersRouter(db, hub));
-  app.use("/api/v1", createQaReleasesRouter(db, hub));
-  app.use("/api/v1", createMiddlewareRouter(db));
-  app.use("/api/v1", createOutboundRouter(db));
-  app.use(getFoodpandaPluginBasePath(), createFoodpandaPluginRouter(db));
-  app.use(getGrabPartnerBasePath(), createGrabPartnerRouter(db));
+  app.use("/api/v1", createSignupRouter(db, workspaces));
+  // Partner webhooks carry no user: every Grab/foodpanda/middleware listing belongs to
+  // workspace #1 until partner routing per workspace is built (RLS hides any other).
+  app.use("/api/v1/middleware/webhook", workspaceOne);
+  app.use("/api/v1", createBusinessModulesRouter(scopedDb));
+  app.use("/api/v1", createOutletsRouter(scopedDb));
+  app.use("/api/v1", createBrandsRouter(scopedDb));
+  app.use("/api/v1", createStationsRouter(scopedDb));
+  app.use("/api/v1", createMenuRouter(scopedDb));
+  app.use("/api/v1", createInventoryRouter(scopedDb, hub));
+  app.use("/api/v1", createAdjustmentsRouter(scopedDb, hub));
+  app.use("/api/v1", createOrdersRouter(scopedDb, hub));
+  app.use("/api/v1", createPrintingRouter(scopedDb, hub));
+  app.use("/api/v1", createAnalyticsRouter(scopedDb));
+  app.use("/api/v1", createEmsRouter(scopedDb));
+  app.use("/api/v1", createMasterRouter(scopedDb));
+  app.use("/api/v1", createPurchasingRouter(scopedDb));
+  app.use("/api/v1", createReportsRouter(scopedDb));
+  app.use("/api/v1", createAdminRouter(scopedDb));
+  app.use("/api/v1", createMeRouter(scopedDb));
+  app.use("/api/v1", createDiscountsRouter(scopedDb));
+  app.use("/api/v1", createCommercialTermsRouter(scopedDb));
+  app.use("/api/v1", createStockReturnsRouter(scopedDb, hub));
+  app.use("/api/v1", createProductionRouter(scopedDb, hub));
+  app.use("/api/v1", createCustomerOrdersRouter(scopedDb, hub));
+  app.use("/api/v1", createTransfersRouter(scopedDb, hub));
+  app.use("/api/v1", createQaReleasesRouter(scopedDb, hub));
+  app.use("/api/v1", createMiddlewareRouter(scopedDb));
+  app.use("/api/v1", createOutboundRouter(scopedDb));
+  app.use(getFoodpandaPluginBasePath(), workspaceOne, createFoodpandaPluginRouter(scopedDb));
+  app.use(getGrabPartnerBasePath(), workspaceOne, createGrabPartnerRouter(scopedDb));
 
   // Safety net — unmatched routes → 404; anything thrown/rejected in a handler
   // is normalized here so internals (stack/SQL) never leak to the client.

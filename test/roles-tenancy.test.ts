@@ -20,6 +20,7 @@ import { runMigrations } from "../src/db/migrate.js";
 import { seed } from "../src/db/seed.js";
 import { hashPassword } from "../src/modules/auth/service.js";
 import { requireAuth, requireRole } from "../src/modules/auth/middleware.js";
+import { createWorkspaceConnections } from "../src/modules/tenancy/connections.js";
 import { locations, userOutletAccess, users } from "../src/db/schema.js";
 
 let app: Express;
@@ -67,6 +68,7 @@ beforeAll(async () => {
   });
   app = express();
   app.set("db", db);
+  app.set("workspaces", createWorkspaceConnections({ platformDb: db, isolated: false }));
   app.use(testRouter);
   app.use(createApp(db));
 });

@@ -21,6 +21,7 @@ import { loadConfig, isPostgresUrl } from "./config.js";
 import { corsOriginCallback, createOriginAllowlist } from "./cors.js";
 import type postgres from "postgres";
 import { createDb, keepPoolWarm } from "./db/client.js";
+import { createWorkspaceConnections } from "./modules/tenancy/connections.js";
 import { runMigrations } from "./db/migrate.js";
 import { createSocketHub } from "./realtime/hub.js";
 import { getGrabPartnerConfigProblem } from "./modules/grab/config.js";
@@ -78,7 +79,15 @@ const io = new IOServer(httpServer, {
 const hub = createSocketHub(io, db);
 
 // 4. Express app with the hub injected
-const app = createApp(db, hub);
+// D55: TENANT_DB_ROLES=on gives each workspace its own database login (row-level security).
+// Off = single-business mode: every request runs as CloudKitchen, sign-up stays closed.
+const workspaces = createWorkspaceConnections({
+  platformDb: db,
+  databaseUrl: isPostgresUrl(config.databaseUrl) ? config.databaseUrl : undefined,
+  isolated: process.env.TENANT_DB_ROLES === "on",
+});
+console.log(workspaces.isolated ? "[tenancy] workspace isolation ON: each workspace uses its own database role" : "[tenancy] single-business mode (TENANT_DB_ROLES is not on): workspace #1 only, sign-up closed");
+const app = createApp(db, hub, { workspaces });
 
 // 5. Express handles all plain HTTP requests on the same server
 httpServer.on("request", app);

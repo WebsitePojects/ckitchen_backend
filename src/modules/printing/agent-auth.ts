@@ -28,10 +28,11 @@
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { loadConfig } from "../../config.js";
 import type { DB } from "../../db/client.js";
-import { printAgents } from "../../db/schema.js";
+import { printAgents, WORKSPACE_ONE_ID } from "../../db/schema.js";
+import { enterWorkspace } from "../tenancy/connections.js";
 
 export interface AuthenticatedAgent {
   id: string;
@@ -94,7 +95,9 @@ export function requireBootstrapToken(req: Request, res: Response, next: NextFun
     return;
   }
 
-  next();
+  // AGENT_TOKEN is the platform's single setup secret, issued for CloudKitchen's kitchens:
+  // registration runs as workspace #1 until each workspace gets its own setup token.
+  void enterWorkspace(req, res, next, WORKSPACE_ONE_ID);
 }
 
 /**
@@ -111,11 +114,13 @@ export async function requireAgentToken(req: Request, res: Response, next: NextF
     return;
   }
 
+  let tenantId: string;
   try {
     const db = req.app.get("db") as DB;
     const tokenHash = hashAgentToken(headerValue);
+    // Owner connection: the token decides the workspace, so it is looked up across all.
     const [agent] = await db
-      .select({ id: printAgents.id, locationId: printAgents.locationId })
+      .select({ id: printAgents.id, locationId: printAgents.locationId, tenantId: sql<string>`"print_agent"."tenant_id"` })
       .from(printAgents)
       .where(eq(printAgents.tokenHash, tokenHash));
 
@@ -125,9 +130,12 @@ export async function requireAgentToken(req: Request, res: Response, next: NextF
     }
 
     req.agent = { id: agent.id, locationId: agent.locationId };
-    next();
+    tenantId = agent.tenantId;
   } catch {
     // Fail closed — never let a DB hiccup fall through as an authenticated agent.
     sendAgentTokenInvalid(res);
+    return;
   }
+  // The agent's pulls and acks run as the agent's workspace.
+  await enterWorkspace(req, res, next, tenantId);
 }

@@ -12,6 +12,7 @@
     "alerts:test": "node dist/scripts/send-test-alert.js",
     "owner:grant": "node dist/scripts/operator-accounts.js grant-owner",
     "seed:retire": "node dist/scripts/operator-accounts.js retire-seeds",
+    "tenancy:check": "node dist/scripts/tenancy-check.js",
     "test": "vitest run",
     "migrate": "tsx src/db/migrate.ts",
     "seed": "tsx src/db/seed.ts",

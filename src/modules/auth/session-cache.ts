@@ -16,28 +16,35 @@ const MAX_ENTRIES = 5_000;
 
 interface Entry {
   userId: string;
+  /** The workspace the session's user belongs to (resolved with the session check). */
+  tenantId: string;
   validUntil: number;
 }
 
 const cache = new Map<string, Entry>();
 
-export function isSessionKnownValid(sessionId: string, now: number = Date.now()): boolean {
+/** The cached workspace of a session known to be valid, or null when it must be re-checked. */
+export function knownValidSessionWorkspace(sessionId: string, now: number = Date.now()): string | null {
   const entry = cache.get(sessionId);
-  if (!entry) return false;
+  if (!entry) return null;
   if (entry.validUntil <= now) {
     cache.delete(sessionId);
-    return false;
+    return null;
   }
-  return true;
+  return entry.tenantId;
 }
 
-export function rememberValidSession(sessionId: string, userId: string, now: number = Date.now()): void {
+export function isSessionKnownValid(sessionId: string, now: number = Date.now()): boolean {
+  return knownValidSessionWorkspace(sessionId, now) !== null;
+}
+
+export function rememberValidSession(sessionId: string, userId: string, tenantId: string, now: number = Date.now()): void {
   if (cache.size >= MAX_ENTRIES && !cache.has(sessionId)) {
     // Map keeps insertion order: drop the oldest entry.
     const oldest = cache.keys().next().value;
     if (oldest !== undefined) cache.delete(oldest);
   }
-  cache.set(sessionId, { userId, validUntil: now + TTL_MS });
+  cache.set(sessionId, { userId, tenantId, validUntil: now + TTL_MS });
 }
 
 /** Call after ending one session (logout). */

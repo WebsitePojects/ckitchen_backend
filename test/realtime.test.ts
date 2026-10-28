@@ -26,6 +26,7 @@ import { seed } from "../src/db/seed.js";
 import { randomUUID } from "node:crypto";
 import { createSocketHub, type RealtimeHub } from "../src/realtime/hub.js";
 import { locations } from "../src/db/schema.js";
+import { sql } from "drizzle-orm";
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -366,6 +367,40 @@ describe("socket join authorization (H1)", () => {
     expect(leaked).toBe(false);
 
     s.disconnect();
+  });
+
+  it("an owner (ALL outlets) cannot join an outlet of ANOTHER workspace (D55)", async () => {
+    const otherWorkspace = "00000000-0000-4000-8000-0000000000d4";
+    await db.execute(sql`insert into tenant (id, slug, name) values (${otherWorkspace}, 'realtime-other', 'Other Business') on conflict do nothing`);
+    const inserted = await db.execute(
+      sql`insert into location (tenant_id, code, name) values (${otherWorkspace}, 'RTOTHER', 'Other business outlet') returning id`,
+    );
+    const otherRoom = ((inserted as unknown as { rows: { id: string }[] }).rows)[0]!.id;
+
+    const s = await connect({ token: adminToken }); // OWNER: every outlet of workspace #1
+    const rejected = waitForEvent<{ code: string; locationId: string }>(s, "join_rejected");
+    s.emit("join", otherRoom);
+    expect((await rejected).code).toBe("FORBIDDEN");
+
+    let leaked = false;
+    s.once("order.created", () => {
+      leaked = true;
+    });
+    hub.emitToLocation(otherRoom, "order.created", { order_id: "cross-workspace-leak-check" });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(leaked).toBe(false);
+
+    // Same owner, own outlet: still allowed.
+    const own = await connect({ token: adminToken, locationId });
+    let received = false;
+    own.once("order.created", () => {
+      received = true;
+    });
+    hub.emitToLocation(locationId, "order.created", { order_id: "own" });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(received).toBe(true);
+    s.disconnect();
+    own.disconnect();
   });
 
   it("ASSIGNED socket CAN join its own outlet room and receives its events", async () => {

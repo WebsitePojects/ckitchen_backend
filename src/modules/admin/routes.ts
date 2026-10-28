@@ -133,6 +133,16 @@ function toPublicUser(user: typeof users.$inferSelect) {
   return { ...publicUser, clerk_linked: clerkUserId !== null };
 }
 
+/** True if the cause is a PostgreSQL unique violation (23505), through Drizzle's wrapping. */
+function isUniqueViolation(err: unknown): boolean {
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>;
+    if (e["code"] === "23505") return true;
+    if (e["cause"] && typeof e["cause"] === "object") return (e["cause"] as Record<string, unknown>)["code"] === "23505";
+  }
+  return false;
+}
+
 /** True if the (possibly v1) role normalizes to OWNER. */
 function isOwnerRole(role: string): boolean {
   return normalizeRole(role) === "OWNER";
@@ -313,17 +323,28 @@ export function createAdminRouter(db: DB): Router {
     // and the password path cannot be guessed into.
     const passwordHash = await hashPassword(password ?? randomBytes(32).toString("base64url"));
     let created: typeof users.$inferSelect | undefined;
-    await db.transaction(async (tx) => {
-      [created] = await tx
-        .insert(users)
-        .values({ name, email, passwordHash, role })
-        .returning();
-      if (outlet_ids && outlet_ids.length > 0) {
-        await tx
-          .insert(userOutletAccess)
-          .values([...new Set(outlet_ids)].map((locationId) => ({ userId: created!.id, locationId })));
+    try {
+      await db.transaction(async (tx) => {
+        [created] = await tx
+          .insert(users)
+          .values({ name, email, passwordHash, role })
+          .returning();
+        if (outlet_ids && outlet_ids.length > 0) {
+          await tx
+            .insert(userOutletAccess)
+            .values([...new Set(outlet_ids)].map((locationId) => ({ userId: created!.id, locationId })));
+        }
+      });
+    } catch (err) {
+      // The email belongs to an account in ANOTHER workspace: the check above cannot see it
+      // (row-level security, D55), but the global unique email still refuses it. Same answer
+      // as a duplicate here, without saying which business has it.
+      if (isUniqueViolation(err)) {
+        sendError(res, 409, "CONFLICT", `A user with email ${email} already exists.`);
+        return;
       }
-    });
+      throw err;
+    }
 
     await audit(db, {
       actorUserId: req.user!.id,

@@ -18,7 +18,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { eq } from "drizzle-orm";
 import type { DB } from "../db/client.js";
 import { aggregatorCommands } from "../db/outbound-schema.js";
-import { aggregatorAccounts } from "../db/schema.js";
+import { aggregatorAccounts, WORKSPACE_ONE_ID } from "../db/schema.js";
+import { activeWorkspaceIds, type WorkspaceConnections } from "../modules/tenancy/connections.js";
 import { readAlertSettings } from "../modules/alerts/config.js";
 import { createAlertsWorker } from "../modules/alerts/worker.js";
 import { runFoodpandaOutboundOnce } from "../modules/foodpanda/worker.js";
@@ -157,7 +158,42 @@ export interface WorkerSetup {
  * not run: the adapters answer "not configured" with a TERMINAL failure, which would
  * permanently mark queued rows DEAD for something an operator simply has not set up yet.
  */
-export function buildWorkers(env: Env = process.env): WorkerSetup {
+/**
+ * Wraps a worker that must see one workspace at a time (D55): one instance per workspace
+ * (its own throttles and state), each run on that workspace's connection, so it reads only
+ * that business's rows and writes into it. Workspaces are independent: one failing does not
+ * stop the others, and the error is reported, not swallowed.
+ */
+export function perWorkspaceWorker(
+  name: string,
+  makeWorker: (tenantId: string) => NamedWorker,
+  workspaces: { platformDb: DB; connections: WorkspaceConnections },
+): NamedWorker {
+  const instances = new Map<string, NamedWorker>();
+  return {
+    name,
+    async run(): Promise<WorkerRunResult> {
+      let claimed = 0;
+      const failures: string[] = [];
+      for (const tenantId of await activeWorkspaceIds(workspaces.platformDb, workspaces.connections)) {
+        let worker = instances.get(tenantId);
+        if (!worker) {
+          worker = makeWorker(tenantId);
+          instances.set(tenantId, worker);
+        }
+        try {
+          claimed += (await worker.run(await workspaces.connections.dbFor(tenantId))).claimed;
+        } catch (err) {
+          failures.push(`${tenantId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (failures.length > 0) throw new Error(`${name} failed for ${failures.length} workspace(s): ${failures.join("; ")}`);
+      return { claimed };
+    },
+  };
+}
+
+export function buildWorkers(env: Env = process.env, workspaces?: { platformDb: DB; connections: WorkspaceConnections }): WorkerSetup {
   const workers: NamedWorker[] = [];
   const skipped: string[] = [];
 
@@ -183,7 +219,18 @@ export function buildWorkers(env: Env = process.env): WorkerSetup {
 
   const alerts = readAlertSettings(env);
   if (alerts.ok) {
-    workers.push(createAlertsWorker(alerts.settings));
+    const settings = alerts.settings;
+    workers.push(
+      workspaces
+        ? // ALERT_EMAIL_TO is Prince IT's copy of CloudKitchen's alerts; other businesses'
+          // alerts go to their own owners only.
+          perWorkspaceWorker(
+            "owner-alerts",
+            (tenantId) => createAlertsWorker(tenantId === WORKSPACE_ONE_ID ? settings : { ...settings, extraRecipients: [] }),
+            workspaces,
+          )
+        : createAlertsWorker(settings),
+    );
   } else {
     skipped.push(`owner-alerts (${alerts.reason})`);
   }
@@ -266,8 +313,18 @@ export async function main(): Promise<void> {
     await runMigrations(db);
   }
 
+  const { createWorkspaceConnections } = await import("../modules/tenancy/connections.js");
+  const connections = createWorkspaceConnections({
+    platformDb: db,
+    databaseUrl: isPostgresUrl(config.databaseUrl) ? config.databaseUrl : undefined,
+    isolated: process.env.TENANT_DB_ROLES === "on",
+  });
+  // Partner workers (Grab, foodpanda, outbound commands) serve CloudKitchen's listings: they
+  // run as workspace #1, so RLS hides any other workspace's rows from them.
+  const workspaceOneDb = await connections.dbFor(WORKSPACE_ONE_ID);
+
   const intervalMs = parseIntervalMs(process.env.WORKER_INTERVAL_MS);
-  const { workers, skipped } = buildWorkers();
+  const { workers, skipped } = buildWorkers(process.env, { platformDb: db, connections });
   consoleLogger.info(`started: interval=${intervalMs}ms workers=[${workers.map((w) => w.name).join(", ")}]`);
   for (const reason of skipped) consoleLogger.info(`skipped: ${reason}`);
 
@@ -283,8 +340,9 @@ export async function main(): Promise<void> {
   process.on("SIGINT", () => onSignal("SIGINT"));
   process.on("SIGTERM", () => onSignal("SIGTERM"));
 
-  await runWorkerLoop({ db, workers, intervalMs, signal: shutdown.signal });
+  await runWorkerLoop({ db: workspaceOneDb, workers, intervalMs, signal: shutdown.signal });
 
+  await connections.closeAll();
   await closeDb(client); // GOTCHA: a postgres-js pool / file-backed PGlite keeps the event loop alive — close or the process hangs.
   consoleLogger.info("stopped");
 }

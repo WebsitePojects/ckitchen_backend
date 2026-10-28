@@ -302,6 +302,11 @@ describe("availability includes active reservations", () => {
     expect(details[0].ingredient_name).toBe("RSV_Avail");
     expect(details[0].required).toBe(300);
     expect(details[0].available).toBe(200); // 500 on hand − 300 reserved
+    // Readable without guessing: the unit, and which item needs how much per serving.
+    expect(second.body.error.details[0].unit).toBe("g");
+    expect(second.body.error.details[0].used_by).toEqual([
+      { menu_item_id: menuId, name: "RSV_Avail Dish", qty: 1, per_serving: 300, entered: { quantity: 300, unit: "g" } },
+    ]);
 
     // GET /inventory reflects the same math per row.
     const row = await kitchenRow(ingId);

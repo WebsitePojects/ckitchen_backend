@@ -140,8 +140,20 @@ export interface PrintJobSummary {
 export interface StockShortfall {
   ingredient_id: string;
   ingredient_name: string;
+  /** The ingredient's stock unit; `required` and `available` are in it. */
+  unit: string;
   required: number;
   available: number;
+  /** Which order items need it, so staff can see "0.25 kg per Large Fries × 2". */
+  used_by: Array<{
+    menu_item_id: string;
+    name: string;
+    qty: number;
+    /** Per serving, in the stock unit (what the recipe deducts). */
+    per_serving: number;
+    /** Per serving as the recipe was typed ("250" + "g"), when it was recorded. */
+    entered: { quantity: number; unit: string } | null;
+  }>;
 }
 
 export interface IngestResult {
@@ -696,7 +708,13 @@ export async function ingestOrder(
       ? await db
           // The ingredient's current unit cost rides along on the same query so each order
           // line can freeze its food cost (order_item.unit_cost) without an extra round trip.
-          .select({ ...getTableColumns(recipeLines), ingredientUnitCost: ingredients.unitCost })
+          // Name and stock unit ride along too, for the shortfall message (no second lookup).
+          .select({
+            ...getTableColumns(recipeLines),
+            ingredientUnitCost: ingredients.unitCost,
+            ingredientName: ingredients.name,
+            ingredientUnit: ingredients.unit,
+          })
           .from(recipeLines)
           .innerJoin(ingredients, eq(ingredients.id, recipeLines.ingredientId))
           .where(inArray(recipeLines.menuItemId, requestedMenuItemIds))
@@ -740,6 +758,10 @@ export async function ingestOrder(
   }
 
   const requiredByIngredient = new Map<string, number>();
+  // ingredient -> menu item -> its usage (one entry per menu item, even when the same item
+  // appears on two cart lines with different notes).
+  const usageByIngredient = new Map<string, Map<string, StockShortfall["used_by"][number]>>();
+  const ingredientInfo = new Map<string, { name: string; unit: string }>();
   for (const item of resolvedItems) {
     for (const line of linesByMenuItem.get(item.menuItemId) ?? []) {
       requiredByIngredient.set(
@@ -747,6 +769,22 @@ export async function ingestOrder(
         (requiredByIngredient.get(line.ingredientId) ?? 0) +
           Number(line.portionQty) * item.qty,
       );
+      ingredientInfo.set(line.ingredientId, { name: line.ingredientName, unit: line.ingredientUnit });
+      const usage = usageByIngredient.get(line.ingredientId) ?? new Map();
+      usageByIngredient.set(line.ingredientId, usage);
+      const existing = usage.get(item.menuItemId);
+      if (existing) existing.qty += item.qty;
+      else
+        usage.set(item.menuItemId, {
+          menu_item_id: item.menuItemId,
+          name: item.name,
+          qty: item.qty,
+          per_serving: Number(line.portionQty),
+          entered:
+            line.enteredQuantity != null && line.enteredUnit
+              ? { quantity: Number(line.enteredQuantity), unit: line.enteredUnit }
+              : null,
+        });
     }
   }
 
@@ -798,31 +836,23 @@ export async function ingestOrder(
         .groupBy(stockReservations.ingredientId);
       const reservedById = new Map(reservedRows.map((r) => [r.ingredientId, Number(r.reserved)]));
 
-      const shortIngredientIds: string[] = [];
       for (const [ingredientId, required] of requiredByIngredient.entries()) {
         const available =
           (onHandById.get(ingredientId) ?? 0) - (reservedById.get(ingredientId) ?? 0);
         if (required > available) {
-          shortIngredientIds.push(ingredientId);
+          const info = ingredientInfo.get(ingredientId)!;
           shortfalls.push({
             ingredient_id: ingredientId,
-            ingredient_name: ingredientId, // resolved to the real name below
+            ingredient_name: info.name,
+            unit: info.unit,
             required,
             available,
+            used_by: [...(usageByIngredient.get(ingredientId)?.values() ?? [])],
           });
         }
       }
 
       if (shortfalls.length > 0) {
-        const nameRows = await db
-          .select({ id: ingredients.id, name: ingredients.name })
-          .from(ingredients)
-          .where(inArray(ingredients.id, shortIngredientIds));
-        const nameById = new Map(nameRows.map((r) => [r.id, r.name]));
-        for (const s of shortfalls) {
-          s.ingredient_name = nameById.get(s.ingredient_id) ?? s.ingredient_id;
-        }
-
         // Policy: FOODPANDA/GRABFOOD orders are still created (the platform
         // already took the customer's payment) — the caller gets stock_risk and
         // emits `stock.risk`. OTHER (walk-in/manual) is blocked with 409

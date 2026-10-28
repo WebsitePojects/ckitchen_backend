@@ -32,6 +32,8 @@ import { requireAuth, requireRole, resolveOutletContext } from "../auth/middlewa
 import { isOutletInScope } from "../auth/outlet-scope.js";
 import { audit } from "../ems/audit.js";
 import { paramAsString, sendError } from "../http-errors.js";
+import { QuantityError } from "../units/catalog.js";
+import { loadIngredientUnits, toStockQuantity, type StockQuantity } from "../units/service.js";
 import { uploadMenuPhoto, ConfigError } from "../ems/cloudinary.js";
 
 const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
@@ -101,11 +103,16 @@ const uploadPhotoSchema = z.object({
   data_url: z.string().min(1).startsWith("data:image/"),
 });
 
-const recipeLineSchema = z.object({
-  ingredient_id: z.string().uuid(),
-  portion_qty: z.union([z.string().min(1), z.number()]),
-  unit: z.string().min(1),
-});
+const recipeLineSchema = z
+  .object({
+    ingredient_id: z.string().uuid(),
+    // What was typed, in any unit the ingredient accepts (250 g for an ingredient stocked in
+    // kg, or one of its custom units). `portion_qty` is the older name for the same field.
+    quantity: z.union([z.string().min(1).max(40), z.number()]).optional(),
+    portion_qty: z.union([z.string().min(1).max(40), z.number()]).optional(),
+    unit: z.string().trim().min(1).max(24).optional(),
+  })
+  .refine((line) => line.quantity !== undefined || line.portion_qty !== undefined, { message: "quantity is required" });
 
 const putRecipeSchema = z.object({
   lines: z.array(recipeLineSchema),
@@ -372,20 +379,28 @@ export function createMenuRouter(db: DB): Router {
       return;
     }
 
-    // Validate every ingredient_id exists before touching the DB
+    // Every ingredient in one query, then convert each typed quantity into the ingredient's
+    // stock unit (D57): deduction subtracts portion_qty from stock kept in that unit.
+    const unitsById = await loadIngredientUnits(db, parsed.data.lines.map((l) => l.ingredient_id));
+    const converted: { ingredientId: string; stockUnit: string; quantity: StockQuantity }[] = [];
     for (const line of parsed.data.lines) {
-      const [ing] = await db
-        .select()
-        .from(ingredients)
-        .where(eq(ingredients.id, line.ingredient_id));
-      if (!ing) {
-        sendError(
-          res,
-          404,
-          "NOT_FOUND",
-          `Ingredient ${line.ingredient_id} not found.`,
-        );
+      const units = unitsById.get(line.ingredient_id);
+      if (!units) {
+        sendError(res, 404, "NOT_FOUND", `Ingredient ${line.ingredient_id} not found.`);
         return;
+      }
+      try {
+        const quantity = toStockQuantity(units, (line.quantity ?? line.portion_qty)!, line.unit);
+        if (!(Number(quantity.stockQuantity) > 0)) {
+          throw new QuantityError(`${units.ingredientName}: the amount per serving must be more than zero.`);
+        }
+        converted.push({ ingredientId: line.ingredient_id, stockUnit: units.stockUnit, quantity });
+      } catch (err) {
+        if (err instanceof QuantityError) {
+          sendError(res, 400, "VALIDATION_ERROR", err.message);
+          return;
+        }
+        throw err;
       }
     }
 
@@ -406,15 +421,17 @@ export function createMenuRouter(db: DB): Router {
 
       await tx.delete(recipeLines).where(eq(recipeLines.menuItemId, id));
 
-      if (parsed.data.lines.length > 0) {
+      if (converted.length > 0) {
         newLines = await tx
           .insert(recipeLines)
           .values(
-            parsed.data.lines.map((line) => ({
+            converted.map((line) => ({
               menuItemId: id,
-              ingredientId: line.ingredient_id,
-              portionQty: String(line.portion_qty),
-              unit: line.unit,
+              ingredientId: line.ingredientId,
+              portionQty: line.quantity.stockQuantity,
+              unit: line.stockUnit,
+              enteredQuantity: line.quantity.enteredQuantity,
+              enteredUnit: line.quantity.enteredUnit,
             })),
           )
           .returning();

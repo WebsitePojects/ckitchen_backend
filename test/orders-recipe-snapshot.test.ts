@@ -184,7 +184,7 @@ describe("(a) flag ON: deduction uses the order's frozen snapshot, immune to a l
     // Snapshot was captured at creation — assert it BEFORE the recipe edit.
     const [item] = await db.select().from(orderItems).where(eq(orderItems.orderId, orderId));
     expect(item!.componentSnapshot).toEqual([
-      { ingredientId: fx.ingredient.id, portionQty: "100.0000", uom: "g" },
+      { ingredientId: fx.ingredient.id, portionQty: "100.000000", uom: "g" },
     ]);
 
     // Recipe edited AFTER order acceptance — portionQty 100 -> 500.
@@ -374,7 +374,7 @@ describe("write path: ingestOrder always snapshots component lines, flag-indepen
       .from(orderItems)
       .where(eq(orderItems.orderId, ingestResult.order_id));
     expect(item!.componentSnapshot).toEqual([
-      { ingredientId: fx.ingredient.id, portionQty: "100.0000", uom: "g" },
+      { ingredientId: fx.ingredient.id, portionQty: "100.000000", uom: "g" },
     ]);
   });
 });

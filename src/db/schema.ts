@@ -354,8 +354,8 @@ export const ingredients = pgTable(
     lotTracked: boolean("lot_tracked").notNull().default(false),
     shelfLifeDays: integer("shelf_life_days"),
     isActive: boolean("is_active").notNull().default(true),
-    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull(),
-    lowStockThreshold: numeric("low_stock_threshold", { precision: 14, scale: 4 }).notNull(),
+    unitCost: numeric("unit_cost", { precision: 20, scale: 8 }).notNull(),
+    lowStockThreshold: numeric("low_stock_threshold", { precision: 20, scale: 6 }).notNull(),
   },
   (table) => [
     uniqueIndex("ingredient_code_unique")
@@ -426,8 +426,13 @@ export const recipeLines = pgTable(
     ingredientId: uuid("ingredient_id")
       .notNull()
       .references(() => ingredients.id),
-    portionQty: numeric("portion_qty", { precision: 14, scale: 4 }).notNull(),
+    /** Always in the ingredient's stock unit: what order deduction subtracts (D57). */
+    portionQty: numeric("portion_qty", { precision: 20, scale: 6 }).notNull(),
+    /** The ingredient's stock unit at save time. */
     unit: text("unit").notNull(),
+    /** What the person typed, for display ("250" + "g"); converted into portionQty. */
+    enteredQuantity: numeric("entered_quantity", { precision: 20, scale: 6 }),
+    enteredUnit: text("entered_unit"),
   },
   (table) => [
     index("recipe_line_menu_item_id_idx").on(table.menuItemId),
@@ -484,7 +489,7 @@ export const inventoryStock = pgTable(
     ingredientId: uuid("ingredient_id")
       .notNull()
       .references(() => ingredients.id),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull().default("0"),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull().default("0"),
   },
   (table) => [
     uniqueIndex("inventory_stock_warehouse_ingredient_unique").on(
@@ -824,7 +829,7 @@ export const orderItems = pgTable(
     /** Menu price at the moment the order was placed; reports use this, never the live price. Migration 0041. */
     unitPrice: numeric("unit_price", { precision: 14, scale: 2 }),
     /** Recipe food cost per unit at order time (sum of portion x ingredient unit cost). Migration 0041. */
-    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }),
+    unitCost: numeric("unit_cost", { precision: 20, scale: 8 }),
   },
   (table) => [
     index("order_item_order_id_idx").on(table.orderId),
@@ -876,7 +881,7 @@ export const itoItems = pgTable(
     ingredientId: uuid("ingredient_id")
       .notNull()
       .references(() => ingredients.id),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
   },
   (table) => [
     index("ito_item_ito_id_idx").on(table.itoId),
@@ -998,7 +1003,7 @@ export const consumptionLogs = pgTable(
     ingredientId: uuid("ingredient_id")
       .notNull()
       .references(() => ingredients.id),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
     logDate: timestamp("log_date", { withTimezone: true }).notNull().defaultNow(),
     loggedBy: uuid("logged_by").references(() => users.id),
     orderId: uuid("order_id").references(() => orders.id),
@@ -1046,7 +1051,7 @@ export const stockReservations = pgTable(
     warehouseId: uuid("warehouse_id")
       .notNull()
       .references(() => warehouses.id),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
@@ -1089,8 +1094,8 @@ export const stockLedgerEntries = pgTable(
       .notNull()
       .references(() => warehouses.id),
     movementType: stockLedgerMovementTypeEnum("movement_type").notNull(),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
+    unitCost: numeric("unit_cost", { precision: 20, scale: 8 }).notNull().default("0"),
     postedAt: timestamp("posted_at", { withTimezone: true }).notNull().defaultNow(),
     encoderUserId: uuid("encoder_user_id").references(() => users.id),
     metadata: jsonb("metadata"),
@@ -1154,7 +1159,7 @@ export const stockAdjustments = pgTable(
       .notNull()
       .references(() => ingredients.id),
     direction: stockAdjustmentDirectionEnum("direction").notNull(),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
     reason: stockAdjustmentReasonEnum("reason").notNull(),
     note: text("note"),
     status: stockAdjustmentStatusEnum("status").notNull().default("PENDING"),
@@ -1354,7 +1359,7 @@ export const supplierItems = pgTable(
       .notNull()
       .references(() => ingredients.id),
     supplierSku: text("supplier_sku"),
-    lastUnitCost: numeric("last_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+    lastUnitCost: numeric("last_unit_cost", { precision: 20, scale: 8 }).notNull().default("0"),
   },
   (table) => [
     uniqueIndex("supplier_item_unique").on(table.supplierId, table.ingredientId),
@@ -1444,8 +1449,8 @@ export const purchaseRequestLines = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     prId: uuid("pr_id").notNull().references(() => purchaseRequests.id),
     ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-    estUnitCost: numeric("est_unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
+    estUnitCost: numeric("est_unit_cost", { precision: 20, scale: 8 }).notNull().default("0"),
   },
   (table) => [
     index("pr_line_pr_id_idx").on(table.prId),
@@ -1481,9 +1486,9 @@ export const purchaseOrderLines = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     poId: uuid("po_id").notNull().references(() => purchaseOrders.id),
     ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
-    quantity: numeric("quantity", { precision: 14, scale: 4 }).notNull(),
-    unitCost: numeric("unit_cost", { precision: 14, scale: 4 }).notNull().default("0"),
-    qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull().default("0"),
+    quantity: numeric("quantity", { precision: 20, scale: 6 }).notNull(),
+    unitCost: numeric("unit_cost", { precision: 20, scale: 8 }).notNull().default("0"),
+    qtyReceived: numeric("qty_received", { precision: 20, scale: 6 }).notNull().default("0"),
   },
   (table) => [
     index("po_line_po_id_idx").on(table.poId),
@@ -1531,7 +1536,7 @@ export const receivingReportLines = pgTable(
     /** NULLABLE (0024): NULL = a direct-receipt line (no purchase_order_line). */
     poLineId: uuid("po_line_id").references(() => purchaseOrderLines.id),
     ingredientId: uuid("ingredient_id").notNull().references(() => ingredients.id),
-    qtyReceived: numeric("qty_received", { precision: 14, scale: 4 }).notNull(),
+    qtyReceived: numeric("qty_received", { precision: 20, scale: 6 }).notNull(),
   },
   (table) => [
     index("rr_line_rr_id_idx").on(table.rrId),

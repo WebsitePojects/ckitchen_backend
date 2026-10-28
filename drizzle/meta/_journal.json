@@ -358,6 +358,13 @@
       "when": 1785501300000,
       "tag": "0050_kiosk_device",
       "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1785501400000,
+      "tag": "0051_quantity_standard_and_units",
+      "breakpoints": true
     }
   ]
 }

@@ -33,6 +33,7 @@ import {
   orders,
   receivingReportLines,
   receivingReports,
+  recipeLines,
   stockLedgerEntries,
   stockReservations,
   supplierItems,
@@ -43,6 +44,7 @@ import {
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { isOutletInScope } from "../auth/outlet-scope.js";
 import { paramAsString, sendError } from "../http-errors.js";
+import { applyStockUnits, canonicalStockUnit } from "../units/service.js";
 import type { RealtimeHub } from "../../realtime/hub.js";
 import { audit } from "../ems/audit.js";
 import { docNo } from "../purchasing/doc-no.js";
@@ -93,6 +95,8 @@ const linkSupplierSchema = z.object({
 const receiveItemSchema = z.object({
   ingredient_id: z.string().uuid(),
   quantity: z.union([z.string().min(1), z.number()]),
+  // Optional: the unit the amount was typed in (D57); converted to the stock unit.
+  unit: z.string().trim().min(1).max(24).optional(),
   // 0024: actual unit price paid on this delivery line (gprci RR standard).
   unit_cost: z.number().min(0).optional(),
 });
@@ -111,6 +115,8 @@ const receiveSchema = z.object({
 const consumptionItemSchema = z.object({
   ingredient_id: z.string().uuid(),
   quantity: z.union([z.string().min(1), z.number()]),
+  // Optional: the unit the amount was typed in (D57); converted to the stock unit.
+  unit: z.string().trim().min(1).max(24).optional(),
 });
 
 const consumptionSchema = z.object({
@@ -121,6 +127,8 @@ const consumptionSchema = z.object({
 const itoItemSchema = z.object({
   ingredient_id: z.string().uuid(),
   quantity: z.union([z.string().min(1), z.number()]),
+  // Optional: the unit the amount was typed in (D57); converted to the stock unit.
+  unit: z.string().trim().min(1).max(24).optional(),
 });
 
 const createItoSchema = z.object({
@@ -230,6 +238,23 @@ async function resolveLocationId(
 // Router factory
 // ---------------------------------------------------------------------------
 
+/** What already counts in this ingredient's unit (stock, history, recipes), or null if nothing. */
+async function ingredientUsage(db: DB, ingredientId: string): Promise<string | null> {
+  const [stock, history, recipes] = await Promise.all([
+    db
+      .select({ id: inventoryStock.id })
+      .from(inventoryStock)
+      .where(and(eq(inventoryStock.ingredientId, ingredientId), sql`${inventoryStock.quantity} <> 0`))
+      .limit(1),
+    db.select({ id: stockLedgerEntries.id }).from(stockLedgerEntries).where(eq(stockLedgerEntries.ingredientId, ingredientId)).limit(1),
+    db.select({ id: recipeLines.id }).from(recipeLines).where(eq(recipeLines.ingredientId, ingredientId)).limit(1),
+  ]);
+  if (stock.length > 0) return "stock";
+  if (history.length > 0) return "stock history";
+  if (recipes.length > 0) return "recipes";
+  return null;
+}
+
 export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
   const router = Router();
 
@@ -307,12 +332,20 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       }
     }
 
+    let stockUnit: string;
+    try {
+      stockUnit = canonicalStockUnit(parsed.data.unit);
+    } catch (err) {
+      sendError(res, 400, "VALIDATION_ERROR", err instanceof Error ? err.message : "Invalid unit.");
+      return;
+    }
+
     const ingredient = await db.transaction(async (tx) => {
       const [created] = await tx
         .insert(ingredients)
         .values({
           name: parsed.data.name,
-          unit: parsed.data.unit,
+          unit: stockUnit,
           unitCost: String(parsed.data.unit_cost),
           lowStockThreshold: String(parsed.data.low_stock_threshold),
         })
@@ -361,8 +394,29 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       changes.name = { from: existing.name, to: parsed.data.name };
     }
     if (parsed.data.unit !== undefined) {
-      updates.unit = parsed.data.unit;
-      changes.unit = { from: existing.unit, to: parsed.data.unit };
+      let nextUnit: string;
+      try {
+        nextUnit = canonicalStockUnit(parsed.data.unit);
+      } catch (err) {
+        sendError(res, 400, "VALIDATION_ERROR", err instanceof Error ? err.message : "Invalid unit.");
+        return;
+      }
+      if (nextUnit !== existing.unit) {
+        // Stock, ledger history and recipes hold numbers in the CURRENT unit: switching the
+        // label would silently turn 5 kg into 5 g. Only allowed before anything uses it.
+        const inUse = await ingredientUsage(db, id);
+        if (inUse) {
+          sendError(
+            res,
+            409,
+            "UNIT_IN_USE",
+            `${existing.name} already has ${inUse} in ${existing.unit}. Keep ${existing.unit} as the stock unit and add other units (they convert automatically), or create a new ingredient.`,
+          );
+          return;
+        }
+        updates.unit = nextUnit;
+        changes.unit = { from: existing.unit, to: nextUnit };
+      }
     }
     if (parsed.data.unit_cost !== undefined) {
       const next = String(parsed.data.unit_cost);
@@ -696,6 +750,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         sendError(res, 400, "VALIDATION_ERROR", "Invalid receive payload.", parsed.error.issues);
         return;
       }
+      if (!(await applyStockUnits(db, res, parsed.data.items, { costField: "unit_cost" }))) return;
 
       const locationId = await resolveLocationId(db, req, res, parsed.data.outlet_id);
       if (!locationId) return;
@@ -908,6 +963,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
         );
         return;
       }
+      if (!(await applyStockUnits(db, res, parsed.data.items))) return;
 
       const logDate = parsed.data.log_date ? new Date(parsed.data.log_date) : new Date();
 
@@ -994,6 +1050,7 @@ export function createInventoryRouter(db: DB, hub: RealtimeHub): Router {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid ITO payload.", parsed.error.issues);
       return;
     }
+    if (!(await applyStockUnits(db, res, parsed.data.items))) return;
 
     const locationId = await resolveLocationId(db, req, res, parsed.data.outlet_id);
     if (!locationId) return;

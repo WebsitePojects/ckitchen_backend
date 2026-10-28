@@ -21,6 +21,7 @@ import { Router, type Request, type Response } from "express";
 import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { z } from "zod";
+import { applyStockUnits } from "../units/service.js";
 import type { DB } from "../../db/client.js";
 import {
   ingredients,
@@ -57,6 +58,8 @@ const createSchema = z.object({
   // Always positive; the direction carries the sign. coerce tolerates a numeric
   // string but rejects NaN / non-numeric, and .positive() rejects 0 and negatives.
   quantity: z.coerce.number().positive(),
+  // Optional: the unit the amount was typed in (D57); converted to the stock unit.
+  unit: z.string().trim().min(1).max(24).optional(),
   reason: z.enum(REASONS as unknown as [string, ...string[]]),
   note: z.string().max(500).optional(),
 });
@@ -83,6 +86,11 @@ export function createAdjustmentsRouter(db: DB, hub: RealtimeHub): Router {
         return;
       }
       const body = parsed.data;
+      if (!(await applyStockUnits(db, res, [body], { asNumber: true }))) return;
+      if (!(body.quantity > 0)) {
+        sendError(res, 400, "VALIDATION_ERROR", "The amount is too small for this ingredient's unit.");
+        return;
+      }
 
       const [warehouse] = await db
         .select({ id: warehouses.id, type: warehouses.type, locationId: warehouses.locationId })

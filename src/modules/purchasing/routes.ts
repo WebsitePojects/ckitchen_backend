@@ -12,6 +12,7 @@ import { Router } from "express";
 import { and, eq } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
+import { applyStockUnits } from "../units/service.js";
 import type { DB } from "../../db/client.js";
 import {
   departmentBudgets,
@@ -59,6 +60,7 @@ const prCreateSchema = z.object({
       z.object({
         ingredient_id: z.string().uuid(),
         quantity: z.number().positive(),
+        unit: z.string().trim().min(1).max(24).optional(),
         est_unit_cost: z.number().min(0).optional(),
       }),
     )
@@ -74,6 +76,7 @@ const poCreateSchema = z.object({
       z.object({
         ingredient_id: z.string().uuid(),
         quantity: z.number().positive(),
+        unit: z.string().trim().min(1).max(24).optional(),
         unit_cost: z.number().min(0).optional(),
       }),
     )
@@ -111,6 +114,7 @@ export function createPurchasingRouter(db: DB): Router {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid purchase request payload.", parsed.error.issues);
       return;
     }
+    if (!(await applyStockUnits(db, res, parsed.data.lines, { costField: "est_unit_cost", asNumber: true }))) return;
     const missing = await allIngredientsExist(db, parsed.data.lines.map((l) => l.ingredient_id));
     if (missing) {
       sendError(res, 404, "NOT_FOUND", `Ingredient ${missing} not found.`);
@@ -380,6 +384,7 @@ export function createPurchasingRouter(db: DB): Router {
       sendError(res, 400, "VALIDATION_ERROR", "Invalid purchase order payload.", parsed.error.issues);
       return;
     }
+    if (!(await applyStockUnits(db, res, parsed.data.lines, { costField: "unit_cost", asNumber: true }))) return;
     const [supplier] = await db.select().from(suppliers).where(eq(suppliers.id, parsed.data.supplier_id));
     if (!supplier) {
       sendError(res, 404, "NOT_FOUND", `Supplier ${parsed.data.supplier_id} not found.`);

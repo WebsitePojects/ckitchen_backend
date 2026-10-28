@@ -11,6 +11,7 @@ import { createJoinLinkRouter } from "./modules/join-links/routes.js";
 import { createBrandsRouter } from "./modules/brands/routes.js";
 import { createStationsRouter } from "./modules/stations/routes.js";
 import { createMenuRouter } from "./modules/menu/routes.js";
+import { createUnitsRouter } from "./modules/units/routes.js";
 import { createInventoryRouter } from "./modules/inventory/routes.js";
 import { createAdjustmentsRouter } from "./modules/inventory/adjustments.js";
 import { createOrdersRouter } from "./modules/orders/routes.js";
@@ -160,6 +161,7 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub(), options: A
   app.use("/api/v1", createBrandsRouter(scopedDb));
   app.use("/api/v1", createStationsRouter(scopedDb));
   app.use("/api/v1", createMenuRouter(scopedDb));
+  app.use("/api/v1", createUnitsRouter(scopedDb));
   app.use("/api/v1", createInventoryRouter(scopedDb, hub));
   app.use("/api/v1", createAdjustmentsRouter(scopedDb, hub));
   app.use("/api/v1", createOrdersRouter(scopedDb, hub));

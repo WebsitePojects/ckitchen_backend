@@ -627,6 +627,30 @@ export const workspaceJoinLinks = pgTable(
 
 export type WorkspaceJoinLink = typeof workspaceJoinLinks.$inferSelect;
 
+/**
+ * An attendance kiosk screen paired to a workspace by a signed-in owner/HR (migration 0050).
+ * The screen keeps a signed token derived from the id (modules/kiosk); kiosk calls run as
+ * this row's workspace, and revoking it cuts the screen off.
+ */
+export const kioskDevices = pgTable(
+  "kiosk_device",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: tenantIdColumn(),
+    name: text("name").notNull(),
+    clientRequestId: uuid("client_request_id").notNull(),
+    createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("kiosk_device_request_unique").on(table.tenantId, table.clientRequestId),
+    index("kiosk_device_tenant_created_idx").on(table.tenantId, table.createdAt.desc()),
+  ],
+).enableRLS();
+
+export type KioskDevice = typeof kioskDevices.$inferSelect;
+
 export const userBrands = pgTable(
   "user_brand",
   {

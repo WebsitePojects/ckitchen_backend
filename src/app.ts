@@ -41,6 +41,7 @@ import { errorHandler, notFoundHandler } from "./modules/error-middleware.js";
 import compression from "compression";
 import { createBusinessModulesRouter } from "./modules/business-modules/routes.js";
 import { createSignupRouter } from "./modules/signup/routes.js";
+import { createKioskRouter, requireKioskDevice } from "./modules/kiosk/routes.js";
 import { createWorkspaceScopedDb } from "./modules/tenancy/context.js";
 import { createWorkspaceConnections, workspaceOne, type WorkspaceConnections } from "./modules/tenancy/connections.js";
 
@@ -143,13 +144,14 @@ export function createApp(db: DB, hub: RealtimeHub = createNoopHub(), options: A
   // auth middleware (deliberate: shared-tablet clock in/out, photo = identity).
   // Its own router applies a feature flag + per-IP rate limit; nothing here
   // inherits requireAuth.
-  // No signed-in user: the kiosk serves CloudKitchen's outlets only for now.
-  app.use("/api/v1/public", workspaceOne, createPublicAttendanceRouter(scopedDb));
+  // No signed-in user: a kiosk screen runs as the workspace it was paired to (D56).
+  app.use("/api/v1/public", requireKioskDevice, createPublicAttendanceRouter(scopedDb));
   app.use("/api/v1", createAuthRouter(db));
   // Before every router that applies requireAuth broadly: /auth/join serves people who
   // have no ORION account yet.
   app.use("/api/v1", createJoinLinkRouter(db));
   app.use("/api/v1", createSignupRouter(db, workspaces));
+  app.use("/api/v1", createKioskRouter(scopedDb));
   // Partner webhooks carry no user: every Grab/foodpanda/middleware listing belongs to
   // workspace #1 until partner routing per workspace is built (RLS hides any other).
   app.use("/api/v1/middleware/webhook", workspaceOne);

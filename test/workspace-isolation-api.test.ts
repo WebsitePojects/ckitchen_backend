@@ -144,6 +144,29 @@ suite("two businesses on one database", () => {
     expect(alphaPeople.body.map((u: { email: string }) => u.email)).not.toContain("bravo.cook@gmail.com");
   });
 
+  it("a kiosk screen paired by a business shows that business's people only", async () => {
+    const paired = await request(app)
+      .post("/api/v1/kiosk-devices/pair")
+      .set(as("user_alpha"))
+      .send({ name: "Alpha lobby", request_id: crypto.randomUUID() });
+    expect(paired.status, JSON.stringify(paired.body)).toBe(201);
+    const kiosk = await request(app).get("/api/v1/public/attendance/employees").set("X-Kiosk-Token", paired.body.token);
+    expect(kiosk.status).toBe(200);
+    const ckEmployees = (await db.execute(sql`select count(*)::int as n from employee where tenant_id = '00000000-0000-4000-8000-000000000001'`)) as unknown as { n: number }[];
+    expect(ckEmployees[0]!.n).toBeGreaterThan(0); // CloudKitchen has people...
+    expect(kiosk.body).toEqual([]); // ...and Alpha's kiosk shows none of them
+
+    // Bravo cannot adopt Alpha's screen: the token is ignored and Bravo gets its own pairing.
+    const bravo = await request(app)
+      .post("/api/v1/kiosk-devices/pair")
+      .set(as("user_bravo"))
+      .send({ name: "Bravo lobby", request_id: crypto.randomUUID(), existing_token: paired.body.token });
+    expect(bravo.status).toBe(201);
+    expect(bravo.body.id).not.toBe(paired.body.id);
+    const alphaList = await request(app).get("/api/v1/kiosk-devices").set(as("user_alpha"));
+    expect(alphaList.body.map((d: { id: string }) => d.id)).toEqual([paired.body.id]);
+  });
+
   it("adding staff with an email another business uses is refused without saying which business", async () => {
     const res = await request(app).post("/api/v1/admin/users").set(as("user_alpha")).send({ name: "Copy", email: "bravo.owner@gmail.com", role: "HR" });
     expect(res.status).toBe(409);

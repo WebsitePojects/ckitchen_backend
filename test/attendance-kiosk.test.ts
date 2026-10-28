@@ -13,6 +13,7 @@
  *                                       success writes a "Public"-actor audit row
  */
 
+import { randomUUID } from "node:crypto";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import request from "supertest";
 import type { Express } from "express";
@@ -44,6 +45,7 @@ let db: DB;
 let adminToken: string;
 let kitchenToken: string;
 let hrToken: string;
+let kioskTok: string; // a paired kiosk screen (D56)
 
 let adminEmpId: string; // OWNER's linked employee
 let kitchenEmpId: string; // kitchen_staff's linked employee (non-OWNER, self)
@@ -63,6 +65,12 @@ beforeAll(async () => {
   adminToken = await login("admin@cloudkitchen.local", "admin123");
   kitchenToken = await login("kitchen_staff@cloudkitchen.local", "password123");
   hrToken = await login("hr@cloudkitchen.local", "password123");
+  const paired = await request(app)
+    .post("/api/v1/kiosk-devices/pair")
+    .set("Authorization", `Bearer ${hrToken}`)
+    .send({ name: "Front door tablet", request_id: randomUUID() });
+  expect(paired.status, JSON.stringify(paired.body)).toBe(201);
+  kioskTok = paired.body.token as string;
 
   const [adminUser] = await db.select().from(users).where(eq(users.email, "admin@cloudkitchen.local"));
   const [kitchenUser] = await db.select().from(users).where(eq(users.email, "kitchen_staff@cloudkitchen.local"));
@@ -185,7 +193,7 @@ describe("POST /api/v1/ems/attendance — SELF_ONLY guard", () => {
 
 describe("GET /api/v1/public/attendance/employees", () => {
   it("returns ACTIVE employees with MINIMAL fields only (no PII)", async () => {
-    const res = await request(app).get("/api/v1/public/attendance/employees");
+    const res = await request(app).get("/api/v1/public/attendance/employees").set("X-Kiosk-Token", kioskTok);
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.length).toBeGreaterThan(0);
@@ -204,7 +212,7 @@ describe("GET /api/v1/public/attendance/employees", () => {
   });
 
   it("rows carry today's clock state — clocked_in / clocked_out / last_type", async () => {
-    const res = await request(app).get("/api/v1/public/attendance/employees");
+    const res = await request(app).get("/api/v1/public/attendance/employees").set("X-Kiosk-Token", kioskTok);
     expect(res.status).toBe(200);
 
     for (const row of res.body as Array<Record<string, unknown>>) {
@@ -231,7 +239,7 @@ describe("GET /api/v1/public/attendance/employees", () => {
 describe("POST /api/v1/public/attendance", () => {
   it("400 when the photo is missing (photo is mandatory)", async () => {
     const res = await request(app)
-      .post("/api/v1/public/attendance")
+      .post("/api/v1/public/attendance").set("X-Kiosk-Token", kioskTok)
       .send({ employee_id: kitchenEmpId, type: "TIME_IN" });
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe("VALIDATION_ERROR");
@@ -241,7 +249,7 @@ describe("POST /api/v1/public/attendance", () => {
     process.env.PUBLIC_ATTENDANCE_ENABLED = "false";
     try {
       const res = await request(app)
-        .post("/api/v1/public/attendance")
+        .post("/api/v1/public/attendance").set("X-Kiosk-Token", kioskTok)
         .send({ employee_id: kitchenEmpId, type: "TIME_IN", photo: PHOTO });
       expect(res.status).toBe(404);
     } finally {
@@ -258,7 +266,7 @@ describe("POST /api/v1/public/attendance", () => {
       .returning();
 
     const res = await request(app)
-      .post("/api/v1/public/attendance")
+      .post("/api/v1/public/attendance").set("X-Kiosk-Token", kioskTok)
       .send({ employee_id: kioskEmp!.id, type: "TIME_IN", photo: PHOTO, note: "kiosk punch" });
 
     expect(res.status).toBe(201);
@@ -282,7 +290,7 @@ describe("POST /api/v1/public/attendance", () => {
 
   it("404 for an unknown employee_id", async () => {
     const res = await request(app)
-      .post("/api/v1/public/attendance")
+      .post("/api/v1/public/attendance").set("X-Kiosk-Token", kioskTok)
       .send({ employee_id: "00000000-0000-0000-0000-000000000000", type: "TIME_IN", photo: PHOTO });
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe("NOT_FOUND");
@@ -341,12 +349,12 @@ describe("Punch gate: 409 ALREADY_TIMED_IN / NOT_TIMED_IN / ALREADY_TIMED_OUT", 
   it("the public kiosk is gated identically", async () => {
     const empId = await makeEmployee("EMP-GATE-4");
     const in1 = await request(app)
-      .post("/api/v1/public/attendance")
+      .post("/api/v1/public/attendance").set("X-Kiosk-Token", kioskTok)
       .send({ employee_id: empId, type: "TIME_IN", photo: PHOTO });
     expect(in1.status).toBe(201);
 
     const in2 = await request(app)
-      .post("/api/v1/public/attendance")
+      .post("/api/v1/public/attendance").set("X-Kiosk-Token", kioskTok)
       .send({ employee_id: empId, type: "TIME_IN", photo: PHOTO });
     expect(in2.status).toBe(409);
     expect(in2.body.error.code).toBe("ALREADY_TIMED_IN");

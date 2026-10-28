@@ -13,7 +13,7 @@
  *    (that person signs in normally and is linked by email), so a link can never take over
  *    an existing account.
  */
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { and, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import {
@@ -26,34 +26,23 @@ import {
   type User,
   type WorkspaceJoinLink,
 } from "../../db/schema.js";
-import { loadConfig } from "../../config.js";
 import { hashPassword } from "../auth/service.js";
 import { outletScopeForRole } from "../auth/roles.js";
-import { isUuid } from "../http-errors.js";
+import { signId, verifySignedId } from "../auth/signed-id.js";
 import { currentWorkspace } from "../tenancy/context.js";
 import { actAsWorkspace } from "../tenancy/roles.js";
 
-const TOKEN_CONTEXT = "orion-join-link:v1:";
-
-function tokenMac(id: string): string {
-  return createHmac("sha256", loadConfig().jwtSecret).update(TOKEN_CONTEXT + id).digest("base64url");
-}
+// Same bytes as the original "orion-join-link:v1:" + id MAC, so links already sent stay valid.
+const TOKEN_PURPOSE = "orion-join-link:v1";
 
 /** The bearer token for a link. Only ever returned to the owner who manages links. */
 export function joinLinkToken(id: string): string {
-  return `${id}.${tokenMac(id)}`;
+  return signId(TOKEN_PURPOSE, id);
 }
 
 /** The link id a token was issued for, or null for anything malformed or forged. */
 export function linkIdFromToken(token: string): string | null {
-  const dot = token.indexOf(".");
-  if (dot <= 0) return null;
-  const id = token.slice(0, dot);
-  if (!isUuid(id)) return null;
-  const given = Buffer.from(token.slice(dot + 1));
-  const expected = Buffer.from(tokenMac(id));
-  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
-  return id;
+  return verifySignedId(TOKEN_PURPOSE, token);
 }
 
 export type JoinLinkStatus = "active" | "used" | "revoked" | "expired";

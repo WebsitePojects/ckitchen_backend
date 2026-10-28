@@ -61,7 +61,7 @@ export function createBusinessModulesRouter(db: DB): Router {
       .insert(businessModules)
       .values({ key, enabled, updatedBy: req.user!.id })
       .onConflictDoUpdate({
-        target: businessModules.key,
+        target: [businessModules.tenantId, businessModules.key],
         set: { enabled, updatedBy: req.user!.id, updatedAt: new Date() },
       });
     void audit(db, {

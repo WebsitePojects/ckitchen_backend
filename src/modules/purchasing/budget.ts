@@ -113,7 +113,7 @@ export async function upsertBudget(
       createdBy: input.createdBy,
     })
     .onConflictDoUpdate({
-      target: [departmentBudgets.department, departmentBudgets.periodMonth],
+      target: [departmentBudgets.tenantId, departmentBudgets.department, departmentBudgets.periodMonth],
       set: { amount: String(input.amount), note: input.note ?? null, updatedAt: new Date() },
     })
     .returning();

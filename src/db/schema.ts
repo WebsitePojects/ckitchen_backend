@@ -543,6 +543,18 @@ export const tenants = pgTable("tenant", {
 
 export type Tenant = typeof tenants.$inferSelect;
 
+/**
+ * tenant_id on a workspace table (migration 0047). Every workspace table has this column
+ * in the database; it is declared in TypeScript only where code must name it (a scoped
+ * unique used as an ON CONFLICT target). Code never sets it: the database default does
+ * (workspace #1 until SaaS step 9 switches the default to the request's workspace).
+ */
+const tenantIdColumn = () =>
+  uuid("tenant_id")
+    .notNull()
+    .default(WORKSPACE_ONE_ID)
+    .references(() => tenants.id);
+
 export const memberships = pgTable(
   "membership",
   {
@@ -1516,6 +1528,7 @@ export const departmentBudgets = pgTable(
   "department_budget",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: tenantIdColumn(),
     department: departmentEnum("department").notNull(),
     periodMonth: text("period_month").notNull(), // 'YYYY-MM'
     amount: numeric("amount", { precision: 14, scale: 2 }).notNull(),
@@ -1525,7 +1538,7 @@ export const departmentBudgets = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    uniqueIndex("department_budget_dept_period_unique").on(table.department, table.periodMonth),
+    uniqueIndex("department_budget_dept_period_unique").on(table.tenantId, table.department, table.periodMonth),
   ],
 ).enableRLS();
 export type DepartmentBudget = typeof departmentBudgets.$inferSelect;
@@ -1545,12 +1558,13 @@ export const rolePageAccess = pgTable(
   "role_page_access",
   {
     id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: tenantIdColumn(),
     role: roleEnum("role").notNull(),
     pageKey: text("page_key").notNull(),
     allowed: boolean("allowed").notNull().default(false),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [uniqueIndex("role_page_access_role_page_unique").on(table.role, table.pageKey)],
+  (table) => [uniqueIndex("role_page_access_role_page_unique").on(table.tenantId, table.role, table.pageKey)],
 ).enableRLS();
 
 export type RolePageAccess = typeof rolePageAccess.$inferSelect;
@@ -1560,12 +1574,17 @@ export type NewRolePageAccess = typeof rolePageAccess.$inferInsert;
  * Owner's on/off choice per business module (migration 0043). The module catalog and the
  * pages each covers live in modules/business-modules/catalog.ts; no row = module ON.
  */
-export const businessModules = pgTable("business_module", {
-  key: text("key").primaryKey(),
-  enabled: boolean("enabled").notNull(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedBy: uuid("updated_by").references(() => users.id),
-}).enableRLS();
+export const businessModules = pgTable(
+  "business_module",
+  {
+    tenantId: tenantIdColumn(),
+    key: text("key").notNull(),
+    enabled: boolean("enabled").notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedBy: uuid("updated_by").references(() => users.id),
+  },
+  (table) => [primaryKey({ name: "business_module_pkey", columns: [table.tenantId, table.key] })],
+).enableRLS();
 
 /**
  * Owner email alerts (migration 0044). `alert_email` is the delivery outbox: sender,

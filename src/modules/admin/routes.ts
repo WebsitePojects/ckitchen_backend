@@ -180,7 +180,7 @@ export async function seedRolePageAccess(db: DB): Promise<void> {
   await db
     .insert(rolePageAccess)
     .values(rows)
-    .onConflictDoNothing({ target: [rolePageAccess.role, rolePageAccess.pageKey] });
+    .onConflictDoNothing({ target: [rolePageAccess.tenantId, rolePageAccess.role, rolePageAccess.pageKey] });
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +781,7 @@ export function createAdminRouter(db: DB): Router {
         .insert(rolePageAccess)
         .values({ role: e.role as Role, pageKey: e.pageKey, allowed: e.allowed, updatedAt: now })
         .onConflictDoUpdate({
-          target: [rolePageAccess.role, rolePageAccess.pageKey],
+          target: [rolePageAccess.tenantId, rolePageAccess.role, rolePageAccess.pageKey],
           set: { allowed: e.allowed, updatedAt: now },
         });
     }

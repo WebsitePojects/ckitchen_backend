@@ -39,7 +39,8 @@ beforeAll(async () => {
     ["todayNew", "NEW", new Date(now - 60_000)],
     ["todayDone", "COMPLETED", new Date(now - 120_000)],
     ["oldOpen", "PREPARING", new Date(now - 3 * DAY)],
-    ["oldDone", "COMPLETED", new Date(now - 3 * DAY)],
+    // A minute apart from oldOpen: equal timestamps would order by random id (a flaky test).
+    ["oldDone", "COMPLETED", new Date(now - 3 * DAY - 60_000)],
     ["oldCancelled", "CANCELLED", new Date(now - 5 * DAY)],
   ];
   for (const [key, status, placedAt] of rows) {

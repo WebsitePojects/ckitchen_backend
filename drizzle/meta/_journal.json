@@ -344,6 +344,13 @@
       "when": 1785501100000,
       "tag": "0048_workspace_scoped_uniques",
       "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1785501200000,
+      "tag": "0049_workspace_rls",
+      "breakpoints": true
     }
   ]
 }

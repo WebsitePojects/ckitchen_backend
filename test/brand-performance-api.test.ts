@@ -185,3 +185,58 @@ describe("GET /analytics/brand-performance", () => {
     }
   });
 });
+
+describe("older analytics endpoints use the same scope", () => {
+  const today = new Date().toISOString().slice(0, 10);
+  const endpoints = [
+    "/api/v1/analytics/brands",
+    "/api/v1/analytics/margins",
+    "/api/v1/analytics/products",
+    `/api/v1/analytics/orders-by-hour-by-brand?date=${today}`,
+  ];
+  const brandIdsIn = (body: unknown): string[] => {
+    const rows = Array.isArray(body) ? body : [];
+    const ids = new Set<string>();
+    for (const r of rows as Array<Record<string, unknown>>) {
+      if (typeof r.brand_id === "string") ids.add(r.brand_id);
+      if (typeof r.brandId === "string") ids.add(r.brandId);
+      for (const b of (r.brands as Array<{ brandId: string }> | undefined) ?? []) ids.add(b.brandId);
+    }
+    return [...ids];
+  };
+
+  it("a brand manager sees only assigned brands in every report", async () => {
+    const at = await outlet();
+    const mine = await brandAt(at.locationId);
+    const theirs = await brandAt(at.locationId);
+    await sale(mine, at, { qty: 1, price: 100, cost: 30 });
+    await sale(theirs, at, { qty: 1, price: 900, cost: 30 });
+    const bm = await actor("BRAND_MANAGER", { locationId: at.locationId, brandIds: [mine.brandId] });
+    for (const url of endpoints) {
+      const res = await request(app).get(url).set("Authorization", `Bearer ${bm}`);
+      expect(res.status, url).toBe(200);
+      const ids = brandIdsIn(res.body);
+      expect(ids, url).toContain(mine.brandId);
+      expect(ids, url).not.toContain(theirs.brandId);
+    }
+    const split = await request(app).get("/api/v1/analytics/aggregators").set("Authorization", `Bearer ${bm}`);
+    const total = split.body.reduce((sum: number, r: { revenue: number }) => sum + r.revenue, 0);
+    expect(total).toBe(100); // the other brand's 900 is not theirs
+  });
+
+  it("an outlet picked in X-Outlet-Id narrows the owner's reports to that outlet", async () => {
+    const a = await outlet();
+    const b = await outlet();
+    const brandA = await brandAt(a.locationId);
+    const brandB = await brandAt(b.locationId);
+    await sale(brandA, a, { qty: 1, price: 111, cost: 10 });
+    await sale(brandB, b, { qty: 1, price: 222, cost: 10 });
+    const owner = await actor("OWNER");
+    const res = await request(app).get("/api/v1/analytics/brands").set("Authorization", `Bearer ${owner}`).set("X-Outlet-Id", a.locationId);
+    expect(res.status).toBe(200);
+    const ids = brandIdsIn(res.body);
+    expect(ids).toContain(brandA.brandId);
+    expect(ids).not.toContain(brandB.brandId);
+  });
+});
+

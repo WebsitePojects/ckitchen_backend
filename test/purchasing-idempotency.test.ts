@@ -11,7 +11,7 @@ import { eq } from "drizzle-orm";
 import { createApp } from "../src/app.js";
 import { createDb, type DB } from "../src/db/client.js";
 import { seed } from "../src/db/seed.js";
-import { auditLogs, ingredients, purchaseOrders, purchaseRequests, suppliers } from "../src/db/schema.js";
+import { auditLogs, ingredients, purchaseOrders, purchaseRequests, suppliers, users } from "../src/db/schema.js";
 
 let app: Express;
 let db: DB;
@@ -94,6 +94,41 @@ describe("purchasing lists", () => {
     for (const url of ["/api/v1/purchase-requests?status=MAYBE", "/api/v1/purchase-requests?department=SPACE", "/api/v1/purchase-orders?status=LOST", "/api/v1/purchase-orders?supplier_id=x"]) {
       const res = await request(app).get(url).set("Authorization", `Bearer ${owner}`);
       expect(res.status, url).toBe(400);
+    }
+  });
+});
+
+describe("who may read purchasing documents (they carry supplier costs)", () => {
+  let crew: string;
+  let otherCrewPr: string;
+  let warehouse: string;
+
+  beforeAll(async () => {
+    crew = await login("kitchen_staff@cloudkitchen.local", "password123");
+    warehouse = await login("warehouse@cloudkitchen.local", "password123");
+    const mine = await request(app).post("/api/v1/purchase-requests").set("Authorization", `Bearer ${crew}`).send(prBody(randomUUID()));
+    expect(mine.status).toBe(201);
+    const theirs = await request(app).post("/api/v1/purchase-requests").set("Authorization", `Bearer ${owner}`).send(prBody(randomUUID()));
+    otherCrewPr = theirs.body.id;
+  });
+
+  it("kitchen crew sees only their own requests and no orders, receipts or budgets", async () => {
+    const list = await request(app).get("/api/v1/purchase-requests").set("Authorization", `Bearer ${crew}`);
+    expect(list.status).toBe(200);
+    expect(list.body.length).toBeGreaterThan(0);
+    const [me] = await db.select({ id: users.id }).from(users).where(eq(users.email, "kitchen_staff@cloudkitchen.local"));
+    expect(list.body.every((pr: { requestedByUserId: string }) => pr.requestedByUserId === me!.id)).toBe(true);
+    expect((await request(app).get(`/api/v1/purchase-requests/${otherCrewPr}`).set("Authorization", `Bearer ${crew}`)).status).toBe(404);
+    for (const url of ["/api/v1/purchase-orders", "/api/v1/receiving-reports", "/api/v1/budgets"]) {
+      expect((await request(app).get(url).set("Authorization", `Bearer ${crew}`)).status, url).toBe(403);
+    }
+  });
+
+  it("purchasing-page roles read everything; a malformed id is a 404, not a 500", async () => {
+    expect((await request(app).get("/api/v1/purchase-orders").set("Authorization", `Bearer ${warehouse}`)).status).toBe(200);
+    expect((await request(app).get(`/api/v1/purchase-requests/${otherCrewPr}`).set("Authorization", `Bearer ${warehouse}`)).status).toBe(200);
+    for (const url of ["/api/v1/purchase-requests/nope", "/api/v1/purchase-orders/nope", "/api/v1/receiving-reports/nope"]) {
+      expect((await request(app).get(url).set("Authorization", `Bearer ${owner}`)).status, url).toBe(404);
     }
   });
 });

@@ -26,6 +26,7 @@ import { sql, type SQL } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { toRows } from "../../db/rows.js";
 import { businessDateSql, localDate, localMonthRange } from "../business-time.js";
+import { brandScopeSql, orderScopeSql } from "./scope.js";
 
 /** Rule-of-thumb food cost ceiling for a delivery kitchen; above it margins get thin. */
 export const FOOD_COST_TARGET = 0.35;
@@ -296,21 +297,9 @@ export async function getBrandPerformance(db: DB, scope: BrandPerformanceScope, 
   const daysInMonth = new Date(Date.UTC(cy, cm, 0)).getUTCDate();
   const daysElapsed = Number(today.slice(8, 10));
 
-  const idList = (ids: string[]) => sql.join(ids.map((id) => sql`${id}::uuid`), sql`, `);
-  // An outlet-scoped reader sees only the brands operating at their outlets (home outlet or
-  // an active deployment), not every brand name in the workspace.
-  // An empty list means "none of them" (a brand manager with no brands), never "all".
-  const inList = (column: SQL, ids: string[]) => (ids.length === 0 ? sql`AND FALSE` : sql`AND ${column} IN (${idList(ids)})`);
-  const brandFilter = sql`${scope.brandIds ? inList(sql`b.id`, scope.brandIds) : sql``} ${
-    scope.locationIds
-      ? scope.locationIds.length === 0
-        ? sql`AND FALSE`
-        : sql`AND (b.location_id IN (${idList(scope.locationIds)}) OR b.id IN (
-            SELECT bo.brand_id FROM brand_outlet bo WHERE bo.is_active AND bo.location_id IN (${idList(scope.locationIds)})))`
-      : sql``
-  }`;
-  const orderBrandFilter = scope.brandIds ? inList(sql`o.brand_id`, scope.brandIds) : sql``;
-  const locationFilter = scope.locationIds ? inList(sql`o.location_id`, scope.locationIds) : sql``;
+  // Same visibility rules as every other report (analytics/scope.ts).
+  const brandFilter = brandScopeSql(scope);
+  const orderFilter = orderScopeSql(scope);
   const window = sql`o.placed_at >= ${from.toISOString()} AND o.placed_at <= ${to.toISOString()}`;
 
   const [brandRows, lineRows, discountRows, cancelRows, productRows] = await Promise.all([
@@ -340,20 +329,20 @@ export async function getBrandPerformance(db: DB, scope: BrandPerformanceScope, 
       JOIN order_item oi ON oi.order_id = o.id
       JOIN menu_item mi ON mi.id = oi.menu_item_id
       LEFT JOIN recipe_costs rc ON rc.menu_item_id = oi.menu_item_id
-      WHERE ${window} AND o.status <> 'CANCELLED' ${orderBrandFilter} ${locationFilter}
+      WHERE ${window} AND o.status <> 'CANCELLED' ${orderFilter}
       GROUP BY o.brand_id, month
     `),
     db.execute(sql`
       SELECT o.brand_id, ${monthKeySql(sql`o.placed_at`)} AS month, SUM(od.amount::numeric) AS discounts
       FROM order_discount od
       JOIN "order" o ON o.id = od.order_id
-      WHERE ${window} AND o.status <> 'CANCELLED' AND od.status = 'APPROVED' ${orderBrandFilter} ${locationFilter}
+      WHERE ${window} AND o.status <> 'CANCELLED' AND od.status = 'APPROVED' ${orderFilter}
       GROUP BY o.brand_id, month
     `),
     db.execute(sql`
       SELECT o.brand_id, ${monthKeySql(sql`o.placed_at`)} AS month, COUNT(*) AS cancelled
       FROM "order" o
-      WHERE ${window} AND o.status = 'CANCELLED' ${orderBrandFilter} ${locationFilter}
+      WHERE ${window} AND o.status = 'CANCELLED' ${orderFilter}
       GROUP BY o.brand_id, month
     `),
     // Top five products per brand over the whole window, ranked in SQL.
@@ -373,7 +362,7 @@ export async function getBrandPerformance(db: DB, scope: BrandPerformanceScope, 
         JOIN order_item oi ON oi.order_id = o.id
         JOIN menu_item mi ON mi.id = oi.menu_item_id
         LEFT JOIN recipe_costs rc ON rc.menu_item_id = oi.menu_item_id
-        WHERE ${window} AND o.status <> 'CANCELLED' ${orderBrandFilter} ${locationFilter}
+        WHERE ${window} AND o.status <> 'CANCELLED' ${orderFilter}
         GROUP BY o.brand_id, mi.id, mi.name
       )
       SELECT * FROM (

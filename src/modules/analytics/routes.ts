@@ -1,11 +1,10 @@
 /**
  * Analytics Router — CK1-API-003 §9
  *
- * All endpoints are read-only GET.  Auth matrix:
- *   SUPER_ADMIN  — sees all brands / all data
- *   BRAND_MANAGER— role permitted (prototype: same full view; per-brand filter is a
- *                  post-prototype enhancement once user_brand scoping is tested at scale)
- *   ACCOUNTANT   — sees all brands / all data (finance view)
+ * All endpoints are read-only GET. Every one goes through analytics/scope.ts:
+ *   OWNER / ACCOUNTING - the whole workspace, or the outlet picked in X-Outlet-Id
+ *   BRAND_MANAGER      - only their assigned brands (user_brand), only their outlets
+ *   OUTLET_MANAGER     - brand performance only, their outlets only
  *
  * Endpoints (all under /api/v1):
  *   GET /analytics/brands?from&to                — brand revenue ranking + weakest flag
@@ -20,12 +19,9 @@
 import { Router } from "express";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
-import { eq } from "drizzle-orm";
-import { userBrands } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
-import { listScopeLocationIds } from "../auth/outlet-scope.js";
-import { normalizeRole } from "../auth/roles.js";
 import { getBrandPerformance } from "./brand-performance.js";
+import { resolveAnalyticsScope } from "./scope.js";
 import { sendError, sendInternalError } from "../http-errors.js";
 import {
   getAggregatorsAnalytics,
@@ -83,6 +79,7 @@ export function createAnalyticsRouter(db: DB): Router {
     "/analytics/brands",
     requireAuth,
     requireRole(...ANALYTICS_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = dateRangeSchema.safeParse(req.query);
       if (!parsed.success) {
@@ -91,7 +88,7 @@ export function createAnalyticsRouter(db: DB): Router {
       }
 
       try {
-        const data = await getBrandsAnalytics(db, parsed.data.from, parsed.data.to);
+        const data = await getBrandsAnalytics(db, parsed.data.from, parsed.data.to, await resolveAnalyticsScope(db, req));
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");
@@ -104,6 +101,7 @@ export function createAnalyticsRouter(db: DB): Router {
     "/analytics/orders-by-hour",
     requireAuth,
     requireRole(...ANALYTICS_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = dateSchema.safeParse(req.query);
       if (!parsed.success) {
@@ -118,7 +116,7 @@ export function createAnalyticsRouter(db: DB): Router {
       }
 
       try {
-        const data = await getOrdersByHour(db, parsed.data.date);
+        const data = await getOrdersByHour(db, parsed.data.date, await resolveAnalyticsScope(db, req));
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");
@@ -134,6 +132,7 @@ export function createAnalyticsRouter(db: DB): Router {
     "/analytics/orders-by-hour-by-brand",
     requireAuth,
     requireRole(...ANALYTICS_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = dateSchema.safeParse(req.query);
       if (!parsed.success) {
@@ -148,7 +147,7 @@ export function createAnalyticsRouter(db: DB): Router {
       }
 
       try {
-        const data = await getOrdersByHourByBrand(db, parsed.data.date);
+        const data = await getOrdersByHourByBrand(db, parsed.data.date, await resolveAnalyticsScope(db, req));
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");
@@ -161,6 +160,7 @@ export function createAnalyticsRouter(db: DB): Router {
     "/analytics/aggregators",
     requireAuth,
     requireRole(...ANALYTICS_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = dateRangeSchema.safeParse(req.query);
       if (!parsed.success) {
@@ -169,7 +169,7 @@ export function createAnalyticsRouter(db: DB): Router {
       }
 
       try {
-        const data = await getAggregatorsAnalytics(db, parsed.data.from, parsed.data.to);
+        const data = await getAggregatorsAnalytics(db, parsed.data.from, parsed.data.to, await resolveAnalyticsScope(db, req));
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");
@@ -182,6 +182,7 @@ export function createAnalyticsRouter(db: DB): Router {
     "/analytics/margins",
     requireAuth,
     requireRole(...ANALYTICS_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = dateRangeSchema.safeParse(req.query);
       if (!parsed.success) {
@@ -190,7 +191,7 @@ export function createAnalyticsRouter(db: DB): Router {
       }
 
       try {
-        const data = await getMarginsAnalytics(db, parsed.data.from, parsed.data.to);
+        const data = await getMarginsAnalytics(db, parsed.data.from, parsed.data.to, await resolveAnalyticsScope(db, req));
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");
@@ -204,6 +205,7 @@ export function createAnalyticsRouter(db: DB): Router {
     "/analytics/products",
     requireAuth,
     requireRole(...ANALYTICS_ROLES),
+    resolveOutletContext,
     async (req, res) => {
       const parsed = dateRangeSchema.safeParse(req.query);
       if (!parsed.success) {
@@ -212,7 +214,7 @@ export function createAnalyticsRouter(db: DB): Router {
       }
 
       try {
-        const data = await getProductPerformance(db, parsed.data.from, parsed.data.to);
+        const data = await getProductPerformance(db, parsed.data.from, parsed.data.to, await resolveAnalyticsScope(db, req));
         res.json(data);
       } catch (err) {
         sendInternalError(res, err, "analytics");
@@ -233,20 +235,15 @@ export function createAnalyticsRouter(db: DB): Router {
         return;
       }
       try {
-        let brandIds = parsed.data.brand_ids ?? null;
-        if (normalizeRole(req.user!.role) === "BRAND_MANAGER") {
-          const assigned = (
-            await db.select({ brandId: userBrands.brandId }).from(userBrands).where(eq(userBrands.userId, req.user!.id))
-          ).map((r) => r.brandId);
-          if (brandIds && brandIds.some((id) => !assigned.includes(id))) {
-            sendError(res, 403, "FORBIDDEN", "That brand is not assigned to you.");
-            return;
-          }
-          brandIds = brandIds ?? assigned;
+        const scope = await resolveAnalyticsScope(db, req);
+        const requested = parsed.data.brand_ids ?? null;
+        if (requested && scope.brandIds && requested.some((id) => !scope.brandIds!.includes(id))) {
+          sendError(res, 403, "FORBIDDEN", "That brand is not assigned to you.");
+          return;
         }
         const data = await getBrandPerformance(db, {
-          brandIds,
-          locationIds: listScopeLocationIds(req.outletContext),
+          brandIds: requested ?? scope.brandIds,
+          locationIds: scope.locationIds,
           months: parsed.data.months,
         });
         res.json(data);

@@ -33,6 +33,7 @@ import {
 } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
+import { normalizeRole } from "../auth/roles.js";
 import { isUuid, paramAsString, sendError } from "../http-errors.js";
 import { isUniqueViolation } from "../../db/pg-errors.js";
 import { audit } from "../ems/audit.js";
@@ -53,6 +54,21 @@ const APPROVER_ROLES = ["OWNER"] as const;
 const PO_ROLES = ["OWNER", "PURCHASING"] as const;
 const RECEIVE_ROLES = ["OWNER", "WAREHOUSE_OUTLET"] as const;
 const BUDGET_ROLES = ["OWNER", "ACCOUNTING"] as const;
+/**
+ * Who may READ purchasing documents (they carry supplier costs): the roles that have the
+ * Purchasing page. Kitchen crew may raise requests but only ever sees their own (see
+ * purchaseRequestReadScope); everyone else gets 403.
+ */
+const PURCHASING_READ_ROLES = ["OWNER", "PURCHASING", "WAREHOUSE_MAIN", "WAREHOUSE_OUTLET", "ACCOUNTING", "OUTLET_MANAGER"] as const;
+
+/** 'all', 'own' (requesters outside purchasing: their own requests only) or null (no access). */
+function purchaseRequestReadScope(role: string | undefined): "all" | "own" | null {
+  const normalized = normalizeRole(role);
+  if (!normalized) return null;
+  if ((PURCHASING_READ_ROLES as readonly string[]).includes(normalized)) return "all";
+  if ((REQUESTER_ROLES as readonly string[]).includes(normalized)) return "own";
+  return null;
+}
 
 /** Generated once per "create" intent by the screen; optional so older clients still work. */
 const clientRequestId = z.string().uuid().optional();
@@ -196,6 +212,11 @@ export function createPurchasingRouter(db: DB): Router {
   });
 
   router.get("/purchase-requests", requireAuth, async (req, res) => {
+    const readScope = purchaseRequestReadScope(req.user!.role);
+    if (!readScope) {
+      sendError(res, 403, "FORBIDDEN", "Role not permitted for this action.");
+      return;
+    }
     const { status, department } = req.query as Record<string, string | undefined>;
     // Fail closed on filters: an unknown value is a 400, not a database error.
     if (status && !(purchaseRequestStatusEnum.enumValues as readonly string[]).includes(status)) {
@@ -207,6 +228,7 @@ export function createPurchasingRouter(db: DB): Router {
       return;
     }
     const conditions: SQL[] = [];
+    if (readScope === "own") conditions.push(eq(purchaseRequests.requestedByUserId, req.user!.id));
     if (status) conditions.push(eq(purchaseRequests.status, status as typeof purchaseRequests.$inferSelect["status"]));
     if (department) conditions.push(eq(purchaseRequests.department, department as typeof purchaseRequests.$inferSelect["department"]));
     const rows = await db
@@ -219,9 +241,15 @@ export function createPurchasingRouter(db: DB): Router {
   });
 
   router.get("/purchase-requests/:id", requireAuth, async (req, res) => {
+    const readScope = purchaseRequestReadScope(req.user!.role);
+    if (!readScope) {
+      sendError(res, 403, "FORBIDDEN", "Role not permitted for this action.");
+      return;
+    }
     const id = paramAsString(req.params.id);
-    const [pr] = await db.select().from(purchaseRequests).where(eq(purchaseRequests.id, id));
-    if (!pr) {
+    const [pr] = isUuid(id) ? await db.select().from(purchaseRequests).where(eq(purchaseRequests.id, id)) : [];
+    // Someone else's request reads as "not found" to an own-only requester (no existence leak).
+    if (!pr || (readScope === "own" && pr.requestedByUserId !== req.user!.id)) {
       sendError(res, 404, "NOT_FOUND", "Purchase request not found.");
       return;
     }
@@ -377,7 +405,7 @@ export function createPurchasingRouter(db: DB): Router {
 
   // ── Department budgets (MOTM 2026-06-24 budget threshold) ───────────────────
 
-  router.get("/budgets", requireAuth, async (req, res) => {
+  router.get("/budgets", requireAuth, requireRole(...PURCHASING_READ_ROLES), async (req, res) => {
     const period = (req.query.period as string | undefined) ?? toPeriod(new Date());
     const rows = await db
       .select()
@@ -419,7 +447,7 @@ export function createPurchasingRouter(db: DB): Router {
     res.json(row);
   });
 
-  router.get("/budgets/:department/status", requireAuth, async (req, res) => {
+  router.get("/budgets/:department/status", requireAuth, requireRole(...PURCHASING_READ_ROLES), async (req, res) => {
     const department = paramAsString(req.params.department);
     if (!(departmentEnum.enumValues as readonly string[]).includes(department)) {
       sendError(res, 400, "VALIDATION_ERROR", `Unknown department "${department}".`);
@@ -514,7 +542,7 @@ export function createPurchasingRouter(db: DB): Router {
     res.status(201).json(created);
   });
 
-  router.get("/purchase-orders", requireAuth, async (req, res) => {
+  router.get("/purchase-orders", requireAuth, requireRole(...PURCHASING_READ_ROLES), async (req, res) => {
     const { status, supplier_id } = req.query as Record<string, string | undefined>;
     if (status && !(purchaseOrderStatusEnum.enumValues as readonly string[]).includes(status)) {
       sendError(res, 400, "VALIDATION_ERROR", `Invalid status. Valid: ${purchaseOrderStatusEnum.enumValues.join(", ")}.`);
@@ -536,9 +564,9 @@ export function createPurchasingRouter(db: DB): Router {
     res.json(rows);
   });
 
-  router.get("/purchase-orders/:id", requireAuth, async (req, res) => {
+  router.get("/purchase-orders/:id", requireAuth, requireRole(...PURCHASING_READ_ROLES), async (req, res) => {
     const id = paramAsString(req.params.id);
-    const [po] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, id));
+    const [po] = isUuid(id) ? await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, id)) : [];
     if (!po) {
       sendError(res, 404, "NOT_FOUND", "Purchase order not found.");
       return;
@@ -788,7 +816,7 @@ export function createPurchasingRouter(db: DB): Router {
   // picks whichever exists) and the PO number. po/poNo null = a DIRECT receipt
   // (frontend shows "Direct"). Read-only, additive — every existing RR field
   // is returned unchanged.
-  router.get("/receiving-reports", requireAuth, async (req, res) => {
+  router.get("/receiving-reports", requireAuth, requireRole(...PURCHASING_READ_ROLES), async (req, res) => {
     const rows = await db
       .select({
         rr: receivingReports,
@@ -814,9 +842,9 @@ export function createPurchasingRouter(db: DB): Router {
     );
   });
 
-  router.get("/receiving-reports/:id", requireAuth, async (req, res) => {
+  router.get("/receiving-reports/:id", requireAuth, requireRole(...PURCHASING_READ_ROLES), async (req, res) => {
     const id = paramAsString(req.params.id);
-    const [rr] = await db.select().from(receivingReports).where(eq(receivingReports.id, id));
+    const [rr] = isUuid(id) ? await db.select().from(receivingReports).where(eq(receivingReports.id, id)) : [];
     if (!rr) {
       sendError(res, 404, "NOT_FOUND", "Receiving report not found.");
       return;

@@ -29,6 +29,7 @@ import type { DB } from "../../db/client.js";
 import { toRows } from "../../db/rows.js";
 import { parseRangeBoundary } from "../date-range.js";
 import { BUSINESS_TZ_SQL } from "../business-time.js";
+import { UNSCOPED, brandScopeSql, orderScopeSql, type AnalyticsScope } from "./scope.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -128,6 +129,7 @@ export async function getBrandsAnalytics(
   db: DB,
   from?: string,
   to?: string,
+  scope: AnalyticsScope = UNSCOPED,
 ): Promise<BrandAnalytics[]> {
   const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
   const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
@@ -148,6 +150,8 @@ export async function getBrandsAnalytics(
           AND o.placed_at <= ${toDate.toISOString()}
           -- A cancelled order earned nothing; it must not inflate revenue or AOV.
           AND o.status <> 'CANCELLED'
+          ${orderScopeSql(scope)}
+    WHERE TRUE ${brandScopeSql(scope)}
     GROUP BY b.id, b.name
     ORDER BY COALESCE(SUM(o.total::numeric), 0) DESC NULLS LAST
   `);
@@ -183,7 +187,7 @@ export async function getBrandsAnalytics(
  * (hours are business-local too, see business-time.ts).
  * Sparse array — hours with no orders are omitted (peak-load view).
  */
-export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrderCount[]> {
+export async function getOrdersByHour(db: DB, date: string, scope: AnalyticsScope = UNSCOPED): Promise<HourlyOrderCount[]> {
   // parseRangeBoundary: a date-only `date` expands to the same full-day bounds
   // as before; a full ISO datetime no longer produces an Invalid Date.
   const startOfDay = parseRangeBoundary(date, "from");
@@ -194,9 +198,10 @@ export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrder
     SELECT
       EXTRACT(HOUR FROM placed_at AT TIME ZONE ${BUSINESS_TZ_SQL})::integer AS hour,
       COUNT(id)::integer                                        AS order_count
-    FROM "order"
+    FROM "order" o
     WHERE placed_at >= ${startOfDay.toISOString()}
       AND placed_at <= ${endOfDay.toISOString()}
+      ${orderScopeSql(scope)}
     GROUP BY EXTRACT(HOUR FROM placed_at AT TIME ZONE ${BUSINESS_TZ_SQL})
     ORDER BY hour
   `);
@@ -230,7 +235,7 @@ export async function getOrdersByHour(db: DB, date: string): Promise<HourlyOrder
  * so the per-brand counts in this endpoint sum to the same per-hour totals
  * the existing /analytics/orders-by-hour endpoint already returns.
  */
-export async function getOrdersByHourByBrand(db: DB, date: string): Promise<HourlyBrandBucket[]> {
+export async function getOrdersByHourByBrand(db: DB, date: string, scope: AnalyticsScope = UNSCOPED): Promise<HourlyBrandBucket[]> {
   // parseRangeBoundary: a date-only `date` expands to the same full-day bounds
   // as before; a full ISO datetime no longer produces an Invalid Date.
   const startOfDay = parseRangeBoundary(date, "from");
@@ -252,6 +257,8 @@ export async function getOrdersByHourByBrand(db: DB, date: string): Promise<Hour
           AND o.placed_at >= ${startOfDay.toISOString()}
           AND o.placed_at <= ${endOfDay.toISOString()}
           AND EXTRACT(HOUR FROM o.placed_at AT TIME ZONE ${BUSINESS_TZ_SQL})::integer = h.hour
+          ${orderScopeSql(scope)}
+    WHERE TRUE ${brandScopeSql(scope)}
     GROUP BY h.hour, b.id, b.name
     ORDER BY h.hour, b.name
   `);
@@ -296,6 +303,7 @@ export async function getAggregatorsAnalytics(
   db: DB,
   from?: string,
   to?: string,
+  scope: AnalyticsScope = UNSCOPED,
 ): Promise<AggregatorAnalytics[]> {
   const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
   const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
@@ -316,6 +324,7 @@ export async function getAggregatorsAnalytics(
     WHERE o.placed_at >= ${fromDate.toISOString()}
       AND o.placed_at <= ${toDate.toISOString()}
       AND o.status <> 'CANCELLED'
+      ${orderScopeSql(scope)}
     GROUP BY o.aggregator, sc.id, sc.name, sc.color
     ORDER BY revenue DESC
   `);
@@ -366,6 +375,7 @@ export async function getMarginsAnalytics(
   db: DB,
   from?: string,
   to?: string,
+  scope: AnalyticsScope = UNSCOPED,
 ): Promise<BrandMargin[]> {
   const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
   const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
@@ -392,6 +402,7 @@ export async function getMarginsAnalytics(
       WHERE o.placed_at >= ${fromDate.toISOString()}
         AND o.placed_at <= ${toDate.toISOString()}
         AND o.status <> 'CANCELLED'
+        ${orderScopeSql(scope)}
     ),
     lines AS (
       SELECT
@@ -413,6 +424,7 @@ export async function getMarginsAnalytics(
       COALESCE(SUM(l.line_revenue - l.line_cost - l.line_commission), 0)      AS net_margin
     FROM brand b
     LEFT JOIN lines l ON l.brand_id = b.id
+    WHERE TRUE ${brandScopeSql(scope)}
     GROUP BY b.id, b.name
   `);
 
@@ -470,6 +482,7 @@ export async function getProductPerformance(
   db: DB,
   from?: string,
   to?: string,
+  scope: AnalyticsScope = UNSCOPED,
 ): Promise<ProductPerformance[]> {
   const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
   const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
@@ -482,6 +495,7 @@ export async function getProductPerformance(
       WHERE o.placed_at >= ${fromDate.toISOString()}
         AND o.placed_at <= ${toDate.toISOString()}
         AND o.status != 'CANCELLED'
+        ${orderScopeSql(scope)}
     )
     SELECT
       mi.id                                        AS menu_item_id,
@@ -494,6 +508,7 @@ export async function getProductPerformance(
     FROM menu_item mi
     JOIN brand b ON b.id = mi.brand_id
     LEFT JOIN filtered_items fi ON fi.menu_item_id = mi.id
+    WHERE TRUE ${brandScopeSql(scope)}
     GROUP BY mi.id, mi.name, mi.brand_id, b.name
     ORDER BY revenue DESC
   `);

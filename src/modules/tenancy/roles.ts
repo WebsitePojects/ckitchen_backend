@@ -7,12 +7,18 @@
  * database receives only a SCRAM-SHA-256 verifier, so the password itself never appears in
  * SQL text or database logs. Rotating JWT_SECRET is handled by ensureWorkspaceRole, which
  * re-applies the verifier every time a workspace's connections are opened.
+ *
+ * The verifier's salt is derived from the same secret, so re-applying it on every process start
+ * writes the identical verifier. A random salt changed it on every restart, and Supabase's pooler
+ * (Supavisor), which caches each role's verifier, then rejected workspace logins with "password
+ * authentication failed" until its cache refreshed (seen after the 2026-10-28 deploy).
  */
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { DB } from "../../db/client.js";
 import { loadConfig } from "../../config.js";
 
+const SALT_CONTEXT = "orion-workspace-role-salt:v1:";
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const PASSWORD_CONTEXT = "orion-workspace-role:v1:";
 
@@ -24,6 +30,12 @@ export function workspaceRoleName(tenantId: string): string {
 
 export function workspaceRolePassword(tenantId: string): string {
   return createHmac("sha256", loadConfig().jwtSecret).update(PASSWORD_CONTEXT + tenantId).digest("base64url");
+}
+
+/** The role's SCRAM verifier: same secret and tenant -> byte-identical verifier (stable salt). */
+export function workspaceRoleVerifier(tenantId: string): string {
+  const salt = createHmac("sha256", loadConfig().jwtSecret).update(SALT_CONTEXT + tenantId).digest().subarray(0, 16);
+  return scramSha256Verifier(workspaceRolePassword(tenantId), salt);
 }
 
 /**
@@ -52,7 +64,7 @@ export async function ensureWorkspaceRole(platformDb: Pick<DB, "execute">, tenan
   const role = workspaceRoleName(tenantId);
   let loginStatement = "";
   if (options.login) {
-    const verifier = scramSha256Verifier(workspaceRolePassword(tenantId));
+    const verifier = workspaceRoleVerifier(tenantId);
     if (!VERIFIER_RE.test(verifier)) throw new Error("workspace role: unexpected verifier format");
     loginStatement = `ALTER ROLE ${role} WITH LOGIN PASSWORD '${verifier}';`;
   }

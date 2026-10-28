@@ -42,8 +42,8 @@ export function scramSha256Verifier(password: string, salt = randomBytes(16), it
 const VERIFIER_RE = /^SCRAM-SHA-256\$\d+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/;
 
 /**
- * Creates the workspace's role if missing (member of orion_tenant) and grants it to the
- * connected owner, so the owner connection can SET LOCAL ROLE into the workspace inside a
+ * Creates the workspace's role if missing (member of orion_tenant) and lets the connected
+ * owner SET ROLE to it (never inherit its rights), so the owner can SET LOCAL ROLE into the workspace inside a
  * transaction (sign-up, join links). With `login`, also enables login with the derived
  * password (per-workspace pools). Idempotent. Identifiers and the verifier are validated
  * above; DDL cannot take bind parameters.
@@ -63,8 +63,10 @@ BEGIN
     CREATE ROLE ${role} NOLOGIN IN ROLE orion_tenant;
   END IF;
   ${loginStatement}
-  IF NOT pg_has_role(current_user, '${role}', 'MEMBER') THEN
-    EXECUTE format('GRANT %I TO %I', '${role}', current_user);
+  -- Postgres 16+: creating a role makes the creator a member with ADMIN but WITHOUT the SET
+  -- option, so 'MEMBER' is already true while SET ROLE is still refused. Check SET itself.
+  IF NOT pg_has_role(current_user, '${role}', 'SET') THEN
+    EXECUTE format('GRANT %I TO %I WITH INHERIT FALSE, SET TRUE', '${role}', current_user);
   END IF;
 END $$`),
   );

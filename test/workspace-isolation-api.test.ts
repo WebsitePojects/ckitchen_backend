@@ -3,8 +3,16 @@
  * the real HTTP API, each connection logs in as its own workspace role, and neither can see
  * or change the other's data, nor CloudKitchen's (workspace #1).
  *
- * Needs a real Postgres where the test user may CREATE ROLE and log in as new roles (the
- * Docker playground): PG_ISOLATION_URL=postgres://orion:...@127.0.0.1:55432/<fresh db>.
+ * Needs a real Postgres, connected as a user shaped like Supabase's `postgres`: NOT a
+ * superuser, with CREATEROLE + BYPASSRLS, owning the database. A superuser hides real bugs
+ * (it may SET ROLE to anything; the 2026-10-28 production sign-up failure passed here as one).
+ * Docker playground setup, as the superuser:
+ *   CREATE ROLE orion_supa LOGIN PASSWORD '...' CREATEROLE BYPASSRLS NOSUPERUSER;
+ *   CREATE DATABASE orion_iso OWNER orion_supa;   -- then in orion_iso:
+ *   CREATE EXTENSION btree_gist; ALTER SCHEMA public OWNER TO orion_supa;
+ *   (roles are cluster-wide: GRANT orion_tenant / existing ws_* roles TO orion_supa
+ *    WITH ADMIN TRUE, SET FALSE if a superuser created them before)
+ * PG_ISOLATION_URL=postgres://orion_supa:...@127.0.0.1:55432/orion_iso?sslmode=disable
  * Skipped without it: PGlite has one connection and cannot log in as a second role.
  * The database-level rules are also covered in the normal suite (workspace-rls.test.ts).
  */

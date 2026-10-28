@@ -225,6 +225,8 @@ export const aggregatorAccounts = pgTable(
     /** Physical outlet owning this channel listing (D39). Nullable only during migration. */
     locationId: uuid("location_id").references(() => locations.id),
     aggregator: aggregatorEnum("aggregator").notNull(),
+    /** The owner-managed channel (D60). Filled by a trigger from `aggregator` when omitted. */
+    channelId: uuid("channel_id").references(() => salesChannels.id),
     externalMerchantId: text("external_merchant_id").notNull(),
     credentialRef: text("credential_ref"),
     isActive: boolean("is_active").notNull().default(true),
@@ -655,6 +657,44 @@ export const kioskDevices = pgTable(
 ).enableRLS();
 
 export type KioskDevice = typeof kioskDevices.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// sales_channel (migration 0054, D60)
+// ---------------------------------------------------------------------------
+
+/** The built-in integration a channel uses. Adapters are code, so this list is closed. */
+export const SALES_CHANNEL_INTEGRATIONS = ["GRABFOOD", "FOODPANDA", "MANUAL"] as const;
+export type SalesChannelIntegration = (typeof SALES_CHANNEL_INTEGRATIONS)[number];
+/** Channels every workspace has; anything else is the owner's own (code NULL). */
+export const SYSTEM_CHANNEL_CODES = ["GRABFOOD", "FOODPANDA", "WALK_IN"] as const;
+export type SystemChannelCode = (typeof SYSTEM_CHANNEL_CODES)[number];
+
+/**
+ * Where orders come from, managed by the owner: GrabFood, foodpanda, Walk-in and any number of
+ * their own (Lalamove, ShopeeFood, Facebook, phone). A channel's listings use the old aggregator
+ * value of its integration (MANUAL -> OTHER), so partner routing and idempotency are unchanged.
+ */
+export const salesChannels = pgTable(
+  "sales_channel",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: tenantIdColumn(),
+    code: text("code").$type<SystemChannelCode>(),
+    name: text("name").notNull(),
+    integration: text("integration").$type<SalesChannelIntegration>().notNull(),
+    color: text("color").notNull().default("#64748B"),
+    defaultCommissionRate: numeric("default_commission_rate", { precision: 5, scale: 2 }),
+    defaultMarketingRate: numeric("default_marketing_rate", { precision: 5, scale: 2 }),
+    isActive: boolean("is_active").notNull().default(true),
+    clientRequestId: uuid("client_request_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  // Unique indexes (name per workspace, case-insensitive; code; client_request_id) live in 0054.
+).enableRLS();
+
+export type SalesChannel = typeof salesChannels.$inferSelect;
+
 
 export const userBrands = pgTable(
   "user_brand",

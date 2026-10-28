@@ -379,6 +379,13 @@
       "when": 1785501600000,
       "tag": "0053_purchasing_request_keys",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1785501700000,
+      "tag": "0054_sales_channels",
+      "breakpoints": true
     }
   ]
 }

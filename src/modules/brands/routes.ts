@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import {
   aggregatorAccounts,
+  salesChannels,
   aggregatorEnum,
   availabilityEnum,
   brandActivityLog,
@@ -21,6 +22,7 @@ import {
 import { menuOptionGroups } from "../../db/outbound-schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
+import { isUniqueViolation } from "../../db/pg-errors.js";
 import { audit } from "../ems/audit.js";
 import { paramAsString, sendError } from "../http-errors.js";
 import { businessDateSql, localMonthRange } from "../business-time.js";
@@ -64,9 +66,12 @@ const updateBrandSchema = z
   });
 
 const createAccountSchema = z.object({
-  aggregator: z.enum(aggregatorEnum.enumValues),
+  /** The owner's sales channel (D60). Preferred; `aggregator` alone still works for old screens. */
+  channel_id: z.string().uuid().optional(),
+  aggregator: z.enum(aggregatorEnum.enumValues).optional(),
   external_merchant_id: z.string().min(1),
-  credential_ref: z.string().min(1),
+  /** Required for partner-API channels; manual channels have no credentials. */
+  credential_ref: z.string().min(1).optional(),
   // Physical outlet this channel listing belongs to (D39/business-rules #7).
   // Optional + backward compatible: omitted = null, unchanged from before.
   location_id: z.string().uuid().optional(),
@@ -93,9 +98,17 @@ const bulkAvailabilitySchema = z.object({
 });
 
 /** Strips `credentialRef` before an aggregator account ever reaches an API response (security.md). */
-function toPublicAccount(account: typeof aggregatorAccounts.$inferSelect) {
+function toPublicAccount(
+  account: typeof aggregatorAccounts.$inferSelect,
+  channel?: { id: string; code: string | null; name: string; color: string; integration: string; isActive: boolean } | null,
+) {
   const { credentialRef, ...publicAccount } = account;
-  return publicAccount;
+  return channel === undefined ? publicAccount : { ...publicAccount, channel };
+}
+
+/** The integration family a channel's listings use in the aggregator column (D60). */
+function aggregatorFor(integration: string): (typeof aggregatorEnum.enumValues)[number] {
+  return integration === "GRABFOOD" ? "GRABFOOD" : integration === "FOODPANDA" ? "FOODPANDA" : "OTHER";
 }
 
 /**
@@ -577,11 +590,36 @@ export function createBrandsRouter(db: DB): Router {
     }
 
     const rows = await db
-      .select()
+      .select({
+        account: aggregatorAccounts,
+        channelId: salesChannels.id,
+        channelName: salesChannels.name,
+        channelColor: salesChannels.color,
+        channelIntegration: salesChannels.integration,
+        channelCode: salesChannels.code,
+        channelActive: salesChannels.isActive,
+      })
       .from(aggregatorAccounts)
+      .leftJoin(salesChannels, eq(salesChannels.id, aggregatorAccounts.channelId))
       .where(and(...conditions));
 
-    res.json(rows.map(toPublicAccount));
+    res.json(
+      rows.map((r) =>
+        toPublicAccount(
+          r.account,
+          r.channelId
+            ? {
+                id: r.channelId,
+                code: r.channelCode ?? null,
+                name: r.channelName!,
+                color: r.channelColor!,
+                integration: r.channelIntegration!,
+                isActive: r.channelActive!,
+              }
+            : null,
+        ),
+      ),
+    );
   });
 
   router.post(
@@ -602,6 +640,28 @@ export function createBrandsRouter(db: DB): Router {
         return;
       }
 
+      // Resolve the channel: explicit channel_id, else the system channel of `aggregator`.
+      let channel: typeof salesChannels.$inferSelect | undefined;
+      if (parsed.data.channel_id) {
+        [channel] = await db.select().from(salesChannels).where(eq(salesChannels.id, parsed.data.channel_id));
+        if (!channel) {
+          sendError(res, 404, "NOT_FOUND", "Sales channel not found.");
+          return;
+        }
+        if (!channel.isActive) {
+          sendError(res, 409, "CHANNEL_INACTIVE", `${channel.name} is switched off.`);
+          return;
+        }
+      } else if (!parsed.data.aggregator) {
+        sendError(res, 400, "VALIDATION_ERROR", "Send channel_id (or aggregator).");
+        return;
+      }
+      const aggregator = channel ? aggregatorFor(channel.integration) : parsed.data.aggregator!;
+      if (aggregator !== "OTHER" && !parsed.data.credential_ref) {
+        sendError(res, 400, "VALIDATION_ERROR", "credential_ref is required for a partner-API channel.");
+        return;
+      }
+
       let locationId: string | undefined;
       if (parsed.data.location_id) {
         const check = await assertBrandDeployedAtLocation(db, id, parsed.data.location_id);
@@ -612,16 +672,29 @@ export function createBrandsRouter(db: DB): Router {
         locationId = parsed.data.location_id;
       }
 
-      const [account] = await db
-        .insert(aggregatorAccounts)
-        .values({
-          brandId: id,
-          locationId,
-          aggregator: parsed.data.aggregator,
-          externalMerchantId: parsed.data.external_merchant_id,
-          credentialRef: parsed.data.credential_ref,
-        })
-        .returning();
+      let account: typeof aggregatorAccounts.$inferSelect;
+      try {
+        [account] = await db
+          .insert(aggregatorAccounts)
+          .values({
+            brandId: id,
+            locationId,
+            aggregator,
+            channelId: channel?.id,
+            externalMerchantId: parsed.data.external_merchant_id,
+            credentialRef: parsed.data.credential_ref ?? "manual",
+            commissionRate: channel?.defaultCommissionRate ?? undefined,
+          })
+          .returning();
+      } catch (err) {
+        // An active listing with this store/merchant id already exists (partner routing needs
+        // exactly one). A double click lands here too: same answer, no second listing.
+        if (isUniqueViolation(err, "aggregator_account_active_external_id_unique")) {
+          sendError(res, 409, "LISTING_EXISTS", "An active listing with this merchant / store ID already exists.");
+          return;
+        }
+        throw err;
+      }
 
       res.status(201).json(toPublicAccount(account));
     },

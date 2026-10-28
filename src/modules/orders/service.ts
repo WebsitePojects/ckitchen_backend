@@ -57,6 +57,7 @@ import type { DB } from "../../db/client.js";
 import { menuItemOutlets, operationalFeatureFlags } from "../../db/enterprise-schema.js";
 import {
   aggregatorAccounts,
+  salesChannels,
   brandOutlet,
   brands,
   consumptionLogs,
@@ -462,7 +463,14 @@ export async function ingestOrder(
   // listings in several outlets from being "ambiguous".
   if (input.aggregator === "OTHER" && !input.aggregator_account_id) {
     const walkInLocationId = await resolveWalkInLocation(db, brand, options.workingLocationId);
-    const atOutlet = allCandidates.filter((c) => c.locationId === walkInLocationId);
+    // Only the Walk-in channel's listing counts: an owner's own manual channels (Lalamove,
+    // phone, ...) are aggregator OTHER too (D60) and must be picked explicitly by listing id.
+    const walkInChannelIds = new Set(
+      (await db.select({ id: salesChannels.id }).from(salesChannels).where(eq(salesChannels.code, "WALK_IN"))).map((r) => r.id),
+    );
+    const atOutlet = allCandidates.filter(
+      (c) => c.locationId === walkInLocationId && (c.channelId === null || walkInChannelIds.has(c.channelId)),
+    );
     allCandidates = atOutlet.length > 0 ? atOutlet : [await ensureWalkInListing(db, brand.id, walkInLocationId)];
   }
 

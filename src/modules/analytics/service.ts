@@ -76,7 +76,12 @@ export interface ProductPerformance {
 }
 
 export interface AggregatorAnalytics {
+  /** Integration family (FOODPANDA / GRABFOOD / OTHER), kept for older screens. */
   aggregator: string;
+  /** The owner's sales channel (D60); null only for orders with no listing. */
+  channel_id: string | null;
+  channel_name: string;
+  color: string | null;
   order_count: number;
   revenue: number;
 }
@@ -295,22 +300,39 @@ export async function getAggregatorsAnalytics(
   const fromDate = from ? parseRangeBoundary(from, "from") : DEFAULT_FROM;
   const toDate = to ? parseRangeBoundary(to, "to") : DEFAULT_TO;
 
+  // One row per sales channel (D60): Lalamove and phone orders are both aggregator OTHER but
+  // different channels, and the owner wants them apart.
   const raw = await db.execute(sql`
     SELECT
-      aggregator,
-      COUNT(id)::integer                 AS order_count,
-      COALESCE(SUM(total::numeric), 0)   AS revenue
-    FROM "order"
-    WHERE placed_at >= ${fromDate.toISOString()}
-      AND placed_at <= ${toDate.toISOString()}
-      AND status <> 'CANCELLED'
-    GROUP BY aggregator
+      o.aggregator,
+      sc.id                                AS channel_id,
+      COALESCE(sc.name, CASE o.aggregator WHEN 'GRABFOOD' THEN 'GrabFood' WHEN 'FOODPANDA' THEN 'foodpanda' ELSE 'Walk-in / Direct' END) AS channel_name,
+      sc.color,
+      COUNT(o.id)::integer                 AS order_count,
+      COALESCE(SUM(o.total::numeric), 0)   AS revenue
+    FROM "order" o
+    LEFT JOIN aggregator_account aa ON aa.id = o.aggregator_account_id
+    LEFT JOIN sales_channel sc ON sc.id = aa.channel_id
+    WHERE o.placed_at >= ${fromDate.toISOString()}
+      AND o.placed_at <= ${toDate.toISOString()}
+      AND o.status <> 'CANCELLED'
+    GROUP BY o.aggregator, sc.id, sc.name, sc.color
     ORDER BY revenue DESC
   `);
 
-  type AggRow = { aggregator: string; order_count: string | number; revenue: string | number };
+  type AggRow = {
+    aggregator: string;
+    channel_id: string | null;
+    channel_name: string;
+    color: string | null;
+    order_count: string | number;
+    revenue: string | number;
+  };
   return toRows<AggRow>(raw).map((row) => ({
     aggregator: row.aggregator,
+    channel_id: row.channel_id,
+    channel_name: row.channel_name,
+    color: row.color,
     order_count: Number(row.order_count),
     revenue: Number(row.revenue),
   }));

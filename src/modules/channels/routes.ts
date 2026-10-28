@@ -13,7 +13,7 @@
  * an insert-if-missing keyed on a deterministic listing id, so repeating it adds nothing.
  */
 import { Router, type Request } from "express";
-import { asc, eq, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DB } from "../../db/client.js";
 import { toRows } from "../../db/rows.js";
@@ -90,7 +90,7 @@ export function createChannelsRouter(db: DB): Router {
       .from(salesChannels)
       .where(activeOnly ? eq(salesChannels.isActive, true) : undefined)
       // System channels first (GrabFood, foodpanda, Walk-in), then the owner's own by name.
-      .orderBy(sql`${salesChannels.code} IS NULL`, asc(salesChannels.name));
+      .orderBy(sql`${salesChannels.code} IS NULL`, sql`lower(${salesChannels.name})`);
     res.json(rows.map(serialize));
   });
 

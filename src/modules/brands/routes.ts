@@ -24,12 +24,16 @@ import { requireAuth, requireRole, resolveOutletContext } from "../auth/middlewa
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
 import { isUniqueViolation } from "../../db/pg-errors.js";
 import { audit } from "../ems/audit.js";
-import { paramAsString, sendError } from "../http-errors.js";
+import { isUuid, paramAsString, sendError } from "../http-errors.js";
+import { toRows } from "../../db/rows.js";
+import { brandScopeSql, resolveAnalyticsScope } from "../analytics/scope.js";
 import { businessDateSql, localMonthRange } from "../business-time.js";
 
 const WRITE_ROLES = ["OWNER", "BRAND_MANAGER"] as const;
 /** Deploying a brand to an outlet / deactivating it is an OWNER (HQ) action. */
 const DEPLOY_ROLES = ["OWNER"] as const;
+/** Who sees a brand's activity log (it carries daily revenue): the Brands-page roles. */
+const BRAND_ACTIVITY_ROLES = ["OWNER", "OUTLET_MANAGER", "BRAND_MANAGER"] as const;
 
 // Outlet-scoping leak fix (M6): additive-only filter for GET /brands. Omitted =
 // unchanged platform-wide behavior (Merchant Management needs the full list);
@@ -452,11 +456,19 @@ export function createBrandsRouter(db: DB): Router {
   // Day buckets are UTC; Manila-day (UTC+8) buckets are a documented follow-up
   // (same caveat as /ems/attendance/self/today).
   // The default (no detail param) shape { events } is unchanged.
+  //
+  // Visibility (it carries daily revenue): the Brands-page roles only, and the same
+  // brand + outlet scope as every analytics report (analytics/scope.ts). A brand
+  // outside the caller's scope is a 404, never a 403, so its existence is not leaked;
+  // order totals count only orders placed at the caller's outlets.
   // -------------------------------------------------------------------------
-  router.get("/brands/:id/activity", requireAuth, async (req, res) => {
+  router.get("/brands/:id/activity", requireAuth, requireRole(...BRAND_ACTIVITY_ROLES), resolveOutletContext, async (req, res) => {
     const id = paramAsString(req.params.id);
-    const [brand] = await db.select().from(brands).where(eq(brands.id, id));
-    if (!brand) {
+    const scope = await resolveAnalyticsScope(db, req);
+    const visible = isUuid(id)
+      ? toRows<{ id: string }>(await db.execute(sql`SELECT b.id FROM brand b WHERE b.id = ${id} ${brandScopeSql(scope)}`))
+      : [];
+    if (visible.length === 0) {
       sendError(res, 404, "NOT_FOUND", "Brand not found.");
       return;
     }
@@ -511,6 +523,8 @@ export function createBrandsRouter(db: DB): Router {
             gte(orders.placedAt, monthStart),
             lt(orders.placedAt, nextMonthStart),
             ne(orders.status, "CANCELLED"),
+            // Non-empty here: an empty outlet scope already failed the brand check above.
+            scope.locationIds === null ? undefined : inArray(orders.locationId, scope.locationIds),
           ),
         )
         .groupBy(dayExpr);

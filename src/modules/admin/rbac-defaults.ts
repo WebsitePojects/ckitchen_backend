@@ -58,7 +58,8 @@ export const PAGE_ROLES: Readonly<Record<string, readonly string[]>> = {
 
   // Insights
   "/reports": ["OUTLET_MANAGER", "BRAND_MANAGER", "PURCHASING", "ACCOUNTING"],
-  "/audit": ["BRAND_MANAGER"],
+  // OUTLET_MANAGER sees only the Brands tab there; GET /audit (all activity) stays OWNER + BRAND_MANAGER.
+  "/audit": ["OUTLET_MANAGER", "BRAND_MANAGER"],
 
   // System
   "/outlets": ["WAREHOUSE_MAIN"],

@@ -240,3 +240,45 @@ describe("older analytics endpoints use the same scope", () => {
   });
 });
 
+describe("GET /brands/:id/activity uses the same scope (it carries daily revenue)", () => {
+  const month = new Date().toISOString().slice(0, 7);
+  const activity = (brandId: string, token: string) =>
+    request(app).get(`/api/v1/brands/${brandId}/activity?detail=daily&month=${month}`).set("Authorization", `Bearer ${token}`);
+  const monthOrders = (body: { daily: Array<{ orders: number }> }) => body.daily.reduce((n, d) => n + d.orders, 0);
+
+  it("kitchen crew is refused", async () => {
+    const at = await outlet();
+    const b = await brandAt(at.locationId);
+    const crew = await actor("KITCHEN_CREW", { locationId: at.locationId });
+    expect((await activity(b.brandId, crew)).status).toBe(403);
+  });
+
+  it("a brand manager reads assigned brands only; another brand (or a malformed id) is a 404", async () => {
+    const at = await outlet();
+    const mine = await brandAt(at.locationId);
+    const theirs = await brandAt(at.locationId);
+    const bm = await actor("BRAND_MANAGER", { locationId: at.locationId, brandIds: [mine.brandId] });
+    expect((await activity(mine.brandId, bm)).status).toBe(200);
+    expect((await activity(theirs.brandId, bm)).status).toBe(404);
+    expect((await activity("not-a-uuid", bm)).status).toBe(404);
+  });
+
+  it("an outlet manager counts only their outlet's orders of a shared brand", async () => {
+    const a = await outlet();
+    const b = await outlet();
+    const shared = await brandAt(a.locationId);
+    await db.insert(brandOutlet).values({ brandId: shared.brandId, locationId: b.locationId, isActive: true });
+    const elsewhere = await brandAt(b.locationId);
+    await sale(shared, a, { qty: 1, price: 300, cost: 90 });
+    await sale(shared, b, { qty: 1, price: 700, cost: 200 });
+
+    const managerA = await actor("OUTLET_MANAGER", { locationId: a.locationId });
+    const res = await activity(shared.brandId, managerA);
+    expect(res.status).toBe(200);
+    expect(monthOrders(res.body)).toBe(1); // outlet B's order is not theirs
+    expect((await activity(elsewhere.brandId, managerA)).status).toBe(404);
+
+    const owner = await actor("OWNER");
+    expect(monthOrders((await activity(shared.brandId, owner)).body)).toBe(2);
+  });
+});

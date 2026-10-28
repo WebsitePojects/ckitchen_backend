@@ -1479,6 +1479,8 @@ export const purchaseRequests = pgTable(
     status: purchaseRequestStatusEnum("status").notNull().default("DRAFT"),
     requestedByUserId: uuid("requested_by_user_id").notNull().references(() => users.id),
     approvedByUserId: uuid("approved_by_user_id").references(() => users.id),
+    /** One document per user intent (migration 0053): a repeat of the same id replays it. */
+    clientRequestId: uuid("client_request_id"),
     notes: text("notes"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1512,6 +1514,8 @@ export const purchaseOrders = pgTable(
     prId: uuid("pr_id").references(() => purchaseRequests.id),
     status: purchaseOrderStatusEnum("status").notNull().default("DRAFT"),
     createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id),
+    /** One document per user intent (migration 0053): a repeat of the same id replays it. */
+    clientRequestId: uuid("client_request_id"),
     notes: text("notes"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

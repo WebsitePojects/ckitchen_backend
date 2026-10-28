@@ -9,8 +9,7 @@
  * (SUPPLIER_COORDINATOR) issues POs, warehouse receives. Every mutation audited.
  */
 import { Router } from "express";
-import { and, eq } from "drizzle-orm";
-import { sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { applyStockUnits } from "../units/service.js";
 import type { DB } from "../../db/client.js";
@@ -20,8 +19,10 @@ import {
   ingredients,
   inventoryStock,
   purchaseOrderLines,
+  purchaseOrderStatusEnum,
   purchaseOrders,
   purchaseRequestLines,
+  purchaseRequestStatusEnum,
   purchaseRequests,
   roleEnum,
   receivingReportLines,
@@ -32,7 +33,8 @@ import {
 } from "../../db/schema.js";
 import { requireAuth, requireRole, resolveOutletContext } from "../auth/middleware.js";
 import { resolveRequestLocationId } from "../auth/outlet-scope.js";
-import { paramAsString, sendError } from "../http-errors.js";
+import { isUuid, paramAsString, sendError } from "../http-errors.js";
+import { isUniqueViolation } from "../../db/pg-errors.js";
 import { audit } from "../ems/audit.js";
 import { postLedger } from "../inventory/ledger.js";
 import { findDuplicateReceivingReport } from "../inventory/receive-dedupe.js";
@@ -52,7 +54,11 @@ const PO_ROLES = ["OWNER", "PURCHASING"] as const;
 const RECEIVE_ROLES = ["OWNER", "WAREHOUSE_OUTLET"] as const;
 const BUDGET_ROLES = ["OWNER", "ACCOUNTING"] as const;
 
+/** Generated once per "create" intent by the screen; optional so older clients still work. */
+const clientRequestId = z.string().uuid().optional();
+
 const prCreateSchema = z.object({
+  client_request_id: clientRequestId,
   department: z.enum(departmentEnum.enumValues),
   notes: z.string().optional(),
   lines: z
@@ -68,6 +74,7 @@ const prCreateSchema = z.object({
 });
 
 const poCreateSchema = z.object({
+  client_request_id: clientRequestId,
   supplier_id: z.string().uuid(),
   pr_id: z.string().uuid().optional(),
   notes: z.string().optional(),
@@ -95,12 +102,25 @@ const receiveSchema = z.object({
     .min(1),
 });
 
+/** First requested ingredient id that does not exist, or null. One query for all lines. */
 async function allIngredientsExist(db: DB, ids: string[]): Promise<string | null> {
-  for (const id of ids) {
-    const [row] = await db.select({ id: ingredients.id }).from(ingredients).where(eq(ingredients.id, id));
-    if (!row) return id;
-  }
-  return null;
+  const unique = [...new Set(ids)];
+  const found = new Set(
+    (await db.select({ id: ingredients.id }).from(ingredients).where(inArray(ingredients.id, unique))).map((r) => r.id),
+  );
+  return unique.find((id) => !found.has(id)) ?? null;
+}
+
+const LIST_LIMIT_MAX = 500;
+
+/** `?limit=` for document lists: newest first, 200 by default, never unbounded. */
+function listLimit(raw: unknown): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, LIST_LIMIT_MAX) : 200;
+}
+
+function actorOf(req: { user?: { id: string; name?: string | null; sessionId?: string | null } }) {
+  return { actorUserId: req.user!.id, actorName: req.user!.name ?? null, sessionId: req.user!.sessionId ?? null };
 }
 
 export function createPurchasingRouter(db: DB): Router {
@@ -121,49 +141,80 @@ export function createPurchasingRouter(db: DB): Router {
       return;
     }
 
+    const key = parsed.data.client_request_id;
+    const replayPr = async () => {
+      if (!key) return false;
+      const [existing] = await db.select().from(purchaseRequests).where(eq(purchaseRequests.clientRequestId, key));
+      if (!existing) return false;
+      if (existing.requestedByUserId !== req.user!.id) {
+        sendError(res, 409, "IDEMPOTENCY_KEY_REUSED", "This client_request_id belongs to another request.");
+      } else {
+        res.status(200).json(existing);
+      }
+      return true;
+    };
+    if (await replayPr()) return;
+
     const prNo = docNo("PR");
     let created!: typeof purchaseRequests.$inferSelect;
-    await db.transaction(async (tx) => {
-      [created] = await tx
-        .insert(purchaseRequests)
-        .values({
-          prNo,
-          department: parsed.data.department,
-          status: "DRAFT",
-          requestedByUserId: req.user!.id,
-          notes: parsed.data.notes ?? null,
-        })
-        .returning();
-      await tx.insert(purchaseRequestLines).values(
-        parsed.data.lines.map((l) => ({
-          prId: created.id,
-          ingredientId: l.ingredient_id,
-          quantity: String(l.quantity),
-          estUnitCost: String(l.est_unit_cost ?? 0),
-        })),
-      );
-    });
-
-    void audit(db, {
-      actorUserId: req.user!.id,
-      actorName: req.user!.name ?? null,
-      sessionId: req.user!.sessionId ?? null,
-      action: "purchase_request.create",
-      description: `Created ${prNo} (${parsed.data.department})`,
-      entityType: "purchase_request",
-      entityId: created.id,
-    });
+    try {
+      await db.transaction(async (tx) => {
+        [created] = await tx
+          .insert(purchaseRequests)
+          .values({
+            prNo,
+            department: parsed.data.department,
+            status: "DRAFT",
+            requestedByUserId: req.user!.id,
+            notes: parsed.data.notes ?? null,
+            clientRequestId: key ?? null,
+          })
+          .returning();
+        await tx.insert(purchaseRequestLines).values(
+          parsed.data.lines.map((l) => ({
+            prId: created.id,
+            ingredientId: l.ingredient_id,
+            quantity: String(l.quantity),
+            estUnitCost: String(l.est_unit_cost ?? 0),
+          })),
+        );
+        await audit(tx as unknown as DB, {
+          ...actorOf(req),
+          action: "purchase_request.create",
+          description: `Created ${prNo} (${parsed.data.department})`,
+          entityType: "purchase_request",
+          entityId: created.id,
+        });
+      });
+    } catch (err) {
+      // A concurrent twin won the insert: answer with its document (re-read outside the
+      // aborted transaction).
+      if (isUniqueViolation(err, "purchase_request_client_request_unique") && (await replayPr())) return;
+      throw err;
+    }
     res.status(201).json(created);
   });
 
   router.get("/purchase-requests", requireAuth, async (req, res) => {
     const { status, department } = req.query as Record<string, string | undefined>;
-    const conditions: ReturnType<typeof eq>[] = [];
+    // Fail closed on filters: an unknown value is a 400, not a database error.
+    if (status && !(purchaseRequestStatusEnum.enumValues as readonly string[]).includes(status)) {
+      sendError(res, 400, "VALIDATION_ERROR", `Invalid status. Valid: ${purchaseRequestStatusEnum.enumValues.join(", ")}.`);
+      return;
+    }
+    if (department && !(departmentEnum.enumValues as readonly string[]).includes(department)) {
+      sendError(res, 400, "VALIDATION_ERROR", `Invalid department. Valid: ${departmentEnum.enumValues.join(", ")}.`);
+      return;
+    }
+    const conditions: SQL[] = [];
     if (status) conditions.push(eq(purchaseRequests.status, status as typeof purchaseRequests.$inferSelect["status"]));
     if (department) conditions.push(eq(purchaseRequests.department, department as typeof purchaseRequests.$inferSelect["department"]));
-    const rows = conditions.length
-      ? await db.select().from(purchaseRequests).where(and(...conditions))
-      : await db.select().from(purchaseRequests);
+    const rows = await db
+      .select()
+      .from(purchaseRequests)
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(purchaseRequests.createdAt))
+      .limit(listLimit(req.query.limit));
     res.json(rows);
   });
 
@@ -202,28 +253,31 @@ export function createPurchasingRouter(db: DB): Router {
       // it and both write (double audit row, and a REJECTED could silently
       // flip back to APPROVED or vice versa on the loser's write ordering).
       // `AND status = from` makes only the first writer win.
-      const [updated] = await db
-        .update(purchaseRequests)
-        .set({
-          status: to,
-          updatedAt: new Date(),
-          ...(setApprover ? { approvedByUserId: req.user!.id } : {}),
-        })
-        .where(and(eq(purchaseRequests.id, id), eq(purchaseRequests.status, from)))
-        .returning();
+      // The audit row commits with the winning transition only (no fire-and-forget write).
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(purchaseRequests)
+          .set({
+            status: to,
+            updatedAt: new Date(),
+            ...(setApprover ? { approvedByUserId: req.user!.id } : {}),
+          })
+          .where(and(eq(purchaseRequests.id, id), eq(purchaseRequests.status, from)))
+          .returning();
+        if (!row) return null;
+        await audit(tx as unknown as DB, {
+          ...actorOf(req),
+          action: `purchase_request.${action}`,
+          description: `${pr.prNo}: ${from} → ${to}`,
+          entityType: "purchase_request",
+          entityId: id,
+        });
+        return row;
+      });
       if (!updated) {
         sendError(res, 409, "CONFLICT", `Purchase request was already moved out of ${from} by a concurrent request.`);
         return;
       }
-      void audit(db, {
-        actorUserId: req.user!.id,
-        actorName: req.user!.name ?? null,
-        sessionId: req.user!.sessionId ?? null,
-        action: `purchase_request.${action}`,
-        description: `${pr.prNo}: ${from} → ${to}`,
-        entityType: "purchase_request",
-        entityId: id,
-      });
       res.json(updated);
     });
   }
@@ -407,50 +461,78 @@ export function createPurchasingRouter(db: DB): Router {
       return;
     }
 
+    const key = parsed.data.client_request_id;
+    const replayPo = async () => {
+      if (!key) return false;
+      const [existing] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.clientRequestId, key));
+      if (!existing) return false;
+      if (existing.createdByUserId !== req.user!.id) {
+        sendError(res, 409, "IDEMPOTENCY_KEY_REUSED", "This client_request_id belongs to another order.");
+      } else {
+        res.status(200).json(existing);
+      }
+      return true;
+    };
+    if (await replayPo()) return;
+
     const poNo = docNo("PO");
     let created!: typeof purchaseOrders.$inferSelect;
-    await db.transaction(async (tx) => {
-      [created] = await tx
-        .insert(purchaseOrders)
-        .values({
-          poNo,
-          supplierId: parsed.data.supplier_id,
-          prId: parsed.data.pr_id ?? null,
-          status: "DRAFT",
-          createdByUserId: req.user!.id,
-          notes: parsed.data.notes ?? null,
-        })
-        .returning();
-      await tx.insert(purchaseOrderLines).values(
-        parsed.data.lines.map((l) => ({
-          poId: created.id,
-          ingredientId: l.ingredient_id,
-          quantity: String(l.quantity),
-          unitCost: String(l.unit_cost ?? 0),
-        })),
-      );
-    });
-
-    void audit(db, {
-      actorUserId: req.user!.id,
-      actorName: req.user!.name ?? null,
-      sessionId: req.user!.sessionId ?? null,
-      action: "purchase_order.create",
-      description: `Created ${poNo} for ${supplier.name}`,
-      entityType: "purchase_order",
-      entityId: created.id,
-    });
+    try {
+      await db.transaction(async (tx) => {
+        [created] = await tx
+          .insert(purchaseOrders)
+          .values({
+            poNo,
+            supplierId: parsed.data.supplier_id,
+            prId: parsed.data.pr_id ?? null,
+            status: "DRAFT",
+            createdByUserId: req.user!.id,
+            notes: parsed.data.notes ?? null,
+            clientRequestId: key ?? null,
+          })
+          .returning();
+        await tx.insert(purchaseOrderLines).values(
+          parsed.data.lines.map((l) => ({
+            poId: created.id,
+            ingredientId: l.ingredient_id,
+            quantity: String(l.quantity),
+            unitCost: String(l.unit_cost ?? 0),
+          })),
+        );
+        await audit(tx as unknown as DB, {
+          ...actorOf(req),
+          action: "purchase_order.create",
+          description: `Created ${poNo} for ${supplier.name}`,
+          entityType: "purchase_order",
+          entityId: created.id,
+        });
+      });
+    } catch (err) {
+      if (isUniqueViolation(err, "purchase_order_client_request_unique") && (await replayPo())) return;
+      throw err;
+    }
     res.status(201).json(created);
   });
 
   router.get("/purchase-orders", requireAuth, async (req, res) => {
     const { status, supplier_id } = req.query as Record<string, string | undefined>;
-    const conditions: ReturnType<typeof eq>[] = [];
+    if (status && !(purchaseOrderStatusEnum.enumValues as readonly string[]).includes(status)) {
+      sendError(res, 400, "VALIDATION_ERROR", `Invalid status. Valid: ${purchaseOrderStatusEnum.enumValues.join(", ")}.`);
+      return;
+    }
+    if (supplier_id && !isUuid(supplier_id)) {
+      sendError(res, 400, "VALIDATION_ERROR", "supplier_id must be a UUID.");
+      return;
+    }
+    const conditions: SQL[] = [];
     if (status) conditions.push(eq(purchaseOrders.status, status as typeof purchaseOrders.$inferSelect["status"]));
     if (supplier_id) conditions.push(eq(purchaseOrders.supplierId, supplier_id));
-    const rows = conditions.length
-      ? await db.select().from(purchaseOrders).where(and(...conditions))
-      : await db.select().from(purchaseOrders);
+    const rows = await db
+      .select()
+      .from(purchaseOrders)
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(purchaseOrders.createdAt))
+      .limit(listLimit(req.query.limit));
     res.json(rows);
   });
 
@@ -706,7 +788,7 @@ export function createPurchasingRouter(db: DB): Router {
   // picks whichever exists) and the PO number. po/poNo null = a DIRECT receipt
   // (frontend shows "Direct"). Read-only, additive — every existing RR field
   // is returned unchanged.
-  router.get("/receiving-reports", requireAuth, async (_req, res) => {
+  router.get("/receiving-reports", requireAuth, async (req, res) => {
     const rows = await db
       .select({
         rr: receivingReports,
@@ -720,7 +802,9 @@ export function createPurchasingRouter(db: DB): Router {
       .leftJoin(
         suppliers,
         eq(suppliers.id, sql`COALESCE(${receivingReports.supplierId}, ${purchaseOrders.supplierId})`),
-      );
+      )
+      .orderBy(desc(receivingReports.createdAt))
+      .limit(listLimit(req.query.limit));
     res.json(
       rows.map(({ rr, poNo, supplierId, supplierCode, supplierName }) => ({
         ...rr,
